@@ -1,0 +1,145 @@
+import numpy as np
+import pandas as pd
+import pytest
+
+from mobeval import EvalConfig, EvaluationPipeline, synthetic_dataset
+from mobeval.adapters.base import NEXT_LOCATION, RECOVERY, LocationPrediction, MobilityModelAdapter
+from mobeval.adapters.reference import KinematicReference, WeakReference
+from mobeval.baselines import linear_interpolation
+from mobeval.data import SpatialGrid, TrajectoryBatch, make_mask
+from mobeval.geo import haversine_m
+from mobeval.metrics.classification import ranking_metrics
+from mobeval.metrics.probabilistic import Mixture, continuous_metrics, crps_mixture, crps_samples
+from mobeval.metrics.reconstruction import block_ends, recovery_metrics
+from mobeval.results import ResultRecord
+from mobeval.stats import skill_score
+from mobeval.tasks import NextLocationTask
+
+
+def test_haversine_one_degree_at_equator():
+    assert haversine_m(0, 0, 0, 1) == pytest.approx(111_195, rel=1e-3)
+
+
+def test_masks():
+    m = make_mask(50, 20, 0.5, "random", seed=1)
+    assert (m.sum(1) == 10).all() and not m[:, 0].any() and not m[:, -1].any()
+    b = make_mask(50, 20, 0.3, "block", seed=1)
+    assert (block_ends(b).sum(1) == 1).all()                     # exactly one contiguous block
+    assert np.array_equal(make_mask(5, 20, .5, seed=3), make_mask(5, 20, .5, seed=3))
+
+
+def _line_batch(n=4, L=20):
+    t = np.tile(np.arange(L) * 15.0, (n, 1))
+    lat = 55.0 + t * 1e-5
+    lon = 12.0 + t * 2e-5
+    return TrajectoryBatch(lat, lon, t, np.arange(n), np.arange(n))
+
+
+def test_interpolation_exact_on_straight_line_and_zero_errors():
+    b = _line_batch()
+    mask = make_mask(len(b), b.length, 0.5, "block", 0)
+    lat, lon = linear_interpolation(b, mask)
+    m = recovery_metrics(lat, lon, b.lat, b.lon, mask)
+    assert m["ade_m"].max() < 1e-3 and m["dtw_m"].max() < 1e-3 and (m["acc_100m"] == 1).all()
+
+
+def test_nan_leak_is_caught():
+    b = _line_batch()
+    mask = make_mask(len(b), b.length, 0.5, "random", 0)
+    lat = b.lat.copy(); lat[mask] = np.nan
+    with pytest.raises(ValueError):
+        recovery_metrics(lat, b.lon, b.lat, b.lon, mask)
+
+
+def test_crps_point_equals_mae_and_mixture_closed_form_matches_samples():
+    rng = np.random.default_rng(0)
+    y = rng.normal(10, 3, 200)
+    pt = y + rng.normal(0, 1, 200)
+    out = continuous_metrics(y, point=pt)
+    assert np.allclose(out["crps_min"], np.abs(pt - y))
+    mix = Mixture(rng.random((200, 3)), rng.normal(10, 2, (200, 3)), rng.uniform(.5, 2, (200, 3)))
+    cf = crps_mixture(mix, y)
+    mc = crps_samples(mix.sample(4000, seed=1), y)
+    assert np.mean(cf) == pytest.approx(np.mean(mc), rel=0.02)
+
+
+@pytest.mark.parametrize("space", ["linear", "log"])
+def test_unit_change_shifts_nll_by_log_jacobian(space):
+    rng = np.random.default_rng(1)
+    y_s = rng.uniform(300, 5000, 50)
+    means = np.log(rng.uniform(300, 5000, (50, 2))) if space == "log" else rng.uniform(300, 5000, (50, 2))
+    stds = rng.uniform(.3, 1, (50, 2)) if space == "log" else rng.uniform(200, 900, (50, 2))
+    mix_s = Mixture(np.ones((50, 2)), means, stds, space)
+    mix_min = mix_s.rescale(1 / 60)
+    assert np.allclose(mix_min.nll(y_s / 60), mix_s.nll(y_s) - np.log(60))
+    assert np.allclose(mix_min.median(), mix_s.median() / 60, rtol=1e-4)
+
+
+def test_mixture_median_matches_samples():
+    mix = Mixture(np.array([[.7, .3]]), np.array([[np.log(600), np.log(6000)]]), np.array([[.4, .6]]), "log")
+    assert mix.median()[0] == pytest.approx(np.median(mix.sample(200_000)[0]), rel=0.02)
+
+
+def test_skill_scores():
+    assert skill_score("ade_m", 50, 100) == pytest.approx(0.5)
+    assert skill_score("acc@1", 0.6, 0.2) == pytest.approx(0.5)
+    assert skill_score("nll", 2.0, 2.5) == pytest.approx(0.5)
+    assert skill_score("jsd", 0.2, 0.5, floor=0.1) == pytest.approx(0.75)
+
+
+def test_record_flags_percent_scale_and_implausible_units():
+    assert ResultRecord("m", "r", "t", "acc@1", 66.0).flags          # 66 instead of 0.66
+    assert ResultRecord("m", "r", "t", "mae_min", 138.8 * 60).flags  # 138.8 hours in minutes
+    assert not ResultRecord("m", "r", "t", "ade_m", 30.0).flags
+    assert ResultRecord("m", "r", "t", "ade_m", 30.0).higher_is_better is False   # direction from registry
+
+
+def test_token_scores_equal_grid_scores_when_vocab_is_the_grid():
+    grid = SpatialGrid(55.6, 55.7, 12.5, 12.6, 1000)
+    rng = np.random.default_rng(0)
+    probs = rng.dirichlet(np.ones(grid.n_cells), 30)
+    cent = np.column_stack(grid.centroid(np.arange(grid.n_cells)))
+    p1, _, _ = NextLocationTask._grid_probs(LocationPrediction(grid_scores=probs), grid, 30)
+    p2, _, _ = NextLocationTask._grid_probs(LocationPrediction(token_scores=probs, token_latlon=cent), grid, 30)
+    y = rng.integers(0, grid.n_cells, 30)
+    assert np.allclose(ranking_metrics(p1, y)["acc@5"], ranking_metrics(p2, y)["acc@5"])
+
+
+class _Cheater(MobilityModelAdapter):
+    name, capabilities = "Cheater", {RECOVERY}
+
+    def reconstruct(self, batch, mask):
+        return batch.lat, batch.lon          # tries to return the hidden truth -> NaN -> error
+
+
+def test_end_to_end_and_leakage_guard():
+    ds = synthetic_dataset(n_users=12, n_days=6, seed=2)
+    cfg = EvalConfig(window_length=24, recovery_ratios=(0.5,), recovery_kinds=("block",), eval_seeds=(0,),
+                     n_boot=30, max_eval_samples=150, visit_context=4, label_fractions=(1.0,),
+                     generation_max_trajectories=40)
+    pipe = EvaluationPipeline(cfg)
+    ctx = pipe.prepare(ds)
+    store = pipe.run([KinematicReference(), WeakReference(), _Cheater()], ctx)
+    df = store.to_frame()
+    assert [e for e in ctx.errors if e[0].startswith("Cheater")], "leakage guard should reject the cheater"
+    assert not [e for e in ctx.errors if not e[0].startswith("Cheater")], ctx.errors
+    fams = set(df[df.model == "KinematicRef"].family)
+    assert {"recovery", "location", "continuous", "classification", "generation", "efficiency"} <= fams
+    # baselines scored on identical samples: skill must be reproducible from logged values
+    r = df[(df.model == "KinematicRef") & (df.metric == "ade_m")].iloc[0]
+    assert r.skill == pytest.approx(1 - r.value / r.baseline_value)
+
+
+def test_geolife_loader_times_and_labels(tmp_path):
+    from mobeval.loaders import load_geolife
+    d = tmp_path / "Data" / "007" / "Trajectory"
+    d.mkdir(parents=True)
+    hdr = "Geolife trajectory\nWGS 84\nAltitude is in Feet\nReserved 3\n0,2,255,My Track,0,0,2,8421376\n0\n"
+    rows = [f"39.98{k:02d},116.30{k:02d},0,100,39000.1,2008-10-23,10:{k // 12:02d}:{(k * 5) % 60:02d}" for k in range(60)]
+    (d / "20081023100000.plt").write_text(hdr + "\n".join(rows) + "\n")
+    (tmp_path / "Data" / "007" / "labels.txt").write_text(
+        "Start Time\tEnd Time\tTransportation Mode\n2008/10/23 10:00:00\t2008/10/23 10:02:00\tsubway\n")
+    p = load_geolife(str(tmp_path)).points
+    assert p.t.iloc[0] == pd.Timestamp("2008-10-23 10:00:00").timestamp()
+    assert p.t.diff().iloc[1] == pytest.approx(5.0)
+    assert set(p["mode"].dropna()) == {"train"} and p["mode"].notna().sum() == 25

@@ -197,7 +197,8 @@ class CLIPMobilityAdapter(TorchAdapter):
     # ------------------------------------------------------------------ pre-training
     @staticmethod
     def pair_windows_with_visits(windows: TrajectoryBatch, staypoints, context: int, proj: LocalProjection):
-        """For each window: the user's last `context` staypoints that ended before the window started."""
+        """For each window: the user's last `context` staypoints that ended before the window started.
+        Visits are RIGHT-padded (valid visits first, in chronological order)."""
         from ..nn.features import VISIT_TOKEN_DIM, visit_tokens
         N = len(windows)
         tok = np.zeros((N, context, VISIT_TOKEN_DIM), np.float32)
@@ -212,9 +213,9 @@ class CLIPMobilityAdapter(TorchAdapter):
             if len(h) == 0:
                 continue
             n = len(h)
-            tok[i, context - n:] = visit_tokens(h.lat.to_numpy()[None], h.lon.to_numpy()[None], h.t_arrive.to_numpy()[None],
-                                                h.t_leave.to_numpy()[None], proj)[0]
-            pad[i, context - n:] = False
+            tok[i, :n] = visit_tokens(h.lat.to_numpy()[None], h.lon.to_numpy()[None], h.t_arrive.to_numpy()[None],
+                                      h.t_leave.to_numpy()[None], proj)[0]
+            pad[i, :n] = False
         return tok, pad
 
     @classmethod

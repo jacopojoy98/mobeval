@@ -133,3 +133,30 @@ def test_cli_smoke(tmp_path):
     from mobeval.cli import main
     assert main(["smoke", "--out", str(tmp_path / "smoke"), "--device", "cpu"]) == 0
     assert (tmp_path / "smoke" / "report.md").exists() and (tmp_path / "smoke" / "checkpoints" / "TrajGPT-tiny.pt").exists()
+
+
+def test_clip_validation_is_finite_with_short_visit_histories():
+    """Regression: left-padded visits + causal mask gave NaN in PyTorch's fast inference path."""
+    import pandas as pd
+    from mobeval.adapters.clip_mobility import CLIPMobilityAdapter
+    from mobeval.data import TrajectoryBatch
+    from mobeval.geo import LocalProjection
+    from mobeval.nn.clip_net import CLIPMobilityModel
+    sp = pd.DataFrame({"user_id": ["a", "a", "b"], "lat": [55.6, 55.61, 55.7], "lon": [12.5, 12.51, 12.6],
+                       "t_arrive": [0., 5000, 0], "t_leave": [3000., 9000, 4000]})
+    w = TrajectoryBatch(np.full((2, 20), 55.6), np.full((2, 20), 12.5), np.tile(np.arange(20) * 15. + 10000, (2, 1)),
+                        np.array(["a", "b"]), np.arange(2))
+    tok, pad = CLIPMobilityAdapter.pair_windows_with_visits(w, sp, 8, LocalProjection(55.6, 12.5))
+    assert not pad[:, 0].any() and (~pad).sum(1).tolist() == [2, 1]
+    m = CLIPMobilityModel(9, 64, 9, 8, d_model=32, nhead=2, num_layers=2, dim_feedforward=64, embedding_dim=16).eval()
+    with torch.no_grad():
+        assert torch.isfinite(m(torch.randn(2, 20, 9), torch.as_tensor(tok), None, torch.as_tensor(pad))["clip_loss"])
+    with pytest.raises(ValueError, match="RIGHT"):
+        m.visit_transformer.hidden_states(torch.as_tensor(tok), torch.as_tensor(pad[:, ::-1].copy()))
+
+
+def test_point_tokens_are_bounded_under_gps_glitches():
+    from mobeval.nn.features import MAX_OFFSET_KM, point_tokens
+    lat = np.full((1, 10), 45.0); lon = np.full((1, 10), 9.0); lat[0, 5] = 60.0      # 1,600 km jump
+    tok = point_tokens(lat, lon, np.arange(10)[None] * 1.0)
+    assert np.abs(tok[..., :2]).max() <= MAX_OFFSET_KM and np.isfinite(tok).all()

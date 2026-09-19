@@ -45,6 +45,32 @@ Outputs in `output_dir`: `report.md`, `results.jsonl` (every metric with bootstr
 `leaderboard.csv`, `family_summary.csv`, `run_info.json`, and `checkpoints/<name>.pt` (+ a
 readable `.json` with config, training history and provenance).
 
+## Using your own data
+
+Any GPS table works (CSV or Parquet). Map your columns to `user_id, traj_id, t, lat, lon` in the config;
+see `examples/configs/vehicle_panel.yaml` for a complete example with pre-split files:
+
+```yaml
+dataset:
+  loader: csv
+  train_path: data/train.csv      # or `path:` for a single file that mobeval splits
+  test_path: data/test.csv
+  time_col: datetime
+  user_id: uid
+  traj_id: trip_id
+  lon: lng
+  query: "QUALITY >= 2"           # optional row filter
+  clean: {max_speed_mps: 70}      # optional GPS cleaning
+eval:
+  split_by: predefined            # validation is carved from the train file (val_by: time | user)
+  staypoint_method: trips         # for data recorded only while moving (vehicle black boxes)
+```
+
+Use `staypoint_method: points` (default) when the device also records while people stay somewhere, and
+`trips` when it records only during trips, so stays have to be inferred from the gaps between them. Run
+`mobeval info` first to check the number of windows, staypoints and visit sequences per split. The
+transport-mode task is skipped automatically when the data has no `mode` column.
+
 ## Training is always on the evaluation split
 
 `train` builds the same `EvalContext` as `evaluate` and trains only on its `train` split, with early

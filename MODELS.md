@@ -83,7 +83,10 @@ appended with `extra_point_features` / `extra_dim`; they must be zero or computa
 Checkpoints from the original scripts are therefore not loadable: retrain with `pretrain`.
 
 **Pairing.** Each GPS window is paired with the same user's last `visit_context` staypoints that ended
-before the window started (tested), so the visit view never contains future information.
+before the window started (tested), so the visit view never contains future information. Shorter histories
+are padded on the right: with a causal mask, left padding leaves positions with nothing to attend to, which
+PyTorch's fast inference path turns into NaN (this produced `val nan` in an earlier version). Point-token
+features are clipped to physical bounds so single GPS glitches cannot create extreme inputs.
 
 **Contrastive loss.** The original training script uses unpaired visit sequences in half of the batches
 with a negative CLIP weight. That rewards driving the contrastive cross-entropy towards infinity and

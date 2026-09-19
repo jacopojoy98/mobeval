@@ -89,7 +89,10 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
                 break
             loss = loss_fn(idx, True)
             if not torch.isfinite(loss):
-                raise FloatingPointError(f"non-finite training loss at epoch {epoch}, step {step}")
+                raise FloatingPointError(
+                    f"non-finite training loss at epoch {epoch}, step {step}. Common causes: extreme or invalid input "
+                    f"values (clean the GPS data, see mobeval.data.clean_points), or a learning rate that is too high "
+                    f"(current {opt.param_groups[0]['lr']:.2e}).")
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if cfg.grad_clip:
@@ -102,6 +105,11 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
         with torch.no_grad():
             va = [loss_fn(idx, False).item() for idx in minibatches(n_val, cfg.batch_size, False)] if n_val else []
         tr, vl = float(np.mean(tr_losses)), (float(np.mean(va)) if va else float(np.mean(tr_losses)))
+        if not np.isfinite(vl):
+            bad_batches = int(np.sum(~np.isfinite(va))) if va else 0
+            raise FloatingPointError(
+                f"non-finite validation loss at epoch {epoch} ({bad_batches}/{len(va)} batches). Early stopping "
+                "cannot work with NaN; check the validation inputs for NaN/inf or extreme values.")
         history.append({"epoch": epoch, "train_loss": tr, "val_loss": vl, "seconds": time.time() - t0})
         log.info(f"epoch {epoch:3d}  train {tr:.4f}  val {vl:.4f}  ({time.time() - t0:.0f}s)")
         sched.step(vl)

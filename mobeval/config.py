@@ -61,7 +61,7 @@ def load_dataset(d: dict):
     if kind == "geolife":
         return load_geolife(d["path"], **kw)
     if kind == "csv":
-        return from_csv(d["path"], **kw)
+        return from_csv(d.get("path"), **kw)
     if kind == "synthetic":
         return synthetic_dataset(**kw)
     raise ValueError(f"unknown dataset loader '{kind}'")

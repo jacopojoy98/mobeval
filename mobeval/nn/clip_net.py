@@ -73,6 +73,9 @@ class LocationVisitTransformer(nn.Module):
         self.visit_projection.weight.data.uniform_(-0.1, 0.1); self.visit_projection.bias.data.zero_()
 
     def hidden_states(self, src, pad=None):
+        if pad is not None and bool(pad[:, 0].any()):
+            raise ValueError("visit padding must be on the RIGHT: with a causal mask, leading padding leaves "
+                             "positions with nothing to attend to, which PyTorch's fast path turns into NaN")
         h = self.pos_encoder(self.visit_projection(src) * math.sqrt(self.d_model))
         return self.transformer_encoder(h, mask=causal_mask(src.size(1), src.device), src_key_padding_mask=pad)
 
@@ -82,10 +85,12 @@ class LocationVisitTransformer(nn.Module):
 
 
 def masked_mean(h, pad=None):
+    """Mean over valid positions. Uses where() rather than multiplication so NaN at padded
+    positions (possible in PyTorch's fast inference path) cannot propagate: NaN * 0 = NaN."""
     if pad is None:
         return h.mean(1)
-    m = (~pad).unsqueeze(-1).float()
-    return (h * m).sum(1) / m.sum(1).clamp(min=1.0)
+    valid = (~pad).unsqueeze(-1)
+    return torch.where(valid, h, torch.zeros_like(h)).sum(1) / valid.sum(1).clamp(min=1)
 
 
 class CLIPMobilityModel(nn.Module):

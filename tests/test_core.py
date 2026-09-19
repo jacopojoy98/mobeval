@@ -143,3 +143,45 @@ def test_geolife_loader_times_and_labels(tmp_path):
     assert p.t.iloc[0] == pd.Timestamp("2008-10-23 10:00:00").timestamp()
     assert p.t.diff().iloc[1] == pytest.approx(5.0)
     assert set(p["mode"].dropna()) == {"train"} and p["mode"].notna().sum() == 25
+
+
+def _vehicle_csvs(tmp_path):
+    """Trip-only recordings with the column layout of a vehicle GPS panel, pre-split in two files."""
+    p = synthetic_dataset(n_users=10, n_days=8, seed=5).points
+    p = p[p["mode"].notna()].copy()
+    p["trip"] = (p.groupby("user_id").t.diff().fillna(1e9) > 120).groupby(p.user_id).cumsum()
+    df = pd.DataFrame({"uid": p.user_id, "lat": p.lat, "lng": p.lon, "QUALITY": 3,
+                       "datetime": pd.to_datetime(p.t, unit="s").dt.strftime("%Y-%m-%d %H:%M:%S"), "trip_id": p.trip})
+    cut = df.datetime.sort_values().iloc[int(0.8 * len(df))]
+    last = df.groupby(["uid", "trip_id"]).datetime.transform("min") >= cut
+    df[~last].to_csv(tmp_path / "train.csv", index=False)
+    df[last].to_csv(tmp_path / "test.csv", index=False)
+    return tmp_path / "train.csv", tmp_path / "test.csv"
+
+
+def test_predefined_split_csv_and_trip_staypoints(tmp_path):
+    from mobeval.context import EvalContext
+    from mobeval.data import staypoints_from_trips
+    from mobeval.loaders import from_csv
+    tr, te = _vehicle_csvs(tmp_path)
+    ds = from_csv(train_path=str(tr), test_path=str(te), time_col="datetime", user_id="uid", traj_id="trip_id",
+                  lon="lng", query="QUALITY >= 2", clean={})
+    splits = ds.split("predefined", val_by="time", val_fraction=0.1)
+    ids = {k: set(v.points.traj_id) for k, v in splits.items()}
+    assert not (ids["train"] & ids["val"]) and not (ids["train"] & ids["test"]) and ids["val"] and ids["test"]
+    # validation is carved from the train file only, from its latest trajectories
+    test_file_ids = set(ds.points.loc[ds.points["split"] == "test", "traj_id"])
+    assert ids["test"] == test_file_ids and not (ids["val"] & test_file_ids)
+    assert splits["val"].points.groupby("traj_id").t.min().min() >= splits["train"].points.groupby("traj_id").t.min().max() - 1
+    sp = staypoints_from_trips(splits["train"])
+    assert len(sp) > 0 and ((sp.t_leave - sp.t_arrive) >= 20 * 60).all()
+    ctx = EvalContext(ds, EvalConfig(split_by="predefined", staypoint_method="trips", window_length=16, visit_context=3))
+    assert len(ctx.visits["test"]) > 0 and len(ctx.windows["test"]) > 0
+
+
+def test_staypoints_follow_time_not_trajectory_id_order():
+    from mobeval.data import MobilityDataset, detect_staypoints
+    rows = [("u", "b_first", 0 + 60 * k, 45.0, 9.0) for k in range(30)] + \
+           [("u", "a_second", 10_000 + 60 * k, 45.1, 9.1) for k in range(30)]
+    sp = detect_staypoints(MobilityDataset(pd.DataFrame(rows, columns=["user_id", "traj_id", "t", "lat", "lon"])))
+    assert list(sp.traj_id) == ["b_first", "a_second"] and (sp.t_leave > sp.t_arrive).all()

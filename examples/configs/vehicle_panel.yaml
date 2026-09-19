@@ -1,0 +1,54 @@
+# Pre-split vehicle GPS panel data with columns:
+#   uid,DAY,HH24,lat,lng,SPEED,HEADING,QUALITY,ID_PANELSESSION,DELTAPOS,datetime,tid,trip_id,trip_id_segment,user
+# mobeval info --config examples/configs/vehicle_panel.yaml     (check sizes first)
+# mobeval run  --config examples/configs/vehicle_panel.yaml
+title: Mobility foundation models on vehicle panel data
+output_dir: results/vehicle_panel
+
+dataset:
+  loader: csv                     # .csv or .parquet
+  train_path: /home/jacopo/Modelli/Datasets/survey/data_by_fua_final/train.csv
+  test_path: /home/jacopo/Modelli/Datasets/survey/data_by_fua_final/test_FVF.csv
+  time_col: datetime              # naive local time is kept as local clock time
+  user_id: uid                    # check: `uid` or `user`, whichever identifies a person/vehicle
+  traj_id: trip_id                # one trip = one trajectory (made unique per user automatically)
+  lat: lat
+  lon: lng
+  query: "QUALITY >= 2"           # optional: adjust to the meaning of QUALITY in your data
+  clean: {max_speed_mps: 70}      # drop impossible jumps (> 250 km/h), duplicates, 1-point trips
+
+eval:
+  split_by: predefined            # use your files; validation is carved from TRAIN only
+  val_by: time                    # latest 10% of train trips (or: user)
+  val_fraction: 0.1
+  staypoint_method: trips         # stays = gaps between consecutive trips (points only recorded while moving)
+  staypoint_time_s: 1200          # a stay lasts at least 20 minutes
+  trip_max_stay_s: 259200         # gaps longer than 3 days are missing data
+  window_length: 64               # points per GPS window; check sampling interval with `mobeval info`
+  max_gap_s: 300                  # windows never span a sampling gap longer than this
+  visit_context: 8
+  grid_cell_m: 500
+  eval_seeds: [0, 1, 2]
+  n_boot: 1000
+  max_eval_samples: 5000
+  travel_time_max_h: 4.0
+
+models:
+  - name: UniTraj-zeroshot
+    type: unitraj
+    checkpoint: /home/jacopo/Documenti/MobFM/Survey/UniTraj/model.pt
+    external_pretraining: true
+    adapter: {device: cuda, batch_size: 256}
+  - name: UniTraj-finetuned
+    type: unitraj
+    chechpoint: /home/jacopo/Documenti/MobFM/BMdir/mobeval/results/geolife/checkpoints/UniTraj-finetuned.pt
+    #train: {init_from: models/unitraj/model.pt, epochs: 30, batch_size: 128, lr: 3.0e-4, patience: 5, device: cuda}
+    adapter: {device: cuda, batch_size: 256}
+  - name: TrajGPT
+    type: trajgpt
+    train: {epochs: 200, batch_size: 64, lr: 1.0e-3, patience: 15, device: cuda}
+    adapter: {device: cuda}
+  - name: CLIPMobility
+    type: clip_mobility
+    train: {epochs: 50, batch_size: 64, lr: 1.0e-4, patience: 8, device: cuda}
+    adapter: {device: cuda}

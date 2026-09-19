@@ -18,15 +18,63 @@ GEOLIFE_MODE_MAP = {"walk": "walk", "bike": "bike", "bus": "bus", "car": "car", 
                     "train": "train", "subway": "train", "railway": "train"}
 
 
-def from_csv(path: str, name: Optional[str] = None, time_col: str = "t", **rename) -> MobilityDataset:
-    """Generic CSV/Parquet with columns user_id, traj_id, t, lat, lon[, mode].
-    `t` may be unix seconds or a datetime string. Pass rename=dict(old=new) as kwargs."""
+def _read_table(path):
     p = Path(path)
-    df = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
-    df = df.rename(columns={v: k for k, v in rename.items()}) if rename else df
-    if not np.issubdtype(df[time_col].dtype, np.number):
-        df[time_col] = to_unix_seconds(df[time_col])
-    return MobilityDataset(df.rename(columns={time_col: "t"}), name or p.stem)
+    return pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
+
+
+def from_csv(path: Optional[str] = None, name: Optional[str] = None, time_col: str = "t",
+             train_path: Optional[str] = None, test_path: Optional[str] = None, val_path: Optional[str] = None,
+             query: Optional[str] = None, clean: Optional[dict] = None, keep_columns=(), **rename) -> MobilityDataset:
+    """CSV/Parquet GPS table(s) -> MobilityDataset.
+
+    path                     one file (mobeval splits it), OR
+    train_path / test_path   pre-split files (+ optional val_path); adds a `split` column for
+                             EvalConfig(split_by="predefined")
+    time_col                 unix seconds or a datetime column. Naive datetimes are kept as local
+                             clock time, so time-of-day features refer to local time
+    rename                   canonical=original, e.g. user_id="uid", traj_id="trip_id", lon="lng"
+    query                    optional pandas query applied before renaming, e.g. "QUALITY >= 2"
+    clean                    optional clean_points() arguments, e.g. {max_speed_mps: 70}; {} = defaults
+    keep_columns             extra original columns to keep (after renaming)
+    """
+    from .data import clean_points
+    files = {"all": path} if path else {k: v for k, v in (("train", train_path), ("val", val_path), ("test", test_path)) if v}
+    if not files or (path and (train_path or test_path)):
+        raise ValueError("give either `path` or `train_path` + `test_path`")
+    if not path and not (train_path and test_path):
+        raise ValueError("pre-split data needs both train_path and test_path")
+    frames = []
+    for split, f in files.items():
+        df = _read_table(f)
+        if query:
+            df = df.query(query)
+        if split != "all":
+            df = df.assign(split=split)
+        frames.append(df)
+    df = pd.concat(frames, ignore_index=True)
+    mapping = {orig: canon for canon, orig in rename.items()}
+    missing = [c for c in list(mapping) + [time_col] if c not in df.columns]
+    if missing:
+        raise ValueError(f"columns not found: {missing}; available: {list(df.columns)}")
+    df = df.rename(columns={**mapping, time_col: "t"})
+    if not pd.api.types.is_numeric_dtype(df["t"]):
+        df["t"] = to_unix_seconds(df["t"])
+    wanted = ["user_id", "traj_id", "t", "lat", "lon"] + [c for c in ("mode", "split") if c in df.columns] + list(keep_columns)
+    lacking = [c for c in ("user_id", "traj_id", "lat", "lon") if c not in df.columns]
+    if lacking:
+        raise ValueError(f"no column mapped to {lacking}; pass e.g. user_id='uid', traj_id='trip_id', lon='lng'")
+    df = df[wanted].copy()
+    # trajectory ids only need to be unique per user in many datasets: make them globally unique
+    df["user_id"] = df["user_id"].astype(str)
+    df["traj_id"] = df["user_id"] + ":" + df["traj_id"].astype(str)
+    if "split" in df.columns:
+        per_traj = df.groupby("traj_id")["split"].nunique()
+        if (per_traj > 1).any():
+            raise ValueError(f"{int((per_traj > 1).sum())} trajectories occur in more than one split file")
+    if clean is not None:
+        df = clean_points(df, **clean)
+    return MobilityDataset(df, name or Path(path or train_path).stem)
 
 
 def load_geolife(root: str, users=None, labelled_only: bool = False, max_speed_mps: float = 60.0) -> MobilityDataset:

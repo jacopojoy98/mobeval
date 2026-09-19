@@ -227,6 +227,8 @@ class TrajGPTAdapter(TorchAdapter):
     _seed_context = 8
 
     def _reference_staypoints(self, reference):
+        if getattr(self, "reference_staypoints", None) is not None:       # set by the pipeline (configured method)
+            return self.reference_staypoints
         from ..data import detect_staypoints
         key = id(reference)
         if getattr(self, "_ref_key", None) != key:

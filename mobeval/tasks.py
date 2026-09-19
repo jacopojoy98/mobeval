@@ -290,8 +290,11 @@ class ModeClassificationTask(Task):
 class GenerationTask(Task):
     name, capability = "generation", GENERATION
 
-    def _stats(self, ctx, ds):
-        sp = detect_staypoints(ds, ctx.cfg.staypoint_dist_m, ctx.cfg.staypoint_time_s, by_trajectory=True)
+    def _stats(self, ctx, ds, generated: bool = False):
+        # generators emit dwell points (e.g. arrival + departure per visit), so generated data always uses
+        # point-based detection per trajectory; real data uses the configured method
+        sp = (detect_staypoints(ds, ctx.cfg.staypoint_dist_m, ctx.cfg.staypoint_time_s, by_trajectory=True)
+              if generated else ctx.detect_staypoints(ds))
         return G.trajectory_stats(ds.points, sp, ctx.grid)
 
     def run(self, adapter, ctx):
@@ -306,12 +309,13 @@ class GenerationTask(Task):
             ctx.cache["gen_floor"] = self._stats(ctx, MobilityDataset(tr[tr.traj_id.isin(ids)], "floor"))
         real, floor = ctx.cache["gen_real"], ctx.cache["gen_floor"]
         for seed in cfg.eval_seeds:
+            adapter.reference_staypoints = ctx.staypoints["train"]
             with ctx.timed(_key(adapter), self.capability, n):
                 gen_ds = adapter.generate(ctx.splits["train"], n, seed)
-            gen = self._stats(ctx, gen_ds)
+            gen = self._stats(ctx, gen_ds, generated=True)
             lk = ("gen_lower", seed)
             if lk not in ctx.cache:
-                ctx.cache[lk] = self._stats(ctx, B.uniform_bbox_generator(ctx.splits["train"], n, seed))
+                ctx.cache[lk] = self._stats(ctx, B.uniform_bbox_generator(ctx.splits["train"], n, seed), generated=True)
             lower = ctx.cache[lk]
             for stat in [s for s in real if not s.startswith("_")]:
                 r = real[stat].to_numpy(float)

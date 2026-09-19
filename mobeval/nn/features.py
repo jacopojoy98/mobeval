@@ -16,6 +16,8 @@ from ..data import SpatialGrid
 from ..geo import LocalProjection, haversine_m
 
 POINT_TOKEN_DIM = 9
+MAX_OFFSET_KM = 200.0      # clip for local offsets within a window
+MAX_SPEED_MPS = 100.0      # clip for point speeds (360 km/h)
 VISIT_TOKEN_DIM = 9
 COORD_CHANNELS = (0, 1)
 KINEMATIC_CHANNELS = (3, 4, 5)
@@ -121,6 +123,11 @@ def point_tokens(lat, lon, t, hidden: Optional[np.ndarray] = None) -> np.ndarray
     tok[..., 4], tok[..., 5] = np.where(known, np.sin(head), 0.0), np.where(known, np.cos(head), 0.0)
     s, c, w = _tod_week(t)
     tok[..., 6], tok[..., 7], tok[..., 8] = s, c, w
+    # physical bounds: a single GPS glitch (e.g. a jump of 1000 km) must not produce huge inputs
+    np.clip(tok[..., :2], -MAX_OFFSET_KM, MAX_OFFSET_KM, out=tok[..., :2])
+    np.clip(tok[..., 3], 0.0, MAX_SPEED_MPS / 10.0, out=tok[..., 3])
+    if not np.isfinite(tok).all():
+        raise ValueError("non-finite point tokens: check the input for NaN/inf coordinates or timestamps")
     return tok
 
 
@@ -145,4 +152,5 @@ def visit_tokens(lat, lon, t_arrive, t_leave, proj: LocalProjection) -> np.ndarr
     tok[..., 6] = np.log1p(np.maximum(tl - ta, 0) / 3600.0)
     travel = ta - np.concatenate([tl[..., :1], tl[..., :-1]], axis=-1)
     tok[..., 7] = np.log1p(np.clip(travel, 0, None) / 3600.0)
+    np.clip(tok[..., :2], -50.0, 50.0, out=tok[..., :2])        # +-500 km around the data centre
     return tok

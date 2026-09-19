@@ -46,11 +46,16 @@ class MobilityDataset:
     def subset_users(self, users) -> "MobilityDataset":
         return MobilityDataset(self.points[self.points.user_id.isin(set(users))], self.name)
 
-    def split(self, by: str = "time", ratios=(0.8, 0.1, 0.1), seed: int = 0) -> Dict[str, "MobilityDataset"]:
+    def split(self, by: str = "time", ratios=(0.8, 0.1, 0.1), seed: int = 0, val_by: str = "time",
+              val_fraction: float = 0.1) -> Dict[str, "MobilityDataset"]:
         """by='time': chronological split of trajectories (UniTE protocol, 8:1:1).
-        by='user':  disjoint users (tests generalisation to unseen people)."""
-        assert abs(sum(ratios) - 1) < 1e-9
+        by='user':  disjoint users (tests generalisation to unseen people).
+        by='predefined': use the `split` column (train/test, optionally val). Without val rows, a
+        validation set is carved from TRAIN only (`val_by` = 'time': latest trajectories, or 'user')."""
         names = ("train", "val", "test")
+        if by == "predefined":
+            return self._predefined_split(val_by, val_fraction, seed)
+        assert abs(sum(ratios) - 1) < 1e-9
         if by == "user":
             users = np.array(sorted(self.points.user_id.unique()))
             np.random.default_rng(seed).shuffle(users)
@@ -64,7 +69,37 @@ class MobilityDataset:
             groups = np.split(ids, cuts)
             return {n: MobilityDataset(self.points[self.points.traj_id.isin(set(g))], self.name)
                     for n, g in zip(names, groups)}
-        raise ValueError("by must be 'time' or 'user'")
+        raise ValueError("by must be 'time', 'user' or 'predefined'")
+
+    def _predefined_split(self, val_by: str, val_fraction: float, seed: int):
+        if "split" not in self.points.columns:
+            raise ValueError("split_by='predefined' needs a 'split' column (train/test[/val]); "
+                             "from_csv(train_path=..., test_path=...) adds it")
+        p = self.points
+        labels = set(p["split"].unique())
+        if not labels <= {"train", "val", "test"} or not {"train", "test"} <= labels:
+            raise ValueError(f"'split' column must contain train and test (and optionally val), found {sorted(labels)}")
+        both = set(p.loc[p["split"] == "train", "traj_id"]) & set(p.loc[p["split"] == "test", "traj_id"])
+        if both:
+            raise ValueError(f"{len(both)} trajectories appear in both train and test, e.g. {sorted(both)[:3]}")
+        sub = lambda mask: MobilityDataset(p[mask], self.name)
+        out = {"test": sub(p["split"] == "test")}
+        if "val" in labels:
+            out["train"], out["val"] = sub(p["split"] == "train"), sub(p["split"] == "val")
+            return out
+        tr = p[p["split"] == "train"]
+        if val_by == "user":
+            users = np.array(sorted(tr.user_id.unique()))
+            np.random.default_rng(seed).shuffle(users)
+            val_ids = set(tr.loc[tr.user_id.isin(users[:max(1, int(round(val_fraction * len(users))))]), "traj_id"])
+        elif val_by == "time":
+            starts = tr.groupby("traj_id")["t"].min().sort_values()
+            val_ids = set(starts.index[len(starts) - max(1, int(round(val_fraction * len(starts)))):])
+        else:
+            raise ValueError("val_by must be 'time' or 'user'")
+        is_val = tr.traj_id.isin(val_ids)
+        out["train"], out["val"] = MobilityDataset(tr[~is_val], self.name), MobilityDataset(tr[is_val], self.name)
+        return out
 
 
 # --------------------------------------------------------------------------- #
@@ -195,6 +230,7 @@ def detect_staypoints(ds: MobilityDataset, dist_thresh_m: float = 200.0,
     keys = ["user_id", "traj_id"] if by_trajectory else "user_id"
     for key, g in ds.points.groupby(keys, sort=False):
         uid = key[0] if by_trajectory else key
+        g = g.sort_values("t", kind="stable")             # chronological, whatever the trajectory ids are
         la, lo, tt = g.lat.to_numpy(), g.lon.to_numpy(), g.t.to_numpy()
         tids = g.traj_id.to_numpy()
         n, i = len(tt), 0
@@ -209,6 +245,61 @@ def detect_staypoints(ds: MobilityDataset, dist_thresh_m: float = 200.0,
                 i += 1
     sp = pd.DataFrame(rows, columns=["user_id", "traj_id", "lat", "lon", "t_arrive", "t_leave"])
     return sp.sort_values(["user_id", "t_arrive"]).reset_index(drop=True)
+
+
+def staypoints_from_trips(ds: MobilityDataset, min_stay_s: float = 20 * 60, max_link_dist_m: float = 500.0,
+                          max_stay_s: float = 3 * 86400) -> pd.DataFrame:
+    """Staypoints for trip-segmented data (e.g. vehicle black boxes that record only while moving).
+    A stay is the gap between the end of one trip and the start of the user's next trip, if it lasts
+    at least `min_stay_s`. Location: midpoint of trip end and next trip start when they are within
+    `max_link_dist_m`, otherwise the trip end. Gaps above `max_stay_s` are treated as missing data."""
+    p = ds.points.sort_values(["user_id", "t"], kind="stable")
+    trips = p.groupby(["user_id", "traj_id"], sort=False).agg(
+        t_start=("t", "first"), t_end=("t", "last"), lat_s=("lat", "first"), lon_s=("lon", "first"),
+        lat_e=("lat", "last"), lon_e=("lon", "last")).reset_index().sort_values(["user_id", "t_start"])
+    rows = []
+    for uid, g in trips.groupby("user_id", sort=False):
+        g = g.reset_index(drop=True)
+        for i in range(len(g) - 1):
+            a, b = g.iloc[i], g.iloc[i + 1]
+            gap = b.t_start - a.t_end
+            if gap < min_stay_s or gap > max_stay_s:
+                continue
+            d = haversine_m(a.lat_e, a.lon_e, b.lat_s, b.lon_s)
+            lat, lon = ((a.lat_e + b.lat_s) / 2, (a.lon_e + b.lon_s) / 2) if d <= max_link_dist_m else (a.lat_e, a.lon_e)
+            rows.append((uid, a.traj_id, float(lat), float(lon), float(a.t_end), float(b.t_start)))
+    sp = pd.DataFrame(rows, columns=["user_id", "traj_id", "lat", "lon", "t_arrive", "t_leave"])
+    return sp.sort_values(["user_id", "t_arrive"]).reset_index(drop=True)
+
+
+def clean_points(df: pd.DataFrame, max_speed_mps: float = 70.0, min_points: int = 2,
+                 drop_duplicate_times: bool = True) -> pd.DataFrame:
+    """Remove NaN/invalid coordinates, duplicate timestamps within a trajectory, points implying an
+    impossible speed from the previous kept point, and trajectories with fewer than `min_points`."""
+    n0 = len(df)
+    df = df.dropna(subset=["user_id", "traj_id", "t", "lat", "lon"])
+    df = df[df.lat.between(-90, 90) & df.lon.between(-180, 180) & ~((df.lat == 0) & (df.lon == 0))]
+    df = df.sort_values(["traj_id", "t"], kind="stable")
+    if drop_duplicate_times:
+        df = df.drop_duplicates(["traj_id", "t"])
+    keep = np.ones(len(df), bool)
+    lat, lon, t, tid = df.lat.to_numpy(), df.lon.to_numpy(), df.t.to_numpy(), df.traj_id.to_numpy()
+    last = 0
+    for i in range(1, len(df)):
+        if tid[i] != tid[last] or not keep[last]:
+            last = i
+            continue
+        v = haversine_m(lat[last], lon[last], lat[i], lon[i]) / max(t[i] - t[last], 1.0)
+        if v > max_speed_mps:
+            keep[i] = False
+        else:
+            last = i
+    df = df[keep]
+    df = df[df.groupby("traj_id").t.transform("size") >= min_points]
+    import logging
+    logging.getLogger("mobeval.data").info(f"clean_points: kept {len(df)}/{n0} points "
+                                           f"({df.traj_id.nunique()} trajectories)")
+    return df.reset_index(drop=True)
 
 
 @dataclass

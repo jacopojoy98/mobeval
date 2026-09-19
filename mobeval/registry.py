@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -65,8 +66,24 @@ def train_model(spec: dict, ctx, output_dir) -> Path:
     init_from = tr.pop("init_from", None)
     if init_from:
         kwargs["init_from"] = init_from
+    from . import progress
+    rep, t0 = progress.get(), time.time()
     log.info(f"training {spec['name']} ({mtype}) -> {out}")
-    getattr(cls, TRAIN_METHOD[mtype])(ctx, train=tr, out=str(out), **kwargs, **spec.get("adapter", {}))
+    rep.set_phase(f"training {spec['name']}")
+    rep.model(spec["name"], state="training", detail="starting")
+    rep.event("train_start", model=spec["name"], model_type=mtype, epochs=tr.get("epochs"),
+              message=f"training {spec['name']} ({mtype})")
+    try:
+        with rep.scoped(spec["name"]):
+            getattr(cls, TRAIN_METHOD[mtype])(ctx, train=tr, out=str(out), **kwargs, **spec.get("adapter", {}))
+    except Exception as e:                                             # noqa: BLE001
+        rep.model(spec["name"], state="failed", detail=repr(e)[:80])
+        rep.error(f"training {spec['name']} failed: {e!r}", model=spec["name"])
+        raise
+    rep.model(spec["name"], state="trained", train_seconds=time.time() - t0, detail=f"-> {out.name}")
+    rep.event("train_end", model=spec["name"], seconds=time.time() - t0,
+              message=f"{spec['name']}: trained in {time.time() - t0:.0f}s")
+    rep.step_done()
     return out
 
 

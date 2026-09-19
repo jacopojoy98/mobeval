@@ -71,6 +71,28 @@ Use `staypoint_method: points` (default) when the device also records while peop
 `mobeval info` first to check the number of windows, staypoints and visit sequences per split. The
 transport-mode task is skipped automatically when the data has no `mode` column.
 
+## POI and road-network features (optional, used by TransferTraj)
+
+`mobeval context` builds them for your data's area and prints the config block to paste:
+
+```bash
+# with internet (login node / laptop): downloads from OpenStreetMap via osmnx
+mobeval context --config exp.yaml --out data/context
+
+# offline: from files you exported once (Overpass Turbo, QGIS, a Geofabrik extract)
+mobeval context --config exp.yaml --out data/context \
+    --poi-file pois.geojson --road-file roads.geojson
+```
+
+It writes `poi_embed.npy`, `poi_latlon.npy`, `road_embed.npy`, `road_latlon.npy` (embeddings are
+one-hot over the most frequent OSM categories, so nothing needs downloading or training) plus a
+`*_categories.json` listing what each column means. Useful flags: `--dim`, `--max-features`,
+`--road-spacing`, `--pad-km`. Supply your own embeddings instead by writing those `.npy` files
+yourself — any real-valued `(N, d)` matrix works, paired with `(N, 2)` (lat, lon) coordinates.
+
+The model compares every trajectory point with every context entry, so cost grows with the number of
+entries; `--max-features` caps it. Only TransferTraj uses these today; the other models ignore them.
+
 ## Training is always on the evaluation split
 
 `train` builds the same `EvalContext` as `evaluate` and trains only on its `train` split, with early
@@ -94,6 +116,43 @@ patience, grad_clip, max_steps_per_epoch, device, seed`, plus `init_from` and `o
 model-specific training arguments) and `adapter:` (`device, batch_size, head_train, head_hidden,
 head_class_weighted`, ...).
 
+## Watching a run in progress
+
+Batch jobs are opaque: the work happens on a compute node, possibly for hours. Every run therefore
+writes live progress that you can read from anywhere:
+
+```bash
+mobeval status --progress-dir ~/MobFM/results/progress      # one look
+mobeval status --config exp.yaml --watch                    # refresh every 10 s
+mobeval status --progress-dir DIR --events 20               # plus the recent event log
+```
+
+```
+* 20260919-135540-8821-run  [running]  job 446898.pbs01 on daneel02
+  started Sat 13:55:40   elapsed 1h 12m   last update 3s ago
+  phase: training TransferTraj
+  steps: [████████░░░░░░░░░░░░░░░░] 3/9   eta ~2h 04m
+    TransferTraj           training   epoch 47/200  val 4.31  best 4.29
+    UniTraj                trained    -> UniTraj.pt   trained in 12m 31s
+    TrajGPT                pending
+  records: 124   skipped: 8
+```
+
+A run is marked `stale` when it stops updating while still claiming to run, which is what a killed or
+crashed job looks like; `failed` runs show the reason. Several jobs can share one progress directory
+(`submit_all.sh` submits one per model), and `status` lists them together, newest first.
+
+Each run writes two files: `<run_id>.status.json`, a snapshot rewritten atomically so reading it mid-run
+is safe, and `<run_id>.events.jsonl`, an append-only log (stage boundaries, every training epoch with
+its losses, every task with its record count and duration) that is easy to parse for your own plots.
+
+**Where it goes.** `MOBEVAL_PROGRESS_DIR`, `--progress-dir`, or `progress_dir:` in the config, falling
+back to `<output_dir>/progress`. On a cluster this must be a shared filesystem (home or project
+folder): jobs compute on node-local `/scratch`, which the login node cannot see. The supplied PBS
+scripts already set it to `$RESULTS_DIR/progress`.
+
+Nothing in the status path imports PyTorch, so it works in a plain shell on a login node.
+
 ## Running on an HPC cluster (PBS)
 
 `jobs/` contains ready-made PBS scripts (written for the SNS HPC cluster: no default queue, GPUs on the
@@ -105,7 +164,8 @@ qsub jobs/all_in_one.pbs                              # train missing checkpoint
 bash jobs/submit_all.sh UniTraj-finetuned TrajGPT CLIPMobility   # one job per model + evaluation after
 qsub -v MODEL=TrajGPT jobs/train_model.pbs            # a single model
 qsub jobs/evaluate.pbs                                # evaluation only, from existing checkpoints
-qstat -u $USER                                        # follow, qdel <id> to cancel
+qstat -u $USER                                        # is it queued or running?
+python -m mobeval status --progress-dir ~/MobFM/results/progress --watch   # what is it doing?
 ```
 
 The scripts copy data to `/scratch/$USER`, run there, and copy `results/` (report, metrics, checkpoints)

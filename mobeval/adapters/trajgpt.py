@@ -79,9 +79,10 @@ class TrajGPTAdapter(TorchAdapter):
             raise ValueError("raw TrajGPT state dicts carry no vocabulary/scales; use from_original_state_dict(...)")
         m = ck["meta"]
         ad = cls(RegionTokenizer.from_state(m["tokenizer"]), LocalProjection(*m["proj"]), m["t0"], m["max_travel_h"],
-                 m["max_duration_h"], m["lambda_max"], m["sequence_len"], arch=ck["config"]["arch"],
-                 min_scale_h=m.get("min_scale_h", 1.0 / 60), time_reference=m.get("time_reference", "global"),
-                 max_valid_travel_h=m.get("max_valid_travel_h", 4.0), **kw)
+                 m["max_duration_h"], m["lambda_max"], m["sequence_len"],
+                 **{"arch": ck["config"]["arch"], "min_scale_h": m.get("min_scale_h", 1.0 / 60),
+                    "time_reference": m.get("time_reference", "global"),
+                    "max_valid_travel_h": m.get("max_valid_travel_h", 4.0), **kw})
         ad.net.load_state_dict(ck["state_dict"], strict=True)
         ad.net.eval()
         ad.provenance = m.get("provenance", {})

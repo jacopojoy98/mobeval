@@ -126,12 +126,29 @@ spatial + temporal + token loss.
    different predictions. Noisy top-k gating is a training-time regulariser (Shazeer et al.), so the
    noise is applied only in training mode here; set `NoisyTopkRouter.noise_in_eval = True` to restore
    the original behaviour. Numerical equivalence with the original was verified with the noise active.
-4. *POI and road-network features are optional.* Without them the parameter shapes are unchanged and
+4. *Memory.* To average the POI embeddings near each point, the original materialises a
+   (batch, length, n_context, d_model) tensor — 6.5 GB for 16 x 64 points against the 12k POIs of its
+   own Chengdu sample at d_model 128, which is why its settings use a batch size of 16. A masked sum
+   over the context axis is exactly a matrix product of the 0/1 mask with the embedding matrix, so
+   mobeval computes it that way, in chunks of `context_chunk` (default 4096) entries. Results match
+   the original to float32 rounding (3.6e-07) at any chunk size, with about 128x less memory.
+5. *POI and road-network features are optional.* Without them the parameter shapes are unchanged and
    the two context pathways contribute only their token embedding. Supply them per adapter with
    `context: {poi_embed: pois.npy, poi_latlon: poi_latlon.npy, road_embed: ..., road_latlon: ...}`,
    where the embeddings are (N, d) arrays and the coordinates (N, 2) arrays of (lat, lon); mobeval
    projects them with the same projection as the trajectories. Note the original compares SQUARED
-   distances against `poi_dist`/`rn_dist`, so the default of 100 means a 10 m radius.
+   distances against `poi_dist`/`rn_dist`, so the default of 100 means a 10 m radius; `mobeval context`
+   prints a value suited to the density of your area.
+
+**Where the features come from.** The original ships 64-d embeddings for Chengdu and Xi'an: one row
+per POI (12,439 of them, nearly all distinct, so text embeddings of the POI name and category) and one
+per road segment (4,315 rows but only 1,410 distinct, so segments of the same street share a vector).
+Neither the embedding model nor a builder is included, and both cities are Chinese, so for any other
+region the features have to be rebuilt. `mobeval context` does that from OpenStreetMap: POIs from the
+usual tags (amenity, shop, tourism, leisure, office, public_transport), road sample points from the
+drivable network at a fixed spacing, and one-hot category embeddings that need no model download. See
+the README for the command and `mobeval/context_features.py` for the readers if you prefer to supply
+your own vectors.
 
 **Capabilities.** Recovery (spatial features masked, timestamps kept, one forward pass, as in the
 repository's TRec padder), embeddings (mean over the encoder states), and mode classification through

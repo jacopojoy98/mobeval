@@ -9,6 +9,11 @@ RESULTS_DIR="$HOME/MobFM/results"           # final outputs are copied back here
 # Scratch: all job I/O happens here (mandatory on this cluster; not backed up)
 SCRATCH="/scratch/$USER/mobeval/$PBS_JOBID"
 
+# Live progress. MUST be on a shared filesystem so you can read it from trantor while the job runs
+# on a compute node - scratch is local to the node. Inspect with:
+#   python -m mobeval status --progress-dir "$RESULTS_DIR/progress" --watch
+export MOBEVAL_PROGRESS_DIR="$RESULTS_DIR/progress"
+
 # Python environment. Check `module avail` on the cluster for the exact module names;
 # if there are no modules, just create the venv with the system python once:
 #   python3 -m venv ~/venvs/mobeval
@@ -24,8 +29,9 @@ setup_env() {
     export OMP_NUM_THREADS="${NCPUS:-1}"
     export MKL_NUM_THREADS="${NCPUS:-1}"
     export PYTHONUNBUFFERED=1
-    mkdir -p "$SCRATCH" "$RESULTS_DIR"
+    mkdir -p "$SCRATCH" "$RESULTS_DIR" "$MOBEVAL_PROGRESS_DIR"
     echo "host=$(hostname) job=$PBS_JOBID cpus=${NCPUS:-?} scratch=$SCRATCH"
+    echo "progress: python -m mobeval status --progress-dir $MOBEVAL_PROGRESS_DIR --watch"
     python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(),
       torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
 }

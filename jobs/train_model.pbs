@@ -16,7 +16,7 @@ restore_checkpoints
 
 : "${MODEL:?pass the model name: qsub -v MODEL=TrajGPT jobs/train_model.pbs}"
 echo "=== training $MODEL ==="
-mobeval train --config "$SCRATCH/config.yaml" --models "$MODEL" --device cuda -v
+python -m mobeval train --config "$SCRATCH/config.yaml" --models "$MODEL" --device cuda -v
 
 stage_out
 exit 0

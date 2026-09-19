@@ -14,7 +14,7 @@ setup_env
 stage_in
 restore_checkpoints
 
-mobeval evaluate --config "$SCRATCH/config.yaml" --device cuda -v
+python -m mobeval evaluate --config "$SCRATCH/config.yaml" --device cuda -v
 
 stage_out
 echo "report: $RESULTS_DIR/report.md"

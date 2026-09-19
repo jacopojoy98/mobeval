@@ -59,5 +59,10 @@ models:
       device: cuda
       batch_size: 128
       coord_scale: 1000.0        # 1.0 reproduces the original (raw metres); see MODELS.md
-      # context: {poi_embed: data/poi_embed.npy, poi_latlon: data/poi_latlon.npy,
-      #           road_embed: data/road_embed.npy, road_latlon: data/road_latlon.npy}
+      # Optional POI / road context. Build it once with:
+      #   mobeval context --config examples/configs/vehicle_panel.yaml --out data/context
+      # then paste the block it prints (keep the files on a shared filesystem, not on /scratch,
+      # so compute nodes can read them):
+      # context: {poi_embed: data/context/poi_embed.npy, poi_latlon: data/context/poi_latlon.npy,
+      #           road_embed: data/context/road_embed.npy, road_latlon: data/context/road_latlon.npy}
+      # and set arch.poi_dist / arch.rn_dist to the SQUARED radius in metres (250000 = 500 m).

@@ -50,7 +50,7 @@ class UniTrajAdapter(TorchAdapter):
     def from_checkpoint(cls, path: str, **kw) -> "UniTrajAdapter":
         from ..nn.common import load_checkpoint
         ck = load_checkpoint(path)
-        ad = cls(arch=ck["config"].get("arch"), norm=ck["meta"].get("norm"), **kw)
+        ad = cls(**{"arch": ck["config"].get("arch"), "norm": ck["meta"].get("norm"), **kw})
         ad.net.load_state_dict(ck["state_dict"], strict=True)
         ad.net.eval()
         ad.provenance = ck["meta"].get("provenance", {})

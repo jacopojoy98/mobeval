@@ -21,6 +21,7 @@ Deviations, all optional and recorded in the checkpoint:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -59,8 +60,19 @@ class TransferTrajAdapter(TorchAdapter):
         out = {}
         for kind in ("poi", "road"):
             emb, coo = self.context.get(f"{kind}_embed"), self.context.get(f"{kind}_latlon")
-            if emb and coo:
+            if not (emb and coo):
+                continue
+            for f in (emb, coo):
+                if not Path(f).exists():
+                    raise FileNotFoundError(
+                        f"{kind} context file {f} not found. Paths recorded at training time are absolute; "
+                        f"override them with `adapter: {{context: {{...}}}}` in the config, or rebuild the "
+                        f"features with `mobeval context`.")
+            if True:
                 e, c = np.load(emb), np.load(coo)
+                if c.ndim != 2 or c.shape[1] != 2 or len(c) != len(e):
+                    raise ValueError(f"{kind}: embeddings {e.shape} and coordinates {c.shape} must have the "
+                                     f"same length, with coordinates shaped (N, 2) as (lat, lon)")
                 x, y = self.proj.to_xy(c[:, 0], c[:, 1])
                 out[f"{kind}_embed"] = np.asarray(e, np.float32)
                 out[f"{kind}_coors"] = np.stack([x, y], 1).astype(np.float32) / self.coord_scale
@@ -82,8 +94,10 @@ class TransferTrajAdapter(TorchAdapter):
             raise ValueError("raw TransferTraj state dicts do not record the projection or coordinate scale; "
                              "use from_original_state_dict(...)")
         m = ck["meta"]
-        ad = cls(arch=ck["config"]["arch"], center=m["center"], coord_scale=m["coord_scale"],
-                 context=m.get("context"), pooling=m.get("pooling", "mean"), **kw)
+        # kw wins over the stored values: context file paths in particular are absolute and move
+        # between machines and jobs (staging to /scratch, for instance), so a config may override them.
+        ad = cls(**{"arch": ck["config"]["arch"], "center": m["center"], "coord_scale": m["coord_scale"],
+                    "context": m.get("context"), "pooling": m.get("pooling", "mean"), **kw})
         ad.net.load_state_dict(ck["state_dict"], strict=True)
         ad.net.eval()
         ad.provenance = m.get("provenance", {})

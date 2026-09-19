@@ -180,11 +180,12 @@ def masked_mean(values, mask):
 # --------------------------------------------------------------------------- model
 class TransferTraj(nn.Module):
     def __init__(self, embed_size, d_model, poi_embed=None, poi_coors=None, road_embed=None, road_coors=None,
-                 rafee_layer=2, UTM_region=None, poi_dist=100, rn_dist=100):
+                 rafee_layer=2, UTM_region=None, poi_dist=100, rn_dist=100, context_chunk=4096):
         super().__init__()
         poi_embed, poi_coors = _default_context(poi_embed, poi_coors)
         road_embed, road_coors = _default_context(road_embed, road_coors)
         self.UTM_region, self.poi_dist, self.rn_dist = UTM_region, poi_dist, rn_dist
+        self.context_chunk = int(context_chunk)
         self.register_buffer("poi_coors", poi_coors, persistent=False)
         self.register_buffer("road_coors", road_coors, persistent=False)
         self.register_buffer("poi_embed_mat", poi_embed, persistent=False)
@@ -217,14 +218,29 @@ class TransferTraj(nn.Module):
         return modal_h, self.seq_model(modal_h, norm_coord, mask=causal_mask, src_key_padding_mask=batch_mask)
 
     def _context_embed(self, layer, embed_mat, coors, spatial, first_point, thresh, feature_mask, token_e,
-                       zero_masked=True):
-        """zero_masked mirrors the original: the POI pathway zeroes masked positions
-        (`masked_fill_`), while the road pathway calls the NON in-place `masked_fill` and
-        therefore leaves them untouched. Kept as-is for checkpoint fidelity."""
-        dist = ((coors.unsqueeze(0).unsqueeze(0) - (spatial + first_point.unsqueeze(1)).unsqueeze(2)) ** 2).sum(-1)
-        sel = layer(embed_mat).unsqueeze(0).unsqueeze(0).expand(dist.shape[0], dist.shape[1], -1, -1)
-        mask = dist < thresh
-        e = (sel * mask.unsqueeze(-1)).sum(dim=2) / mask.sum(-1, keepdim=True).clamp(min=1)
+                       zero_masked=True, chunk=4096):
+        """Mean embedding of the POIs / road segments within `thresh` (a SQUARED distance) of each point.
+
+        The original materialises (B, L, N_context, D) to mask the embeddings before summing, which is
+        6.5 GB for a batch of 16 x 64 points against 12k POIs at d_model=128. A masked sum over the
+        context axis is exactly a matrix product of the 0/1 mask with the embedding matrix, so the
+        result is identical while only (B, L, chunk) is held at once.
+
+        zero_masked mirrors the original: the POI pathway zeroes masked positions (`masked_fill_`),
+        while the road pathway calls the NON in-place `masked_fill` and therefore leaves them
+        untouched. Kept as-is for checkpoint fidelity.
+        """
+        pts = (spatial + first_point.unsqueeze(1)).unsqueeze(2)              # (B, L, 1, 2)
+        emb = layer(embed_mat)                                               # (N, D)
+        B, L = spatial.shape[:2]
+        num = torch.zeros(B, L, emb.shape[1], dtype=emb.dtype, device=emb.device)
+        cnt = torch.zeros(B, L, 1, dtype=emb.dtype, device=emb.device)
+        for s in range(0, coors.shape[0], chunk):
+            dist = ((coors[s:s + chunk].unsqueeze(0).unsqueeze(0) - pts) ** 2).sum(-1)   # (B, L, n)
+            mask = (dist < thresh).to(emb.dtype)
+            num = num + mask @ emb[s:s + chunk]
+            cnt = cnt + mask.sum(-1, keepdim=True)
+        e = num / cnt.clamp(min=1)
         if zero_masked:
             e = e.masked_fill(feature_mask.unsqueeze(-1), 0)
         return e + token_e
@@ -239,9 +255,11 @@ class TransferTraj(nn.Module):
         spatial_e.masked_fill(feature_e_mask[..., 0].unsqueeze(-1), 0)          # (original: not in place)
         spatial_e = spatial_e + token_e[:, :, 0]
         poi_e = self._context_embed(self.poi_embed_layer, self.poi_embed_mat, self.poi_coors, spatial, first_point,
-                                    self.poi_dist, feature_e_mask[..., 0], token_e[:, :, 0])
+                                    self.poi_dist, feature_e_mask[..., 0], token_e[:, :, 0],
+                                    chunk=self.context_chunk)
         road_e = self._context_embed(self.road_embed_layer, self.road_embed_mat, self.road_coors, spatial, first_point,
-                                     self.rn_dist, feature_e_mask[..., 0], token_e[:, :, 0], zero_masked=False)
+                                     self.rn_dist, feature_e_mask[..., 0], token_e[:, :, 0], zero_masked=False,
+                                     chunk=self.context_chunk)
         temporal_e = self.temporal_embed_layer(
             torch.cat([m(temporal_token[..., i]) for i, m in enumerate(self.temporal_embed_modules)], -1))
         temporal_e.masked_fill(feature_e_mask[..., 1].unsqueeze(-1), 0)          # (original: not in place)

@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional
 
+from .. import progress
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -81,6 +83,9 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
                             lr=cfg.lr, weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=max(1, cfg.patience // 3))
     best, best_state, bad, history = math.inf, None, 0, []
+    rep = progress.get()
+    who = getattr(rep, "scope", None) or "model"
+    rep.model(who, state="training", detail=f"epoch 0/{cfg.epochs}")
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         t0, tr_losses = time.time(), []
@@ -112,6 +117,12 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
                 "cannot work with NaN; check the validation inputs for NaN/inf or extreme values.")
         history.append({"epoch": epoch, "train_loss": tr, "val_loss": vl, "seconds": time.time() - t0})
         log.info(f"epoch {epoch:3d}  train {tr:.4f}  val {vl:.4f}  ({time.time() - t0:.0f}s)")
+        improved = vl < best - 1e-6
+        rep.model(who, state="training", epoch=epoch, epochs=cfg.epochs, train_loss=tr, val_loss=vl,
+                  best_val=min(best, vl), detail=f"epoch {epoch}/{cfg.epochs}  val {vl:.4g}"
+                                                 f"  best {min(best, vl):.4g}")
+        rep.event("epoch", model=who, epoch=epoch, epochs=cfg.epochs, train_loss=float(f"{tr:.6g}"),
+                  val_loss=float(f"{vl:.6g}"), improved=improved, seconds=round(time.time() - t0, 1))
         sched.step(vl)
         if vl < best - 1e-6:
             best, bad, best_state = vl, 0, copy.deepcopy(model.state_dict())
@@ -119,6 +130,8 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
             bad += 1
             if bad >= cfg.patience:
                 log.info(f"early stopping at epoch {epoch} (best val {best:.4f})")
+                rep.event("early_stop", model=who, epoch=epoch, best_val=best,
+                          message=f"{who}: early stop at epoch {epoch} (best val {best:.4g})")
                 break
     if best_state is not None:
         model.load_state_dict(best_state)

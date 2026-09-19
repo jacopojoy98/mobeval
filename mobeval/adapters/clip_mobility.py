@@ -78,9 +78,9 @@ class CLIPMobilityAdapter(TorchAdapter):
         if ck["format"] == "raw":
             raise ValueError("raw CLIP state dicts do not record token definitions; token layouts from the original "
                              "tokenizer differ from mobeval's, so retrain with CLIPMobilityAdapter.pretrain(...)")
-        ad = cls(arch=ck["config"]["arch"], visit_center=ck["meta"]["visit_center"],
-                 visit_context=ck["meta"]["visit_context"], extra_point_features=extra_point_features,
-                 extra_dim=ck["config"].get("extra_dim", 0), **kw)
+        ad = cls(**{"arch": ck["config"]["arch"], "visit_center": ck["meta"]["visit_center"],
+                    "visit_context": ck["meta"]["visit_context"], "extra_point_features": extra_point_features,
+                    "extra_dim": ck["config"].get("extra_dim", 0), **kw})
         ad.net.load_state_dict(ck["state_dict"], strict=True)
         ad.net.eval()
         ad.provenance = ck["meta"].get("provenance", {})

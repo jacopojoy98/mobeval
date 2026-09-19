@@ -1,4 +1,6 @@
 """Tests for the PyTorch model adapters, training, checkpoints, provenance and CLI."""
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -216,3 +218,82 @@ def test_transfertraj_inference_is_deterministic(ctx, transfertraj):
     hidden = TargetGuard.hide_masked(b, m)
     assert np.array_equal(ad.reconstruct(hidden, m)[0], ad.reconstruct(hidden, m)[0])
     assert np.array_equal(ad.embed(b), ad._embed_batch(b))
+
+
+# ------------------------------------------------- TransferTraj context features (POI / road)
+def _context_files(tmp_path, ctx, n_poi=40, n_road=25, dim=8, seed=0):
+    """POI / road arrays scattered over the dataset's own area."""
+    from mobeval.context_features import dataset_bbox
+    rng = np.random.default_rng(seed)
+    lat_min, lat_max, lon_min, lon_max = dataset_bbox(ctx.splits["train"], pad_km=0.0)
+    out = {}
+    for kind, n in (("poi", n_poi), ("road", n_road)):
+        np.save(tmp_path / f"{kind}_embed.npy", rng.normal(size=(n, dim)).astype(np.float32))
+        np.save(tmp_path / f"{kind}_latlon.npy",
+                np.column_stack([rng.uniform(lat_min, lat_max, n), rng.uniform(lon_min, lon_max, n)]))
+        out[f"{kind}_embed"] = str(tmp_path / f"{kind}_embed.npy")
+        out[f"{kind}_latlon"] = str(tmp_path / f"{kind}_latlon.npy")
+    return out
+
+
+def test_context_lookup_matches_the_naive_masked_mean():
+    """The chunked matmul must equal materialising (B, L, N, D) and averaging, at any chunk size."""
+    from mobeval.nn.transfertraj_net import TransferTraj
+    torch.manual_seed(0)
+    net = TransferTraj(embed_size=8, d_model=16, poi_embed=torch.randn(37, 5),
+                       poi_coors=torch.randn(37, 2) * 400, poi_dist=250_000.0).eval()
+    B, L = 2, 6
+    spatial, first = torch.randn(B, L, 2) * 300, torch.randn(B, 2) * 100
+    fmask, token_e = torch.zeros(B, L, dtype=torch.bool), torch.zeros(B, L, 16)
+    with torch.no_grad():
+        emb = net.poi_embed_layer(net.poi_embed_mat)
+        d = ((net.poi_coors[None, None] - (spatial + first.unsqueeze(1)).unsqueeze(2)) ** 2).sum(-1)
+        m = (d < net.poi_dist).unsqueeze(-1)
+        naive = (emb[None, None] * m).sum(2) / m.sum(2).clamp(min=1)
+        for chunk in (1024, 8, 3):
+            got = net._context_embed(net.poi_embed_layer, net.poi_embed_mat, net.poi_coors, spatial, first,
+                                     net.poi_dist, fmask, token_e, chunk=chunk)
+            assert torch.allclose(got, naive, atol=1e-5), chunk
+
+
+def test_transfertraj_uses_context_and_survives_a_checkpoint_roundtrip(ctx, tmp_path):
+    from mobeval.adapters.transfertraj import TransferTrajAdapter
+    context = _context_files(tmp_path, ctx)
+    arch = dict(embed_size=16, d_model=32, rafee_layer=1, poi_dist=250_000.0, rn_dist=250_000.0)
+    path = tmp_path / "tt_ctx.pt"
+    ad = TransferTrajAdapter.pretrain(ctx, arch=arch, train=FAST, out=str(path), context=context, batch_size=32)
+    assert ad.net.poi_embed_mat.shape == (40, 8) and ad.net.road_embed_mat.shape == (25, 8)
+    b = ctx.windows["test"].take(np.arange(6))
+    m = make_mask(len(b), b.length, 0.5, "block", 0)
+    hidden = TargetGuard.hide_masked(b, m)
+    ad2 = TransferTrajAdapter.from_checkpoint(str(path), device="cpu")
+    assert np.allclose(ad.reconstruct(hidden, m)[0], ad2.reconstruct(hidden, m)[0])
+    # POI/road matrices are inputs, not weights: they must stay out of the state dict
+    assert not [k for k in ad.net.state_dict() if k.endswith(("poi_embed_mat", "road_coors"))]
+
+
+def test_context_paths_can_be_overridden_and_missing_files_are_reported(ctx, tmp_path):
+    from mobeval.adapters.transfertraj import TransferTrajAdapter
+    context = _context_files(tmp_path, ctx)
+    path = tmp_path / "tt_ov.pt"
+    TransferTrajAdapter.pretrain(ctx, arch=dict(embed_size=16, d_model=32, rafee_layer=1), train=FAST,
+                                 out=str(path), context=context, batch_size=32)
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    for k, v in context.items():                       # simulate staging to a different directory
+        (moved / Path(v).name).write_bytes(Path(v).read_bytes())
+        Path(v).unlink()
+    with pytest.raises(FileNotFoundError, match="override them"):
+        TransferTrajAdapter.from_checkpoint(str(path), device="cpu")
+    ad = TransferTrajAdapter.from_checkpoint(
+        str(path), device="cpu", context={k: str(moved / Path(v).name) for k, v in context.items()})
+    assert ad.net.poi_embed_mat.shape == (40, 8)
+
+
+def test_mismatched_context_arrays_are_rejected(ctx, tmp_path):
+    from mobeval.adapters.transfertraj import TransferTrajAdapter
+    np.save(tmp_path / "e.npy", np.zeros((10, 4), np.float32))
+    np.save(tmp_path / "c.npy", np.zeros((7, 2)))
+    with pytest.raises(ValueError, match="same length"):
+        TransferTrajAdapter(center=(55.6, 12.5), device="cpu",
+                            context={"poi_embed": str(tmp_path / "e.npy"), "poi_latlon": str(tmp_path / "c.npy")})

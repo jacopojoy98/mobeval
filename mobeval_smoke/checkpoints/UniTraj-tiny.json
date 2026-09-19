@@ -1,0 +1,45 @@
+{
+  "model_type": "unitraj",
+  "config": {
+    "arch": {
+      "trajectory_length": 32,
+      "patch_size": 1,
+      "embedding_dim": 32,
+      "encoder_layers": 1,
+      "encoder_heads": 4,
+      "decoder_layers": 1,
+      "decoder_heads": 4
+    }
+  },
+  "meta": {
+    "norm": {
+      "mean": [
+        0.0004415199498842286,
+        -0.00012148052952545374
+      ],
+      "std": [
+        0.029998520590914825,
+        0.01723439202578871
+      ]
+    },
+    "provenance": {
+      "train_fingerprint": "f230b9afb0ad9d37",
+      "dataset": "synthetic",
+      "trained_at": "2026-09-16T22:13:53"
+    }
+  },
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 1257.0090318762739,
+      "val_loss": 36.012818336486816,
+      "seconds": 0.9798238277435303
+    },
+    {
+      "epoch": 2,
+      "train_loss": 23.59945595782736,
+      "val_loss": 3.956513285636902,
+      "seconds": 0.6710238456726074
+    }
+  ]
+}

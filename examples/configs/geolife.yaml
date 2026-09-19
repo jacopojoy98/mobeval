@@ -1,0 +1,62 @@
+# Full comparison on GeoLife.   mobeval run --config examples/configs/geolife.yaml
+title: UniTraj vs TrajGPT vs CLIP mobility model on GeoLife
+output_dir: results/geolife
+check_provenance: error          # refuse checkpoints trained on a different split
+
+dataset:
+  loader: geolife
+  path: /home/jacopo/Modelli/Datasets/Geolife            # folder containing Data/
+
+eval:
+  split_by: time                 # chronological 8:1:1 (use "user" for unseen-user generalisation)
+  window_length: 64              # <= 200 (UniTraj's fixed length)
+  grid_cell_m: 500
+  visit_context: 8
+  eval_seeds: [0, 1, 2]
+  n_boot: 1000
+  max_eval_samples: 5000
+  recovery_ratios: [0.25, 0.5, 0.75]
+  recovery_kinds: [random, block]
+  label_fractions: [1.0, 0.1, 0.01]
+  travel_time_max_h: 4.0
+
+models:
+  # Zero-shot: public checkpoint pre-trained on WorldTrace (declared as external pre-training;
+  # WorldTrace does not contain GeoLife, so no overlap with the test split)
+  - name: UniTraj-zeroshot
+    type: unitraj
+    checkpoint: /home/jacopo/Documenti/MobFM/Survey/UniTraj/model.pt
+    external_pretraining: true
+    adapter: {device: cuda, batch_size: 256}
+
+  # Continued pre-training of the public weights on the GeoLife train split
+  - name: UniTraj-finetuned
+    type: unitraj
+    checkpoint: /home/jacopo/Documenti/MobFM/BMdir/mobeval/results/geolife/checkpoints/UniTraj-finetuned.pt
+    #train: {init_from: /home/jacopo/Documenti/MobFM/Survey/UniTraj/model.pt, epochs: 30, batch_size: 128, lr: 3.0e-4, patience: 5, device: cuda}
+    adapter: {device: cuda, batch_size: 256}
+
+  - name: TrajGPT
+    type: trajgpt
+    arch: {input_order: fixed, num_layers: 4, d_embed: 32}
+    train:
+      #init_from: /home/jacopo/Documenti/MobFM/TrajGPT/trajgpt.pth
+      epochs: 200
+      batch_size: 64
+      lr: 1.0e-3
+      patience: 15
+      device: cuda
+      options: {tokenizer: {backend: grid, cell_m: 1000}}   # or {backend: h3, h3_resolution: 7}
+    adapter: {device: cuda}
+
+  - name: CLIPMobility
+    type: clip_mobility
+    arch: {d_model: 256, nhead: 8, num_layers: 6, embedding_dim: 128}
+    train: {epochs: 50, batch_size: 64, lr: 1.0e-4, patience: 8, device: cuda}
+    adapter: {device: cuda}
+
+  # Several training seeds of one model: same type, different name/run_tag and train.seed
+  # - {name: CLIPMobility-s1, type: clip_mobility, run_tag: seed1, train: {seed: 1, epochs: 50, device: cuda}}
+
+  - name: KinematicRef          # non-neural reference, useful sanity check
+    type: kinematic_ref

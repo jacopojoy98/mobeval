@@ -1,0 +1,142 @@
+{
+  "fingerprint": "f230b9afb0ad9d37",
+  "config": {
+    "output_dir": "mobeval_smoke",
+    "title": "mobeval smoke test",
+    "dataset": {
+      "loader": "synthetic",
+      "n_users": 20,
+      "n_days": 8,
+      "seed": 0
+    },
+    "eval": {
+      "window_length": 32,
+      "recovery_ratios": [
+        0.5
+      ],
+      "recovery_kinds": [
+        "block"
+      ],
+      "eval_seeds": [
+        0
+      ],
+      "n_boot": 50,
+      "max_eval_samples": 150,
+      "visit_context": 4,
+      "label_fractions": [
+        1.0
+      ],
+      "generation_max_trajectories": 20
+    },
+    "models": [
+      {
+        "name": "UniTraj-tiny",
+        "type": "unitraj",
+        "arch": {
+          "trajectory_length": 32,
+          "embedding_dim": 32,
+          "encoder_layers": 1,
+          "decoder_layers": 1
+        },
+        "train": {
+          "epochs": 2,
+          "batch_size": 32,
+          "lr": 0.001,
+          "device": "cpu"
+        },
+        "adapter": {
+          "device": "cpu"
+        }
+      },
+      {
+        "name": "TrajGPT-tiny",
+        "type": "trajgpt",
+        "arch": {
+          "num_layers": 1
+        },
+        "train": {
+          "epochs": 2,
+          "batch_size": 32,
+          "options": {
+            "tokenizer": {
+              "cell_m": 1000
+            }
+          },
+          "device": "cpu"
+        },
+        "adapter": {
+          "device": "cpu"
+        }
+      },
+      {
+        "name": "CLIP-tiny",
+        "type": "clip_mobility",
+        "arch": {
+          "d_model": 32,
+          "nhead": 2,
+          "num_layers": 1,
+          "dim_feedforward": 64,
+          "embedding_dim": 16
+        },
+        "train": {
+          "epochs": 2,
+          "batch_size": 32,
+          "lr": 0.001,
+          "device": "cpu"
+        },
+        "adapter": {
+          "head_train": {
+            "epochs": 5
+          },
+          "device": "cpu"
+        }
+      },
+      {
+        "name": "KinematicRef",
+        "type": "kinematic_ref",
+        "adapter": {
+          "device": "cpu"
+        }
+      }
+    ],
+    "check_provenance": "error"
+  },
+  "errors": [],
+  "skipped": [
+    [
+      "UniTraj-tiny@default",
+      "next_location",
+      "capability not declared"
+    ],
+    [
+      "UniTraj-tiny@default",
+      "continuous/travel_time",
+      "capability not declared"
+    ],
+    [
+      "UniTraj-tiny@default",
+      "continuous/duration",
+      "capability not declared"
+    ],
+    [
+      "UniTraj-tiny@default",
+      "generation",
+      "capability not declared"
+    ],
+    [
+      "TrajGPT-tiny@default",
+      "recovery",
+      "capability not declared"
+    ],
+    [
+      "TrajGPT-tiny@default",
+      "mode_classification",
+      "capability not declared"
+    ],
+    [
+      "CLIP-tiny@default",
+      "generation",
+      "capability not declared"
+    ]
+  ]
+}

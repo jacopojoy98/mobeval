@@ -37,6 +37,9 @@ class EvalConfig:
     recovery_dtw: bool = True
     continuous_targets: Sequence[str] = ("travel_time", "duration")
     continuous_reveal: Dict[str, Tuple[str, ...]] = field(default_factory=dict)  # e.g. {"duration": ("location",)}
+    # gaps between consecutive staypoints longer than this are missing data (phone off, overnight), not travel;
+    # they are excluded from the travel-time task for every model and baseline (TrajGPT uses the same 4 h rule)
+    travel_time_max_h: Optional[float] = 4.0
     mode_protocols: Sequence[str] = ("native", "linear_probe")
     label_fractions: Sequence[float] = (1.0, 0.1)
     generation_max_trajectories: int = 500
@@ -70,6 +73,25 @@ class EvalContext:
         self.emitted_baselines = set()
         self.latency = defaultdict(lambda: defaultdict(lambda: [0.0, 0]))   # model -> capability -> [sec, n]
         self.skipped, self.errors = [], []
+
+    @property
+    def fingerprint(self) -> str:
+        """Hash of the split assignment (which trajectories are train/val/test) + view parameters."""
+        import hashlib
+        h = hashlib.sha1()
+        for name in ("train", "val", "test"):
+            h.update(name.encode())
+            h.update("|".join(map(str, sorted(self.splits[name].points.traj_id.unique()))).encode())
+        c = self.cfg
+        h.update(repr((c.split_by, tuple(c.split_ratios), c.split_seed, c.window_length, c.max_gap_s,
+                       c.staypoint_dist_m, c.staypoint_time_s, c.visit_context)).encode())
+        return h.hexdigest()[:16]
+
+    def provenance(self, **extra) -> dict:
+        import datetime
+        return {"train_fingerprint": self.fingerprint, "dataset": self.dataset_name,
+                "trained_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                **{k: v for k, v in extra.items() if v is not None}}
 
     def _cap(self, b: TrajectoryBatch) -> TrajectoryBatch:
         m = self.cfg.max_eval_samples

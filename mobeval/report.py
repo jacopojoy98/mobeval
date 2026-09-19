@@ -75,7 +75,7 @@ def pareto_front(df: pd.DataFrame) -> pd.DataFrame:
     fam = family_summary(df)
     if fam.empty:
         return pd.DataFrame()
-    q = pd.DataFrame({"mean_skill": fam.mean(1)})
+    q = pd.DataFrame({"mean_skill": fam.mean(axis=1)})
     eff = df[df.family == "efficiency"]
     q["n_parameters"] = eff[eff.metric == "n_parameters"].groupby("model").value.mean()
     q["latency_ms"] = eff[eff.metric == "latency_ms_per_sample"].groupby("model").value.mean()

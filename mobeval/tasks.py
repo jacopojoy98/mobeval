@@ -161,6 +161,12 @@ class ContinuousValueTask(Task):
         assert target in ("travel_time", "duration")
         self.target, self.name = target, f"continuous/{target}"
 
+    def _valid(self, y_min, cfg):
+        ok = np.isfinite(y_min) & (y_min > 0)
+        if self.target == "travel_time" and cfg.travel_time_max_h is not None:
+            ok &= y_min <= cfg.travel_time_max_h * 60
+        return ok
+
     def _y(self, v):
         return (v.tgt_travel_time_s if self.target == "travel_time" else v.tgt_duration_s) / 60.0
 
@@ -181,7 +187,7 @@ class ContinuousValueTask(Task):
     def run(self, adapter, ctx):
         cfg, v = ctx.cfg, ctx.visits["test"]
         reveal = tuple(cfg.continuous_reveal.get(self.target, ()))
-        keep = self._y(v) > 0
+        keep = self._valid(self._y(v), cfg)
         seed = cfg.eval_seeds[0]
         adapter.prepare(self.name, ctx.visits.get("train"), ctx.visits.get("val"))
         with ctx.timed(_key(adapter), f"{self.capability}/{self.target}", len(v)):
@@ -192,7 +198,8 @@ class ContinuousValueTask(Task):
         if mix is None and samples is None:            # point model: sigma from VALIDATION residuals
             vv = ctx.visits["val"]
             vp = adapter.predict_continuous(TargetGuard.hide_visits(vv, reveal), self.target).point
-            sigma = float(np.std(self._y(vv) - np.asarray(vp) / 60.0)) or 1.0
+            okv = self._valid(self._y(vv), cfg)
+            sigma = float(np.std((self._y(vv) - np.asarray(vp) / 60.0)[okv])) or 1.0
         sel = lambda a: None if a is None else a[keep]
         if mix is not None:
             from .metrics.probabilistic import Mixture
@@ -200,13 +207,16 @@ class ContinuousValueTask(Task):
         model = self._with_pit(continuous_metrics(y[keep], sel(point), mix, sel(samples), sigma))
         ck = ("cont_baselines", self.target, reveal)
         if ck not in ctx.cache:
-            cb = B.ContinuousBaselines(self._y(ctx.visits["train"]), seed=seed)
+            ytr = self._y(ctx.visits["train"])
+            cb = B.ContinuousBaselines(ytr[self._valid(ytr, cfg)], seed=seed)
             n = int(keep.sum())
             prob = continuous_metrics(y[keep], None, cb.mixture(n))
             pt = continuous_metrics(y[keep], cb.point(n))
             prob["mae_min"], prob["rmse_min"] = pt["mae_min"], pt["rmse_min"]   # median is the MAE-optimal point
             ctx.cache[ck] = {"train_marginal": self._with_pit(prob)}
         task = self.name + (f"|given:{'+'.join(reveal)}" if reveal else "")
+        if self.target == "travel_time" and cfg.travel_time_max_h is not None:
+            task += f"|<={cfg.travel_time_max_h:g}h"
         return self.emit(ctx, adapter, task, int(keep.sum()), model, ctx.cache[ck], ["train_marginal"], seed)
 
 

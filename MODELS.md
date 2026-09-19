@@ -1,0 +1,116 @@
+# Model integrations: what was wrapped, verified and changed
+
+All three networks were re-implemented inside `mobeval/nn/` with unchanged parameter names, so
+existing checkpoints load, and checked against the original code: with identical weights and
+inputs the outputs match exactly (maximum absolute difference 0.0). Everything below that deviates
+from the original repositories is deliberate and listed with its reason.
+
+## UniTraj (`type: unitraj`)
+
+Source: github.com/Yasoz/UniTraj (Apache-2.0). Dependencies on `timm` and `einops` were removed.
+
+**Conventions reproduced.** (longitude, latitude) channel order; offsets from the first visible point
+in degrees; z-normalisation with the pre-training statistics (the public checkpoint's are built in);
+time intervals in seconds; fixed length 200 with patch size 1.
+
+**Changes.** Windows shorter than 200 points are right-padded and the padding positions are always
+hidden from the encoder, so meaningless zero tokens are never visible. Masking uses an explicit random
+generator instead of global NumPy state, making evaluation reproducible. When retraining from scratch,
+normalisation statistics are fitted on the train windows and stored in the checkpoint; when continuing
+from existing weights they are kept.
+
+**Verification.** On UniTraj's own WorldTrace sample (1 s sampling), the public checkpoint reconstructs
+50 % randomly masked points with a mean error of about 52 m. On synthetic data with a very different
+sampling rate and spatial extent it reached 1.8 km; 150 CPU steps of continued pre-training with
+`init_from` reduced that to 0.7 km. Zero-shot results on data unlike WorldTrace should therefore be
+read as a transfer test, and a fine-tuned variant reported alongside.
+
+## TrajGPT (`type: trajgpt`)
+
+Source: github.com/ktxlh/TrajGPT (MIT).
+
+**Target leakage in the original time heads.** The visit embedding is concatenated as
+[location, arrival, departure, region], but the travel-time decoder reads the first two blocks of the
+*target* visit and the duration decoder the first three. The travel head therefore sees the target's
+arrival time (travel = arrival − previous departure) and the duration head its arrival and departure
+(duration = departure − arrival). The code comments and the paper's factorisation
+p(region)·p(travel | region)·p(duration | region, travel) indicate the intended order
+[region, location, arrival, departure], which is `input_order: fixed`, the default for training. A test
+shows the legacy duration head responds to the target's departure time while the fixed one does not.
+This leak very likely explains the strongly negative duration NLL reported earlier.
+
+**Checkpoint fidelity.** The original `PositionalEncoding` adds in place (`x += pe`) to tensor views,
+which silently also shifts positional encodings into the decoder targets and into the encoder memory
+used by the time heads. `input_order: legacy` reproduces both side effects exactly, so original
+checkpoints behave identically (`TrajGPTAdapter.from_original_state_dict`, which needs the H3 region
+list, scales and reference time from the original preprocessing).
+
+**Training fixes** (each was necessary; without them validation loss diverged and region accuracy
+stayed at chance level):
+
+1. `time_reference: week`. The original feeds absolute days since the dataset start into Time2Vec.
+   Under a chronological split, validation and test days lie outside the training range and the linear
+   Time2Vec component extrapolates. Times are now measured from the Monday 00:00 before each sequence,
+   which keeps time-of-day and day-of-week phase but stays bounded. `global` reproduces the original.
+2. Travel gaps above 4 h are excluded from the travel loss. TrajGPT's own metrics already treat them as
+   missing spans; the pipeline's travel-time task applies the same rule to every model and baseline
+   (`EvalConfig.travel_time_max_h`).
+3. Minimum mixture scale of 1 minute (the original floor of 1e-6 h lets a single out-of-range value
+   dominate the validation loss).
+4. Mixture heads are initialised at the training data's quantiles and spread. With durations of tens to
+   hundreds of hours against an initial location of about 0, the NLL gradients were so large that, after
+   clipping, the region cross-entropy on the shared encoder barely moved.
+
+**Evaluation.** Location predictions are region-token scores mapped onto the shared grid through region
+centroids. When the target location is hidden, travel-time and duration distributions marginalise over
+the top-5 predicted regions (the result is still a Gaussian mixture); for duration the unknown arrival is
+set to the last departure plus the median predicted travel time. Outputs are in hours (linear space) and
+converted to seconds by the adapter. Regions use a metric grid by default (no extra dependency) or H3
+(`options: {tokenizer: {backend: h3, h3_resolution: 7}}`); unseen test cells map to the nearest known
+region.
+
+## CLIP mobility model (`type: clip_mobility`)
+
+Source: `Model/Models/clip_mobility_model.py` and `mobility_transformer_vector.py`.
+
+**Token layouts.** The original tokenizer produces semantic, coordinate-free point tokens (speed and turn
+bins, time of day, road type, POI density, land-use diversity, network centrality) that require OSM data.
+Without coordinates the model cannot be scored on recovery, and the original layouts are not recorded in
+checkpoints, so mobeval defines its own documented layouts (`nn/features.py`). The trajectory view has
+local offsets in km, time step, speed, heading, time of day and weekday; the visit view has position,
+arrival and departure time of day, duration, travel time and weekday. OSM or other features can be
+appended with `extra_point_features` / `extra_dim`; they must be zero or computable for masked points.
+Checkpoints from the original scripts are therefore not loadable: retrain with `pretrain`.
+
+**Pairing.** Each GPS window is paired with the same user's last `visit_context` staypoints that ended
+before the window started (tested), so the visit view never contains future information.
+
+**Contrastive loss.** The original training script uses unpaired visit sequences in half of the batches
+with a negative CLIP weight. That rewards driving the contrastive cross-entropy towards infinity and
+makes the objective unbounded below. Standard symmetric InfoNCE already uses the other pairs in the batch
+as negatives; it is used here, with the logit scale clamped as in CLIP.
+
+**Capabilities.** Recovery uses the native next-token head autoregressively: masked points are filled left
+to right from the points before them. The causal model cannot use points after a gap, a structural
+disadvantage against bidirectional models such as UniTraj and against interpolation. Next location and
+the two time tasks use heads on the frozen visit encoder's last-token state, trained on the train visit
+sequences when first needed; the embedding task uses the normalised CLIP embedding.
+
+## Shared components
+
+**Mode-classification head.** The native head is trained on frozen embeddings and re-fitted for every
+label fraction and seed. By default it is linear and unweighted, matching the pipeline's logistic
+regression probe, so the two protocols differ only in the optimiser. A class-weighted head trades
+accuracy for balanced accuracy (on synthetic data: accuracy 0.65 vs 0.83, balanced accuracy 0.80 vs
+0.45); enable it with `head_class_weighted: true` if balanced metrics are the priority, and report it.
+
+**Training loop** (`nn/common.py`): AdamW, plateau learning-rate schedule, gradient clipping, early
+stopping on validation loss with restoration of the best weights, and checkpoints that store the
+architecture, model-specific metadata (normalisation, vocabulary, scales), the training history and the
+split fingerprint.
+
+## What this means for the earlier results
+
+The previous "My Model" recovery results came from `Trajectory_transformer` with a randomly initialised
+reconstruction head (its script never loaded weights), so they carry no information about the model.
+The TrajGPT duration NLL was produced by a head that could see the answer. Neither should be reported.

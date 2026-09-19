@@ -1,0 +1,2 @@
+[console_scripts]
+mobeval = mobeval.cli:main

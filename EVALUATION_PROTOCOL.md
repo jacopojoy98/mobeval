@@ -130,6 +130,8 @@ scale in minutes with a proper scoring rule. The proposed Gaussian pseudo-NLL is
 fitted on validation residuals; fitting it on the evaluated batch chooses the best variance after seeing
 the errors and is optimistic.
 
+**Travel-time gaps.** Gaps longer than 4 h between consecutive staypoints are treated as missing data (phone off, overnight) rather than travel and are excluded from the travel-time task for all models and baselines (`travel_time_max_h`, the same rule TrajGPT uses in its own metrics); the task name records the threshold.
+
 **Uncertainty.** Every metric has a bootstrap CI over evaluation samples, and every skill score a paired
 bootstrap CI (model and baseline resampled on the same indices). Results are recorded per evaluation seed
 and per training run tag; reports show the mean with the spread across runs.

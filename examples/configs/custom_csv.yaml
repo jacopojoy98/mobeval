@@ -1,0 +1,17 @@
+# Any GPS table: columns user_id, traj_id, t (unix seconds or datetime), lat, lon [, mode]
+output_dir: results/my_city
+dataset:
+  loader: csv
+  path: data/points.csv
+  time_col: timestamp
+  # rename canonical=original, e.g.:
+  user_id: uid
+  lat: latitude
+  lon: longitude
+eval:
+  split_by: user
+  window_length: 64
+  eval_seeds: [0, 1, 2]
+models:
+  - {name: TrajGPT, type: trajgpt, train: {epochs: 100, device: cuda}, adapter: {device: cuda}}
+  - {name: CLIPMobility, type: clip_mobility, train: {epochs: 30, device: cuda}, adapter: {device: cuda}}

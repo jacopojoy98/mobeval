@@ -1,92 +1,111 @@
-# mobeval: unified evaluation of human-mobility foundation models
+# mobeval: unified evaluation and (re)training of human-mobility foundation models
 
-`mobeval` evaluates models with different output representations (continuous GPS reconstruction,
-discrete visit/region tokens, probabilistic time heads, embeddings, generators) on the same data,
-the same samples and the same baselines. See `EVALUATION_PROTOCOL.md` for the rationale and a review
-of the previous evaluation run.
+`mobeval` trains and evaluates models with very different representations (masked GPS
+reconstruction, visit-token generators with probabilistic time heads, dual-view contrastive
+encoders) on the **same data, the same splits, the same samples and the same baselines**.
+Built-in models: **UniTraj**, **TrajGPT** and the **CLIP mobility model**. See
+`EVALUATION_PROTOCOL.md` for the evaluation design and `MODELS.md` for how each model is
+wrapped, what was changed and why.
 
-## Quick start
-
-```bash
-pip install -r requirements.txt
-python -m pytest -q tests                      # 13 tests, ~3 s
-python examples/run_synthetic.py out_synth     # end-to-end run with two reference models, ~10 s
-```
-
-`out_synth/` then contains `results.jsonl` (one record per model × task × metric × seed, with CIs),
-`leaderboard.csv` and `report.md`.
-
-For real data, fill in the adapters (below) and run:
+## Install
 
 ```bash
-python examples/run_real.py --geolife /data/geolife --out results \
-    --mymodel ckpt_seed0.pt ckpt_seed1.pt --unitraj unitraj.pt --trajgpt trajgpt.pt
+pip install -e ".[models,test]"      # core + PyTorch + pytest
+mobeval smoke --device cpu           # trains 3 tiny models on synthetic data and evaluates them (~30 s)
+python -m pytest -q tests            # 22 tests
 ```
+
+The evaluation core (metrics, baselines, reports) does not need PyTorch; the model adapters do.
+
+## The workflow: one config file
+
+```bash
+mobeval info     --config examples/configs/geolife.yaml   # dataset/split summary and split fingerprint
+mobeval train    --config examples/configs/geolife.yaml   # train every model with a `train:` section
+mobeval evaluate --config examples/configs/geolife.yaml   # evaluate all models, write the report
+mobeval run      --config examples/configs/geolife.yaml   # train missing checkpoints, then evaluate
+```
+
+Useful flags: `--models TrajGPT CLIPMobility` (subset), `--device cuda`, `--out DIR`, `-v`.
+
+A config has four parts (full example: `examples/configs/geolife.yaml`):
+
+```yaml
+output_dir: results/geolife
+dataset: {loader: geolife, path: /data/geolife}        # or loader: csv / synthetic
+eval:    {split_by: time, window_length: 64, eval_seeds: [0, 1, 2]}   # any EvalConfig field
+models:
+  - {name: UniTraj-zeroshot, type: unitraj, checkpoint: model.pt, external_pretraining: true}
+  - {name: UniTraj-ft, type: unitraj, train: {init_from: model.pt, epochs: 30, device: cuda}}
+  - {name: TrajGPT, type: trajgpt, train: {epochs: 200, device: cuda}}
+  - {name: CLIPMobility, type: clip_mobility, train: {epochs: 50, device: cuda}}
+```
+
+Outputs in `output_dir`: `report.md`, `results.jsonl` (every metric with bootstrap CIs),
+`leaderboard.csv`, `family_summary.csv`, `run_info.json`, and `checkpoints/<name>.pt` (+ a
+readable `.json` with config, training history and provenance).
+
+## Training is always on the evaluation split
+
+`train` builds the same `EvalContext` as `evaluate` and trains only on its `train` split, with early
+stopping on `val`. Every checkpoint stores a fingerprint of the split assignment; `evaluate` refuses a
+checkpoint whose fingerprint differs from the current split (`check_provenance: error | warn | off`),
+because such a model may have been trained on today's test data. Checkpoints pre-trained elsewhere (e.g.
+the public UniTraj weights) must be declared with `external_pretraining: true`.
+
+## Models
+
+| type | what it does in mobeval | training routine |
+|---|---|---|
+| `unitraj` | recovery, embeddings, mode classification (head on frozen embeddings) | masked reconstruction; from scratch or `init_from` the public `model.pt` |
+| `trajgpt` | next location, travel time, duration (Gaussian mixtures), generation | region CE + travel/duration NLL on visit sequences |
+| `clip_mobility` | recovery (autoregressive), embeddings, mode classification, next location, travel time, duration (heads on the frozen visit encoder) | next-token regression + InfoNCE between trajectory and visit views |
+| `kinematic_ref`, `weak_ref` | non-neural references | none |
+
+Model options go under `arch:` (architecture), `train:` (`epochs, batch_size, lr, weight_decay,
+patience, grad_clip, max_steps_per_epoch, device, seed`, plus `init_from` and `options:` for
+model-specific training arguments) and `adapter:` (`device, batch_size, head_train, head_hidden,
+head_class_weighted`, ...).
+
+## Python API
+
+```python
+from mobeval import EvalConfig, EvaluationPipeline, markdown_report
+from mobeval.loaders import load_geolife
+from mobeval.adapters.unitraj import UniTrajAdapter
+from mobeval.adapters.trajgpt import TrajGPTAdapter
+from mobeval.adapters.clip_mobility import CLIPMobilityAdapter
+
+pipe = EvaluationPipeline(EvalConfig(window_length=64, eval_seeds=(0, 1, 2)))
+ctx = pipe.prepare(load_geolife("/data/geolife"))
+
+unitraj = UniTrajAdapter.pretrain(ctx, init_from="model.pt", train={"epochs": 30, "device": "cuda"},
+                                  out="ckpt/unitraj_ft.pt")
+trajgpt = TrajGPTAdapter.train(ctx, train={"epochs": 200, "device": "cuda"}, out="ckpt/trajgpt.pt")
+clip = CLIPMobilityAdapter.from_checkpoint("ckpt/clip.pt", device="cuda")
+
+store = pipe.run([unitraj, trajgpt, clip], ctx)
+open("report.md", "w").write(markdown_report(store, ctx))
+```
+
+## Adding another model
+
+Subclass `MobilityModelAdapter` (or `adapters.torch_base.TorchAdapter` for PyTorch models), declare
+`capabilities`, implement the matching methods in the canonical formats (degrees, seconds, shared-grid
+or token scores, `Mixture` distributions), optionally a `pretrain`/`train` classmethod that uses
+`nn.common.fit`, and register it in `registry.MODEL_TYPES`. The adapter contract is documented in
+`adapters/base.py`; the three built-in adapters are complete examples.
 
 ## Layout
 
 ```
 mobeval/
-  data.py            canonical dataset, splits, shared grid, windows, masks, staypoints, visit sequences
-  loaders.py         CSV/Parquet and GeoLife loaders
-  geo.py             haversine, local projection, radius of gyration
-  metrics/
-    registry.py      direction, unit, valid range, skill formula for every metric (single source)
-    reconstruction.py  ADE / FDE / DTW / RMSE / within-d accuracy / grid accuracy
-    classification.py  top-k, MRR, NLL, balanced accuracy, macro-F1, ECE
-    probabilistic.py   Gaussian (log-)mixtures, closed-form CRPS, NLL with unit Jacobian, PIT
-    generative.py      mobility statistics, JSD / W1 on fixed bins, paired Spearman, copy detection
-  baselines.py       interpolation, Markov/frequency, train marginal, handcrafted-feature classifier, generators
-  adapters/
-    base.py          the adapter contract and canonical prediction formats
-    reference.py     two small non-neural models that exercise every code path
-    templates.py     UniTraj, TrajGPT and MyModel adapters (model calls marked TODO(model))
-  context.py         EvalConfig and the shared EvalContext
-  tasks.py           recovery, next location, travel time, duration, mode classification, generation, efficiency
-  stats.py           bootstrap CIs, paired skill-score CIs
-  results.py         ResultRecord schema with automatic sanity flags
-  report.py          leaderboards, family summary, Pareto front, Markdown report
-  runner.py          EvaluationPipeline
+  cli.py, config.py, registry.py   command line, config files, model registry
+  data.py, loaders.py, geo.py      canonical data, splits, windows, staypoints, loaders
+  context.py, runner.py, tasks.py  EvalConfig / shared context, pipeline, tasks
+  metrics/, baselines.py, stats.py metrics registry and implementations, baselines, bootstrap
+  results.py, report.py            result schema with sanity flags, reports
+  adapters/  base.py, torch_base.py, unitraj.py, trajgpt.py, clip_mobility.py, reference.py
+  nn/        common.py (training loop, checkpoints, heads), features.py (tokenizers),
+             unitraj_net.py, trajgpt_net.py, clip_net.py (networks, checkpoint-compatible)
 ```
-
-## Writing an adapter
-
-Subclass `MobilityModelAdapter`, set `name` and `capabilities`, and implement only the methods the model
-supports. The pipeline skips undeclared capabilities and records them as skipped.
-
-| Capability | Method | Return |
-|---|---|---|
-| `recovery` | `reconstruct(batch, mask)` | `(lat, lon)` arrays `(N, L)` in degrees |
-| `next_location` | `predict_location(visits, grid)` | `LocationPrediction` with grid scores, own-token scores plus token centroids, or coordinates |
-| `continuous` | `predict_continuous(visits, target)` | `ContinuousPrediction` with a point, a `Mixture` (linear or log space) or samples, in seconds |
-| `mode_classification` | `classify_mode(batch, classes)` | `(N, K)` probabilities or logits |
-| `embedding` | `embed(batch)` | `(N, d)`; used for linear probing |
-| `generation` | `generate(reference_train, n, seed)` | `MobilityDataset` point table |
-
-Checklist that prevents the inconsistencies seen previously:
-
-1. Convert outputs to the canonical formats inside the adapter: degrees (de-normalised with the training
-   statistics), seconds, and the correct mixture space. Never report errors in normalised units.
-2. For models that reorder tokens (TrajGPT infilling with a separator), put predictions back at their
-   original positions before returning.
-3. Use `prepare(...)` to fit task heads on the `train` subset the pipeline passes, and re-fit for each label
-   fraction and seed so few-shot comparisons use identical labels.
-4. Evaluate several training seeds by creating one adapter per checkpoint with a distinct `run_tag`;
-   reports aggregate over them.
-5. Implement `num_parameters()` so the efficiency comparison is populated.
-
-Masked GPS positions and target visit fields arrive as NaN, so an adapter that reads ground truth fails
-loudly instead of producing optimistic numbers.
-
-## Configuration
-
-All settings live in `EvalConfig` (`context.py`): split type and ratios, window length, grid cell size,
-staypoint thresholds, visit context length, evaluation seeds, bootstrap size, mask ratios and kinds,
-continuous targets and conditioning (`continuous_reveal`), classification protocols and label fractions,
-and generation sample size. Custom task lists can be passed to `EvaluationPipeline(tasks=[...])`.
-
-## Adding a metric or task
-
-Register the metric in `metrics/registry.py` (direction, unit, valid range, skill type), compute per-sample
-values (or a set-level function of sample indices), and emit records through `Task.emit`, which pairs them
-with the task's baselines and computes the CIs. Tasks subclass `Task` and declare the capability they use.

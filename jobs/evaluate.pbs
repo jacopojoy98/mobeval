@@ -1,0 +1,21 @@
+#!/bin/bash
+#PBS -N mobeval_eval
+#PBS -q q07daneel
+#PBS -l select=1:ncpus=8:ngpus=1:mem=32gb
+#PBS -l walltime=12:00:00
+#PBS -j oe
+# Evaluate every model in the config using the checkpoints produced by the training jobs.
+#   qsub jobs/evaluate.pbs
+# Run it only after training: checkpoints are read from $RESULTS_DIR/checkpoints.
+
+cd "$PBS_O_WORKDIR"
+source jobs/env.sh
+setup_env
+stage_in
+restore_checkpoints
+
+mobeval evaluate --config "$SCRATCH/config.yaml" --device cuda -v
+
+stage_out
+echo "report: $RESULTS_DIR/report.md"
+exit 0

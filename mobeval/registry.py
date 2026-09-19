@@ -23,6 +23,11 @@ def _clip():
     return CLIPMobilityAdapter
 
 
+def _transfertraj():
+    from .adapters.transfertraj import TransferTrajAdapter
+    return TransferTrajAdapter
+
+
 def _kinematic():
     from .adapters.reference import KinematicReference
     return KinematicReference
@@ -33,9 +38,9 @@ def _weak():
     return WeakReference
 
 
-MODEL_TYPES = {"unitraj": _unitraj, "trajgpt": _trajgpt, "clip_mobility": _clip,
+MODEL_TYPES = {"unitraj": _unitraj, "trajgpt": _trajgpt, "clip_mobility": _clip, "transfertraj": _transfertraj,
                "kinematic_ref": _kinematic, "weak_ref": _weak}
-TRAIN_METHOD = {"unitraj": "pretrain", "trajgpt": "train", "clip_mobility": "pretrain"}
+TRAIN_METHOD = {"unitraj": "pretrain", "trajgpt": "train", "clip_mobility": "pretrain", "transfertraj": "pretrain"}
 
 
 class ProvenanceError(RuntimeError):

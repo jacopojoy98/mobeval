@@ -99,6 +99,50 @@ disadvantage against bidirectional models such as UniTraj and against interpolat
 the two time tasks use heads on the frozen visit encoder's last-token state, trained on the train visit
 sequences when first needed; the embedding task uses the normalised CLIP embedding.
 
+## TransferTraj (`type: transfertraj`)
+
+Source: github.com/wtl52656/TransferTraj. Verified against the original implementation: identical
+weights and inputs give identical hidden states, spatial predictions and loss (maximum absolute
+difference 0.0). The einops dependency was removed.
+
+**Conventions reproduced.** Metre coordinates relative to each trajectory's first point (the absolute
+first point is passed separately, since the POI/road lookup needs it); the four features
+[x, y, timestamp, delta_t], each paired with a token channel (known / mask / pad); causal attention
+whose rotary embedding is driven by the coordinates; the mixture-of-experts encoder layer; and the
+pre-training objective of span masking plus per-point single-modality masking, with the original
+spatial + temporal + token loss.
+
+**Deviations, all recorded in the checkpoint.**
+1. *Projection.* The original converts to UTM with pyproj, choosing the zone by city name. mobeval uses
+   its own local metric projection centred on the training data: no extra dependency, still metres,
+   and sub-percent distortion at city scale.
+2. *coord_scale* (default 1000, i.e. kilometres). The original feeds raw metres, so the spatial MSE
+   term starts around 1e5 and dominates the gradient. On synthetic data, raw metres moved the
+   validation loss from 6.17M to 6.14M over six epochs while the scaled version went from 1,868 to
+   1,145. The architecture is unchanged; set `coord_scale: 1.0` to reproduce the original exactly, and
+   keep 1.0 when loading original checkpoints.
+3. *Deterministic inference.* The mixture-of-experts router adds Gaussian routing noise on every
+   forward pass in the original, including evaluation, so repeated runs of the same checkpoint give
+   different predictions. Noisy top-k gating is a training-time regulariser (Shazeer et al.), so the
+   noise is applied only in training mode here; set `NoisyTopkRouter.noise_in_eval = True` to restore
+   the original behaviour. Numerical equivalence with the original was verified with the noise active.
+4. *POI and road-network features are optional.* Without them the parameter shapes are unchanged and
+   the two context pathways contribute only their token embedding. Supply them per adapter with
+   `context: {poi_embed: pois.npy, poi_latlon: poi_latlon.npy, road_embed: ..., road_latlon: ...}`,
+   where the embeddings are (N, d) arrays and the coordinates (N, 2) arrays of (lat, lon); mobeval
+   projects them with the same projection as the trajectories. Note the original compares SQUARED
+   distances against `poi_dist`/`rn_dist`, so the default of 100 means a 10 m radius.
+
+**Capabilities.** Recovery (spatial features masked, timestamps kept, one forward pass, as in the
+repository's TRec padder), embeddings (mean over the encoder states), and mode classification through
+the shared frozen-embedding head. Its trajectory-prediction and travel-time tasks are point-level and
+have no counterpart among mobeval's visit-level tasks, so they are not exposed; the pipeline lists
+them as skipped capabilities rather than silently scoring something different.
+
+**Sanity check.** Overfitting 16 windows drives recovery error from 2,190 m to 161 m, so the
+encode/decode path is sound; short CPU runs on small data remain far from converged (about 1.5 km
+after 40 epochs with a 1-layer, 32-dimensional model), as expected.
+
 ## Shared components
 
 **Mode-classification head.** The native head is trained on frozen embeddings and re-fitted for every

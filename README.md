@@ -85,6 +85,7 @@ the public UniTraj weights) must be declared with `external_pretraining: true`.
 |---|---|---|
 | `unitraj` | recovery, embeddings, mode classification (head on frozen embeddings) | masked reconstruction; from scratch or `init_from` the public `model.pt` |
 | `trajgpt` | next location, travel time, duration (Gaussian mixtures), generation | region CE + travel/duration NLL on visit sequences |
+| `transfertraj` | recovery, embeddings, mode classification | span-masked pre-training (optional POI / road features) |
 | `clip_mobility` | recovery (autoregressive), embeddings, mode classification, next location, travel time, duration (heads on the frozen visit encoder) | next-token regression + InfoNCE between trajectory and visit views |
 | `kinematic_ref`, `weak_ref` | non-neural references | none |
 
@@ -92,6 +93,24 @@ Model options go under `arch:` (architecture), `train:` (`epochs, batch_size, lr
 patience, grad_clip, max_steps_per_epoch, device, seed`, plus `init_from` and `options:` for
 model-specific training arguments) and `adapter:` (`device, batch_size, head_train, head_hidden,
 head_class_weighted`, ...).
+
+## Running on an HPC cluster (PBS)
+
+`jobs/` contains ready-made PBS scripts (written for the SNS HPC cluster: no default queue, GPUs on the
+daneel queues, mandatory use of `/scratch`). Edit `jobs/env.sh` once with your paths and virtual
+environment, then:
+
+```bash
+qsub jobs/all_in_one.pbs                              # train missing checkpoints + evaluate, one job
+bash jobs/submit_all.sh UniTraj-finetuned TrajGPT CLIPMobility   # one job per model + evaluation after
+qsub -v MODEL=TrajGPT jobs/train_model.pbs            # a single model
+qsub jobs/evaluate.pbs                                # evaluation only, from existing checkpoints
+qstat -u $USER                                        # follow, qdel <id> to cancel
+```
+
+The scripts copy data to `/scratch/$USER`, run there, and copy `results/` (report, metrics, checkpoints)
+back to `RESULTS_DIR`. Checkpoints from earlier jobs are restored first, so a job killed by the walltime
+can be re-submitted and continues with the models that are already trained.
 
 ## Python API
 

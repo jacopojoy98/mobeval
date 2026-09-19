@@ -87,6 +87,8 @@ SMOKE = {
         {"name": "CLIP-tiny", "type": "clip_mobility", "arch": {"d_model": 32, "nhead": 2, "num_layers": 1,
                                                                  "dim_feedforward": 64, "embedding_dim": 16},
          "train": {"epochs": 2, "batch_size": 32, "lr": 1e-3}, "adapter": {"head_train": {"epochs": 5}}},
+        {"name": "TransferTraj-tiny", "type": "transfertraj", "arch": {"embed_size": 16, "d_model": 32, "rafee_layer": 1},
+         "train": {"epochs": 2, "batch_size": 16, "lr": 1e-3}},
         {"name": "KinematicRef", "type": "kinematic_ref"},
     ],
 }

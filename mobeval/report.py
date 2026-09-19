@@ -17,6 +17,20 @@ import pandas as pd
 from .metrics.registry import HEADLINE, get_spec
 
 
+def md_table(df: pd.DataFrame, index: bool = True) -> str:
+    """Markdown table via tabulate when available, otherwise a plain pipe table."""
+    try:
+        return df.to_markdown(index=index)
+    except ImportError:
+        d = df.reset_index() if index else df
+        cols = [str(c) for c in d.columns]
+        rows = [[("" if pd.isna(v) else f"{v:.4g}" if isinstance(v, float) else str(v)) for v in r]
+                for r in d.itertuples(index=False)]
+        w = [max(len(c), *(len(r[i]) for r in rows)) if rows else len(c) for i, c in enumerate(cols)]
+        line = lambda vals: "| " + " | ".join(v.ljust(w[i]) for i, v in enumerate(vals)) + " |"
+        return "\n".join([line(cols), "|" + "|".join("-" * (x + 2) for x in w) + "|"] + [line(r) for r in rows])
+
+
 def _agg(df: pd.DataFrame) -> pd.DataFrame:
     g = df.groupby(["family", "task", "metric", "protocol", "model"], dropna=False)
     out = g.agg(value=("value", "mean"), std=("value", "std"), ci_low=("ci_low", "mean"),
@@ -110,16 +124,16 @@ def markdown_report(store, ctx=None, title: str = "Mobility foundation model eva
             "perfect closed; [Δ] = nats/sample better than baseline). 95% bootstrap CIs are in results.jsonl.", ""]
     fs = family_summary(df)
     if not fs.empty:
-        out += ["## Summary: median headline skill per task family (%, clipped to ±100)", "", (fs * 100).round(1).to_markdown(), ""]
+        out += ["## Summary: median headline skill per task family (%, clipped to ±100)", "", md_table((fs * 100).round(1)), ""]
     pf = pareto_front(df)
     if not pf.empty and pf[["n_parameters", "latency_ms"]].notna().any().any():
-        out += ["## Efficiency (Pareto front)", "", pf.to_markdown(index=False), ""]
+        out += ["## Efficiency (Pareto front)", "", md_table(pf, index=False), ""]
     a = _agg(df)
     for fam in ["recovery", "location", "continuous", "classification", "generation", "efficiency"]:
         sub = a[a.family == fam]
         if sub.empty:
             continue
-        out += [f"## {fam.capitalize()}", "", wide_table(sub, fam != "efficiency").to_markdown(), ""]
+        out += [f"## {fam.capitalize()}", "", md_table(wide_table(sub, fam != "efficiency")), ""]
     flagged = df[df["flags"].map(len) > 0]
     if len(flagged):
         out += ["## Sanity flags", ""]

@@ -160,3 +160,59 @@ def test_point_tokens_are_bounded_under_gps_glitches():
     lat = np.full((1, 10), 45.0); lon = np.full((1, 10), 9.0); lat[0, 5] = 60.0      # 1,600 km jump
     tok = point_tokens(lat, lon, np.arange(10)[None] * 1.0)
     assert np.abs(tok[..., :2]).max() <= MAX_OFFSET_KM and np.isfinite(tok).all()
+
+
+# ------------------------------------------------------------------ TransferTraj
+@pytest.fixture(scope="module")
+def transfertraj(ctx, tmp_path_factory):
+    from mobeval.adapters.transfertraj import TransferTrajAdapter
+    out = tmp_path_factory.mktemp("ck") / "transfertraj.pt"
+    ad = TransferTrajAdapter.pretrain(ctx, arch=dict(embed_size=16, d_model=32, rafee_layer=1), train=FAST,
+                                      out=str(out), batch_size=32)
+    return ad, out
+
+
+def test_transfertraj_recovery_roundtrip_and_embeddings(ctx, transfertraj):
+    from mobeval.adapters.transfertraj import TransferTrajAdapter
+    ad, path = transfertraj
+    b = ctx.windows["test"]
+    m = make_mask(len(b), b.length, 0.5, "random", 0)
+    la, lo = ad.reconstruct(TargetGuard.hide_masked(b, m), m)
+    assert np.isfinite(la[m]).all() and np.array_equal(la[~m], b.lat[~m])          # observed points untouched
+    ad2 = TransferTrajAdapter.from_checkpoint(str(path), device="cpu")
+    la2, _ = ad2.reconstruct(TargetGuard.hide_masked(b, m), m)
+    assert np.allclose(la, la2) and ad2.provenance["train_fingerprint"] == ctx.fingerprint
+    assert ad2.embed(b).shape == (len(b), 32)
+
+
+def test_transfertraj_encoding_is_invertible(ctx, transfertraj):
+    """Relative scaled metres -> degrees must round-trip, whatever coord_scale is."""
+    ad, _ = transfertraj
+    b = ctx.windows["test"].take(np.arange(4))
+    seq, _, fp = ad._encode(b.lat, b.lon, b.t, np.zeros(b.lat.shape, bool))
+    xy = (seq[..., :2, 0] + fp.unsqueeze(1)).numpy() * ad.coord_scale
+    la, lo = ad.proj.to_latlon(xy[..., 0], xy[..., 1])
+    assert np.allclose(la, b.lat, atol=1e-6) and np.allclose(lo, b.lon, atol=1e-6)
+
+
+def test_transfertraj_pretrain_masks_cover_both_modalities():
+    from mobeval.adapters.transfertraj import TransferTrajAdapter
+    h = TransferTrajAdapter._pretrain_masks(8, 32, np.random.default_rng(0), 0.2, 0.4, 0.2)
+    assert h.shape == (8, 32, 2) and h[..., 0].any() and h[..., 1].any() and not h.all()
+
+
+def test_transfertraj_works_without_poi_or_road_data(ctx, transfertraj):
+    """The optional context pathways must keep the architecture intact when no data is given."""
+    ad, _ = transfertraj
+    assert ad.net.poi_embed_mat.shape == (1, 1) and float(ad.net.poi_coors.min()) > 1e10
+    assert "poi_embed_mat" not in ad.net.state_dict()          # non-persistent: not part of checkpoints
+
+
+def test_transfertraj_inference_is_deterministic(ctx, transfertraj):
+    """The MoE router's noise must not leak into evaluation (the original randomises every forward)."""
+    ad, _ = transfertraj
+    b = ctx.windows["test"].take(np.arange(8))
+    m = make_mask(len(b), b.length, 0.5, "random", 2)
+    hidden = TargetGuard.hide_masked(b, m)
+    assert np.array_equal(ad.reconstruct(hidden, m)[0], ad.reconstruct(hidden, m)[0])
+    assert np.array_equal(ad.embed(b), ad._embed_batch(b))

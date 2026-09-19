@@ -1,0 +1,23 @@
+#!/bin/bash
+#PBS -N mobeval_all
+#PBS -q q07daneel
+#PBS -l select=1:ncpus=8:ngpus=1:mem=32gb
+#PBS -l walltime=72:00:00
+#PBS -j oe
+# Train every model that has no checkpoint yet, then evaluate everything, in a single job.
+#   qsub jobs/all_in_one.pbs
+# Jobs are NOT re-queued on this cluster and are killed when the walltime expires; since
+# `mobeval run` skips models whose checkpoint already exists, simply re-submitting this job
+# continues from the checkpoints copied back by the previous one.
+
+cd "$PBS_O_WORKDIR"
+source jobs/env.sh
+setup_env
+stage_in
+restore_checkpoints
+
+mobeval run --config "$SCRATCH/config.yaml" --device cuda -v
+
+stage_out
+echo "report: $RESULTS_DIR/report.md"
+exit 0

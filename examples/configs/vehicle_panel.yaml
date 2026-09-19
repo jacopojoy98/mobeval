@@ -7,8 +7,8 @@ output_dir: results/vehicle_panel
 
 dataset:
   loader: csv                     # .csv or .parquet
-  train_path: /home/jacopo/Modelli/Datasets/survey/data_by_fua_final/train.csv
-  test_path: /home/jacopo/Modelli/Datasets/survey/data_by_fua_final/test_FVF.csv
+  train_path: data/train.csv
+  test_path: data/test.csv
   time_col: datetime              # naive local time is kept as local clock time
   user_id: uid                    # check: `uid` or `user`, whichever identifies a person/vehicle
   traj_id: trip_id                # one trip = one trajectory (made unique per user automatically)
@@ -36,13 +36,12 @@ eval:
 models:
   - name: UniTraj-zeroshot
     type: unitraj
-    checkpoint: /home/jacopo/Documenti/MobFM/Survey/UniTraj/model.pt
+    checkpoint: models/unitraj/model.pt
     external_pretraining: true
     adapter: {device: cuda, batch_size: 256}
   - name: UniTraj-finetuned
     type: unitraj
-    chechpoint: /home/jacopo/Documenti/MobFM/BMdir/mobeval/results/geolife/checkpoints/UniTraj-finetuned.pt
-    #train: {init_from: models/unitraj/model.pt, epochs: 30, batch_size: 128, lr: 3.0e-4, patience: 5, device: cuda}
+    train: {init_from: models/unitraj/model.pt, epochs: 30, batch_size: 128, lr: 3.0e-4, patience: 5, device: cuda}
     adapter: {device: cuda, batch_size: 256}
   - name: TrajGPT
     type: trajgpt
@@ -52,3 +51,13 @@ models:
     type: clip_mobility
     train: {epochs: 50, batch_size: 64, lr: 1.0e-4, patience: 8, device: cuda}
     adapter: {device: cuda}
+  - name: TransferTraj
+    type: transfertraj
+    arch: {embed_size: 64, d_model: 128, rafee_layer: 2}
+    train: {epochs: 50, batch_size: 32, lr: 1.0e-3, patience: 8, device: cuda}
+    adapter:
+      device: cuda
+      batch_size: 128
+      coord_scale: 1000.0        # 1.0 reproduces the original (raw metres); see MODELS.md
+      # context: {poi_embed: data/poi_embed.npy, poi_latlon: data/poi_latlon.npy,
+      #           road_embed: data/road_embed.npy, road_latlon: data/road_latlon.npy}

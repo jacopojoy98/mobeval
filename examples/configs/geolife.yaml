@@ -1,6 +1,11 @@
 # Full comparison on GeoLife.   mobeval run --config examples/configs/geolife.yaml
 title: UniTraj vs TrajGPT vs CLIP mobility model on GeoLife
 output_dir: results/geolife
+
+# Keep finished work outside scratch as it is produced (a checkpoint after every
+# improving epoch, results after every task), so a crash or walltime kill loses nothing.
+# The PBS scripts set MOBEVAL_PERSIST_DIR instead, which overrides this.
+# persist_dir: /home/jcolombini/results
 check_provenance: error          # refuse checkpoints trained on a different split
 
 dataset:

@@ -64,12 +64,12 @@ class CLIPMobilityAdapter(TorchAdapter):
         self._loc_head, self._time_heads = None, {}
 
     # ------------------------------------------------------------------ persistence
-    def save(self, path, history=None):
+    def save(self, path, history=None, quiet: bool = False, complete: bool = True):
         from ..nn.common import save_checkpoint
         save_checkpoint(path, self.net, self.model_type, {"arch": self.arch, "extra_dim": self.extra_dim},
                         {"visit_center": [self.visit_proj.lat0, self.visit_proj.lon0], "visit_context": self.visit_context,
                          "provenance": self.provenance},
-                        history)
+                        history, quiet=quiet, complete=complete)
 
     @classmethod
     def from_checkpoint(cls, path, extra_point_features=None, **kw) -> "CLIPMobilityAdapter":
@@ -259,7 +259,8 @@ class CLIPMobilityAdapter(TorchAdapter):
 
         ad.provenance = ctx.provenance(init_from=init_from)
         ad.net.train()
-        history = fit_loop(ad.net, len(data[True][0]), len(data[False][0]), loss_fn, cfg)
+        history = fit_loop(ad.net, len(data[True][0]), len(data[False][0]), loss_fn, cfg,
+                           on_best=ad.epoch_checkpointer(out))
         ad.invalidate_cache()
         if out:
             ad.save(out, history)

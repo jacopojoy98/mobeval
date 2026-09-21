@@ -49,7 +49,16 @@ class ProvenanceError(RuntimeError):
 
 
 def checkpoint_path(spec: dict, output_dir) -> Path:
-    return Path(spec.get("checkpoint") or Path(output_dir) / "checkpoints" / f"{spec['name']}.pt")
+    """Where this model's weights live. An explicit `checkpoint:` in the config always wins;
+    otherwise it is the run layout's shared checkpoint directory, which deliberately does NOT
+    vary per run so a second job reuses the first job's training."""
+    if spec.get("checkpoint"):
+        return Path(spec["checkpoint"])
+    from . import layout
+    lay = layout.get()
+    if lay is not None and Path(lay.output_dir) == Path(output_dir):
+        return lay.checkpoint(spec["name"])
+    return Path(output_dir) / "checkpoints" / f"{spec['name']}.pt"
 
 
 def train_model(spec: dict, ctx, output_dir) -> Path:
@@ -76,13 +85,29 @@ def train_model(spec: dict, ctx, output_dir) -> Path:
     try:
         with rep.scoped(spec["name"]):
             getattr(cls, TRAIN_METHOD[mtype])(ctx, train=tr, out=str(out), **kwargs, **spec.get("adapter", {}))
+    except progress.Interrupted:
+        # Not a failure: the best epoch reached is already saved (and mirrored), and a resumed
+        # run continues from it because that checkpoint is marked incomplete.
+        rep.model(spec["name"], state="interrupted",
+                  detail="stopped mid-training; re-run with --resume to continue from the best epoch")
+        rep.event("train_interrupted", model=spec["name"], seconds=time.time() - t0,
+                  message=f"{spec['name']}: interrupted after {time.time() - t0:.0f}s, best epoch kept")
+        raise
     except Exception as e:                                             # noqa: BLE001
         rep.model(spec["name"], state="failed", detail=repr(e)[:80])
         rep.error(f"training {spec['name']} failed: {e!r}", model=spec["name"])
         raise
+    # The checkpoint was already mirrored after every improving epoch; mirror once more so the
+    # durable copy is the final one (best weights + full history) the moment training ends,
+    # rather than whenever the job gets around to staging out.
+    from . import layout
+    kept = layout.mirror(out)
+    layout.mirror(out.with_suffix(".json"))
     rep.model(spec["name"], state="trained", train_seconds=time.time() - t0, detail=f"-> {out.name}")
-    rep.event("train_end", model=spec["name"], seconds=time.time() - t0,
-              message=f"{spec['name']}: trained in {time.time() - t0:.0f}s")
+    rep.event("train_end", model=spec["name"], seconds=time.time() - t0, checkpoint=str(kept or out),
+              message=f"{spec['name']}: trained in {time.time() - t0:.0f}s -> {kept or out}")
+    if kept:
+        log.info(f"{spec['name']}: checkpoint kept at {kept}")
     rep.step_done()
     return out
 

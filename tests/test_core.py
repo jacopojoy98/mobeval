@@ -185,3 +185,20 @@ def test_staypoints_follow_time_not_trajectory_id_order():
            [("u", "a_second", 10_000 + 60 * k, 45.1, 9.1) for k in range(30)]
     sp = detect_staypoints(MobilityDataset(pd.DataFrame(rows, columns=["user_id", "traj_id", "t", "lat", "lon"])))
     assert list(sp.traj_id) == ["b_first", "a_second"] and (sp.t_leave > sp.t_arrive).all()
+
+
+def test_training_views_can_be_thinned_without_touching_evaluation():
+    """Panel data yields millions of overlapping visit sequences; train must be limitable."""
+    from mobeval.context import EvalContext
+    ds = synthetic_dataset(n_users=20, n_days=12, seed=7)
+    base = EvalConfig(window_length=32, visit_context=6, max_eval_samples=50)
+    plain = EvalContext(ds, base)
+    thin = EvalContext(ds, EvalConfig(window_length=32, visit_context=6, max_eval_samples=50,
+                                      visit_stride=4, max_train_samples=100))
+    assert len(thin.windows["train"]) == 100 < len(plain.windows["train"])
+    assert 0 < len(thin.visits["train"]) < len(plain.visits["train"]) / 2
+    for split in ("val", "test"):                       # evaluation views must be identical
+        assert len(thin.visits[split]) == len(plain.visits[split])
+        assert len(thin.windows[split]) == len(plain.windows[split])
+        assert np.array_equal(thin.visits[split].tgt_cell, plain.visits[split].tgt_cell)
+    assert thin.fingerprint == plain.fingerprint        # same split: checkpoints stay compatible

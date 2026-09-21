@@ -7,11 +7,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Tuple
 
+import logging
+
 import numpy as np
 import pandas as pd
 
 from .data import (MobilityDataset, SpatialGrid, TrajectoryBatch, VisitBatch, detect_staypoints,
                    make_visit_sequences, make_windows)
+
+log = logging.getLogger("mobeval.context")
 
 
 @dataclass
@@ -32,7 +36,13 @@ class EvalConfig:
     trip_link_dist_m: float = 500.0             # 'trips': max distance trip end -> next start to average them
     trip_max_stay_s: float = 3 * 86400          # 'trips': longer gaps are missing data, not stays
     visit_context: int = 8
-    max_eval_samples: Optional[int] = 2000      # seeded subsample of test views (same for all models)
+    max_eval_samples: Optional[int] = 2000      # seeded subsample of val/test views (same for all models)
+    # Training-set size. Visit sequences are built with a sliding window, so with stride 1 consecutive
+    # samples share visit_context-1 of their visits: a panel dataset easily yields millions of nearly
+    # identical sequences. `visit_stride` thins them at the source (train split only, so evaluation
+    # semantics are untouched) and `max_train_samples` caps the training views outright.
+    visit_stride: int = 1
+    max_train_samples: Optional[int] = None
     # statistics
     eval_seeds: Sequence[int] = (0, 1, 2)       # repeated masks / label subsets
     n_boot: int = 500
@@ -64,14 +74,17 @@ class EvalContext:
         for name, ds in self.splits.items():
             try:
                 w = make_windows(ds, cfg.window_length, cfg.window_stride, cfg.max_gap_s)
-                self.windows[name] = self._cap(w) if name != "train" else w
+                self.windows[name] = self._cap(w) if name != "train" else self._cap_train(w, "windows")
             except ValueError:
                 pass
             tids = set(ds.points.traj_id.unique())
             self.staypoints[name] = all_sp[all_sp.traj_id.isin(tids)].reset_index(drop=True)
             try:
-                v = make_visit_sequences(all_sp, self.grid, cfg.visit_context, target_traj_ids=tids)
-                self.visits[name] = self._cap_visits(v) if name != "train" else v
+                v = make_visit_sequences(all_sp, self.grid, cfg.visit_context,
+                                         stride=cfg.visit_stride if name == "train" else 1,
+                                         target_traj_ids=tids)
+                self.visits[name] = (self._cap_visits(v) if name != "train"
+                                     else self._cap_train(v, "visit sequences", visits=True))
             except ValueError:
                 pass
         self.cache: Dict = {}
@@ -107,6 +120,26 @@ class EvalContext:
         return {"train_fingerprint": self.fingerprint, "dataset": self.dataset_name,
                 "trained_at": datetime.datetime.now().isoformat(timespec="seconds"),
                 **{k: v for k, v in extra.items() if v is not None}}
+
+    def _subsample(self, n: int, m: Optional[int]) -> Optional[np.ndarray]:
+        if m is None or n <= m:
+            return None
+        return np.sort(np.random.default_rng(self.cfg.split_seed).choice(n, m, replace=False))
+
+    LARGE_TRAIN = 500_000
+
+    def _cap_train(self, batch, what: str, visits: bool = False):
+        idx = self._subsample(len(batch), self.cfg.max_train_samples)
+        if idx is None:
+            if len(batch) > self.LARGE_TRAIN:
+                log.warning(
+                    f"train {what}: {len(batch):,} samples - one epoch will be {len(batch) // 64:,} steps at "
+                    f"batch size 64. Thin them with `visit_stride` (overlapping sequences) and/or "
+                    f"`max_train_samples`, or cap work per epoch with train.max_steps_per_epoch.")
+            return batch
+        log.info(f"train {what}: {len(batch)} -> {len(idx)} (max_train_samples)")
+        return (VisitBatch(**{k: getattr(batch, k)[idx] for k in VisitBatch.__dataclass_fields__})
+                if visits else batch.take(idx))
 
     def _cap(self, b: TrajectoryBatch) -> TrajectoryBatch:
         m = self.cfg.max_eval_samples

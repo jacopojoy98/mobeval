@@ -31,6 +31,10 @@ from .torch_base import TorchAdapter
 log = logging.getLogger("mobeval.adapters.trajgpt")
 DEFAULT_ARCH = dict(num_heads=2, num_layers=4, num_gaussians=3, d_feedforward=32, d_embed=32, lambda_min=1.0,
                     input_order="fixed")
+# `sequence_len` only sizes the pre-computed causal masks (no parameters depend on it, and the masks are
+# non-persistent, so checkpoints are portable across values). It is kept at least this long - the
+# original repository's RAW_SEQ_LEN - so a checkpoint is not locked to the context it was trained with.
+MIN_SEQUENCE_LEN = 128
 
 
 class TrajGPTAdapter(TorchAdapter):
@@ -52,6 +56,7 @@ class TrajGPTAdapter(TorchAdapter):
             raise ValueError("time_reference must be 'week' or 'global'")
         self.time_reference = time_reference
         self.max_valid_travel_h = float(max_valid_travel_h)
+        self._warned_context = False
         self.net = TrajGPT(self.tok.n_regions, self.sequence_len, self.lambda_max, **self.arch).to(self.device).eval()
         if self.arch["input_order"] == "legacy":
             log.warning("TrajGPT legacy input order: the original time heads read the target's own arrival/"
@@ -66,9 +71,10 @@ class TrajGPTAdapter(TorchAdapter):
                 "time_reference": self.time_reference, "max_valid_travel_h": self.max_valid_travel_h,
                 "provenance": self.provenance}
 
-    def save(self, path, history=None):
+    def save(self, path, history=None, quiet: bool = False, complete: bool = True):
         from ..nn.common import save_checkpoint
-        save_checkpoint(path, self.net, self.model_type, {"arch": self.arch}, self._meta(), history)
+        save_checkpoint(path, self.net, self.model_type, {"arch": self.arch}, self._meta(), history,
+                        quiet=quiet, complete=complete)
 
     @classmethod
     def from_checkpoint(cls, path, **kw) -> "TrajGPTAdapter":
@@ -125,6 +131,12 @@ class TrajGPTAdapter(TorchAdapter):
     def _check_len(self, C):
         if C + 1 > self.sequence_len:
             raise ValueError(f"visit context {C} + 1 exceeds the model sequence length {self.sequence_len}")
+        trained = self.provenance.get("train_context")
+        if trained is not None and trained != C and not self._warned_context:
+            self._warned_context = True
+            log.warning(f"evaluating with a context of {C} visits, but this checkpoint was trained with "
+                        f"{trained}. The model sees sequence positions it never saw in training; retrain "
+                        f"with the same `visit_context` for a like-for-like comparison.")
 
     # ------------------------------------------------------------------ capabilities
     def predict_location(self, visits: VisitBatch, grid) -> LocationPrediction:
@@ -271,8 +283,10 @@ class TrajGPTAdapter(TorchAdapter):
             x, y = proj.to_xy(sp_train.lat.to_numpy(), sp_train.lon.to_numpy())
             lam = float(np.hypot(np.ptp(x), np.ptp(y))) or 1000.0
             ad = cls(tok, proj, float(sp_train.t_arrive.min()), np.nanpercentile(travel_h, 99),
-                     np.nanpercentile(dur_h, 99), lam, C + 1, arch=arch, device=cfg.device, **kw)
-        log.info(f"TrajGPT: {ad.tok.n_regions} regions, seq_len {ad.sequence_len}, input_order {ad.arch['input_order']}, "
+                     np.nanpercentile(dur_h, 99), lam, max(C + 1, MIN_SEQUENCE_LEN),
+                     arch=arch, device=cfg.device, **kw)
+        log.info(f"TrajGPT: {ad.tok.n_regions} regions, visit_context {C} ({C} targets per sample), "
+                 f"mask capacity {ad.sequence_len}, input_order {ad.arch['input_order']}, "
                  f"time_reference {ad.time_reference}, max duration {ad.max_duration_h:.1f} h")
 
         def tensors(v):
@@ -299,9 +313,9 @@ class TrajGPTAdapter(TorchAdapter):
             d_nll = gmm_nll(out["duration"], dur[idx], torch.ones_like(ok[idx], dtype=torch.bool), ms)
             return ce + (t_nll.mean() if t_nll.numel() else 0.0) + d_nll.mean()
 
-        ad.provenance = ctx.provenance(init_from=init_from)
+        ad.provenance = ctx.provenance(init_from=init_from, train_context=C)
         ad.net.train()
-        history = fit_loop(ad.net, len(tr), len(va), loss_fn, cfg)
+        history = fit_loop(ad.net, len(tr), len(va), loss_fn, cfg, on_best=ad.epoch_checkpointer(out))
         if out:
             ad.save(out, history)
         return ad

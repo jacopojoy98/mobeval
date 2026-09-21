@@ -133,8 +133,13 @@ def test_provenance_blocks_checkpoint_from_other_split(ctx, unitraj):
 
 def test_cli_smoke(tmp_path):
     from mobeval.cli import main
-    assert main(["smoke", "--out", str(tmp_path / "smoke"), "--device", "cpu"]) == 0
-    assert (tmp_path / "smoke" / "report.md").exists() and (tmp_path / "smoke" / "checkpoints" / "TrajGPT-tiny.pt").exists()
+    out = tmp_path / "smoke"
+    assert main(["smoke", "--out", str(out), "--device", "cpu"]) == 0
+    # Checkpoints are shared across runs; the report belongs to this run, reachable via `latest`.
+    assert (out / "checkpoints" / "TrajGPT-tiny.pt").exists()
+    assert (out / "latest" / "report.md").exists()
+    runs = sorted((out / "runs").iterdir())
+    assert len(runs) == 1 and (runs[0] / "results.jsonl").exists()
 
 
 def test_clip_validation_is_finite_with_short_visit_histories():
@@ -297,3 +302,22 @@ def test_mismatched_context_arrays_are_rejected(ctx, tmp_path):
     with pytest.raises(ValueError, match="same length"):
         TransferTrajAdapter(center=(55.6, 12.5), device="cpu",
                             context={"poi_embed": str(tmp_path / "e.npy"), "poi_latlon": str(tmp_path / "c.npy")})
+
+
+def test_trajgpt_mask_capacity_is_generous_and_context_mismatch_warns(ctx, tmp_path, caplog):
+    """sequence_len only sizes the causal masks: no parameter depends on it and it is not persisted,
+    so a checkpoint must not be locked to the context it was trained with - but using a different
+    one must say so."""
+    from mobeval.adapters.trajgpt import MIN_SEQUENCE_LEN, TrajGPTAdapter
+    path = tmp_path / "tg_ctx.pt"
+    ad = TrajGPTAdapter.train(ctx, train=FAST, out=str(path), arch={"num_layers": 1})
+    trained_context = ctx.visits["train"].ctx_lat.shape[1]
+    assert ad.sequence_len >= MIN_SEQUENCE_LEN
+    assert ad.provenance["train_context"] == trained_context
+
+    reloaded = TrajGPTAdapter.from_checkpoint(str(path), device="cpu")
+    with caplog.at_level("WARNING"):
+        reloaded._check_len(trained_context)                      # same context: silent
+        assert not [r for r in caplog.records if "trained with" in r.message]
+        reloaded._check_len(trained_context + 4)                  # different: warns once
+        assert [r for r in caplog.records if "trained with" in r.message]

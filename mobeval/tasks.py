@@ -3,6 +3,7 @@ calls ONE adapter capability, scores model AND baselines on identical samples,
 and emits ResultRecords with bootstrap CIs and paired skill-score CIs."""
 from __future__ import annotations
 
+import logging
 from typing import Callable, Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -20,6 +21,8 @@ from .metrics.probabilistic import continuous_metrics, pit_ks
 from .metrics.reconstruction import recovery_metrics
 from .results import ResultRecord
 from .stats import bootstrap, evaluate_with_ci, skill_score
+
+log = logging.getLogger("mobeval")
 
 Scores = Tuple[Dict[str, np.ndarray], Dict[str, Callable]]   # (per-sample, set-level)
 
@@ -387,6 +390,16 @@ class EfficiencyTask(Task):
                 recs.append(ResultRecord(model=adapter.name, run_tag=adapter.run_tag, task=f"efficiency/{cap}",
                                          metric="latency_ms_per_sample", value=1000 * sec / n, n=n,
                                          dataset=ctx.dataset_name))
+        # Latency is timed while a task runs, so a task whose results were kept from an earlier
+        # attempt has no timing in this process. That is a real gap, not a silent one: say so.
+        kept = sorted(t for (m, rt, t) in getattr(ctx, "resumed_units", None) or ()
+                      if (m, rt) == (adapter.name, adapter.run_tag))
+        if kept:
+            log.warning(f"{adapter.name}: no latency measured for {', '.join(kept)} - those results were "
+                        f"kept from an earlier run, so those tasks were not timed here. Re-run without "
+                        f"--resume for complete efficiency numbers.")
+            for r in recs:
+                r.flags.append(f"resumed run: {len(kept)} task(s) not timed in this process")
         return recs
 
 

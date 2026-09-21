@@ -6,9 +6,12 @@
 #PBS -j oe
 # Train every model that has no checkpoint yet, then evaluate everything, in a single job.
 #   qsub jobs/all_in_one.pbs
-# Jobs are NOT re-queued on this cluster and are killed when the walltime expires; since
-# `mobeval run` skips models whose checkpoint already exists, simply re-submitting this job
-# continues from the checkpoints copied back by the previous one.
+# Jobs are NOT re-queued on this cluster and are killed when the walltime expires. Nothing
+# finished waits for the end of the job: checkpoints are copied to $RESULTS_DIR after every
+# improving epoch and results after every task. Re-submitting with RESUME continues where the
+# previous attempt stopped - finished models are skipped, a half-trained one is continued from
+# its best epoch, and completed evaluation tasks are kept:
+#   qsub -v RESUME=latest jobs/all_in_one.pbs
 
 cd "$PBS_O_WORKDIR"
 source jobs/env.sh
@@ -16,8 +19,10 @@ setup_env
 stage_in
 restore_checkpoints
 
-python -m mobeval run --config "$SCRATCH/config.yaml" --device cuda -v
+status=0
+run_mobeval run --config "$SCRATCH/config.yaml" --device cuda -v \
+    ${RESUME:+--resume "$RESUME"} || status=$?
 
 stage_out
-echo "report: $RESULTS_DIR/report.md"
-exit 0
+echo "report: $RESULTS_DIR/latest/report.md"
+exit $status

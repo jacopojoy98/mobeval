@@ -48,6 +48,24 @@ class TorchAdapter(MobilityModelAdapter):
         if self.net is None:
             raise RuntimeError(f"{self.name}: no network loaded - use from_checkpoint(...) or pretrain(...) first")
 
+    def epoch_checkpointer(self, out: Optional[str]):
+        """Callback for `nn.common.fit`: keep `out` at the best-so-far weights.
+
+        Without this a checkpoint only appeared once training had finished, so a crash at
+        epoch 40 of 100 - or a PBS walltime kill - threw away every epoch of work. Saving on
+        improvement means the file on disk is always the best model seen so far, and it is
+        mirrored to durable storage by `save_checkpoint` as it is written.
+        """
+        if not out:
+            return None
+
+        def save_best(history):
+            # complete=False: these are the best weights so far, not the end of training. If the
+            # job dies here, a resumed run continues from them instead of treating them as final.
+            self.save(out, history, quiet=True, complete=False)
+
+        return save_best
+
     # ----------------------------------------------------------------- embeddings
     def _embed_batch(self, batch: TrajectoryBatch) -> np.ndarray:
         raise NotImplementedError

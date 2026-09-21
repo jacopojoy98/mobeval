@@ -110,3 +110,17 @@ def test_pipeline_reports_stages_tasks_and_counts(tmp_path):
     kinds = {e["event"] for e in events}
     assert {"run_start", "stage_start", "prepared", "task_start", "task_end", "run_end"} <= kinds
     assert any(e["event"] == "task_end" and e["task"] == "recovery" for e in events)
+
+
+def test_config_failure_is_recorded_when_the_directory_is_known_early(tmp_path, monkeypatch):
+    """A broken config must leave a visible failed run, not an empty progress directory."""
+    from mobeval.cli import main
+    d = tmp_path / "progress"
+    monkeypatch.setenv("MOBEVAL_PROGRESS_DIR", str(d))
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("output_dir: /tmp/x\ndataset: {loader: csv, path: /nope.csv}\n"
+                   "models: [{name: A, type: unitraj}, {name: A, type: unitraj}]\n")
+    with pytest.raises(ValueError, match="unique"):
+        main(["train", "--config", str(bad)])
+    run = progress.load_runs(d)[0]
+    assert run["state"] == "failed" and run["phase"] == "loading config" and "unique" in run["failure"]

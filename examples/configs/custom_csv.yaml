@@ -1,5 +1,10 @@
 # Any GPS table: columns user_id, traj_id, t (unix seconds or datetime), lat, lon [, mode]
 output_dir: results/my_city
+
+# Keep finished work outside scratch as it is produced (a checkpoint after every
+# improving epoch, results after every task), so a crash or walltime kill loses nothing.
+# The PBS scripts set MOBEVAL_PERSIST_DIR instead, which overrides this.
+# persist_dir: /home/jcolombini/results
 dataset:
   loader: csv
   path: data/points.csv

@@ -1,6 +1,10 @@
 """Experiment configuration files (YAML or JSON).
 
     output_dir: results/geolife
+    persist_dir: /home/me/results       # optional: keep checkpoints/results here as they are produced,
+                                        # so a job killed in scratch does not lose finished work
+    run_dirs: true                      # each run writes output_dir/runs/<run_id>/ (default)
+    checkpoint_dir: null                # defaults to output_dir/checkpoints, shared by every run
     dataset:   {loader: geolife, path: /data/geolife}          # or csv / synthetic
     eval:      {window_length: 64, eval_seeds: [0, 1, 2], ...} # any EvalConfig field
     check_provenance: error                                    # error | warn | off
@@ -39,6 +43,11 @@ def apply_defaults(cfg: dict) -> dict:
     cfg.setdefault("output_dir", "results")
     cfg.setdefault("eval", {})
     cfg.setdefault("check_provenance", "error")
+    # Each invocation writes its report into output_dir/runs/<run_id>/ so concurrent or repeated
+    # jobs never overwrite each other. Checkpoints stay in the shared output_dir/checkpoints/.
+    cfg.setdefault("run_dirs", True)
+    cfg.setdefault("persist_dir", None)        # durable directory; results are copied there as produced
+    cfg.setdefault("checkpoint_dir", None)     # defaults to output_dir/checkpoints
     return cfg
 
 

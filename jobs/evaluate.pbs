@@ -7,6 +7,10 @@
 # Evaluate every model in the config using the checkpoints produced by the training jobs.
 #   qsub jobs/evaluate.pbs
 # Run it only after training: checkpoints are read from $RESULTS_DIR/checkpoints.
+#
+# Results are written after every task, into $RESULTS_DIR/runs/<run_id>/, so a crash keeps
+# whatever had finished. To carry on from an interrupted evaluation instead of redoing it:
+#   qsub -v RESUME=latest jobs/evaluate.pbs        (or RESUME=<run_id> for a specific one)
 
 cd "$PBS_O_WORKDIR"
 source jobs/env.sh
@@ -14,8 +18,10 @@ setup_env
 stage_in
 restore_checkpoints
 
-python -m mobeval evaluate --config "$SCRATCH/config.yaml" --device cuda -v
+status=0
+run_mobeval evaluate --config "$SCRATCH/config.yaml" --device cuda -v \
+    ${RESUME:+--resume "$RESUME"} || status=$?
 
 stage_out
-echo "report: $RESULTS_DIR/report.md"
-exit 0
+echo "report: $RESULTS_DIR/latest/report.md"
+exit $status

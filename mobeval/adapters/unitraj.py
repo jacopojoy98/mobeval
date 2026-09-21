@@ -57,10 +57,10 @@ class UniTrajAdapter(TorchAdapter):
         log.info(f"loaded UniTraj ({'mobeval' if ck['format'] != 'raw' else 'original'} checkpoint) from {path}")
         return ad
 
-    def save(self, path: str, history=None):
+    def save(self, path: str, history=None, quiet: bool = False, complete: bool = True):
         from ..nn.common import save_checkpoint
         save_checkpoint(path, self.net, self.model_type, {"arch": self.arch},
-                        {"norm": self.norm, "provenance": self.provenance}, history)
+                        {"norm": self.norm, "provenance": self.provenance}, history, quiet=quiet, complete=complete)
 
     # ------------------------------------------------------------------ encoding
     def _encode(self, lat, lon, t, hidden):
@@ -150,7 +150,7 @@ class UniTrajAdapter(TorchAdapter):
 
         ad.provenance = ctx.provenance(init_from=init_from)
         ad.net.train()
-        history = fit_loop(ad.net, len(tr), len(va), loss_fn, cfg)
+        history = fit_loop(ad.net, len(tr), len(va), loss_fn, cfg, on_best=ad.epoch_checkpointer(out))
         ad.invalidate_cache()
         if out:
             ad.save(out, history)

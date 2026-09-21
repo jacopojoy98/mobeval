@@ -10,8 +10,10 @@ Produces four arrays, which is the format every mobeval adapter expects for cont
 Two ways in, because compute nodes usually have no internet:
 
   * live        `from_osm(...)` downloads with osmnx (Overpass). Run it on a login node or laptop.
-  * from files  `pois_from_file(...)` / `roads_from_file(...)` read a GeoJSON or CSV you exported
-                beforehand (Overpass Turbo, QGIS, a Geofabrik extract processed with osmium/pyrosm).
+  * from files  `pois_from_file(...)` / `roads_from_file(...)` read a GeoPackage (.gpkg), GeoJSON,
+                CSV or Parquet you exported beforehand (QGIS, Overpass Turbo, ogr2ogr, a Geofabrik
+                extract). .gpkg and .geojson are parsed with the standard library, so geopandas /
+                fiona / GDAL are not required.
 
 Embeddings are one-hot over the most frequent OSM categories, so nothing has to be downloaded or
 trained. The model puts a LayerNorm + Linear in front of them, so any real-valued matrix works:
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import struct
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -37,6 +40,8 @@ POI_TAG_KEYS = ("amenity", "shop", "tourism", "leisure", "office", "healthcare",
 DEFAULT_POI_TAGS = {k: True for k in ("amenity", "shop", "tourism", "leisure", "office", "public_transport")}
 ROAD_TAG_KEYS = ("highway",)
 COLUMNS = ["lat", "lon", "category"]
+# formats read through geopandas/OGR (GeoJSON is handled without it)
+GEO_SUFFIXES = {".gpkg", ".shp", ".gml", ".kml", ".fgb", ".sqlite", ".geoparquet"}
 
 
 # --------------------------------------------------------------------------- bounding box
@@ -103,33 +108,63 @@ def _gdf_to_points(gdf, tag_keys) -> pd.DataFrame:
 
 # --------------------------------------------------------------------------- files (offline)
 def pois_from_file(path, category_keys: Sequence[str] = POI_TAG_KEYS, **kw) -> pd.DataFrame:
+    """GeoPackage / GeoJSON / CSV / Parquet. For .gpkg pass layer=... to pick a layer."""
     return _from_file(path, category_keys, **kw)
 
 
 def roads_from_file(path, category_keys: Sequence[str] = ROAD_TAG_KEYS, max_spacing_m: float = 100.0,
                     **kw) -> pd.DataFrame:
+    """`layer=` selects one layer of a multi-layer GeoPackage."""
     return _from_file(path, category_keys, max_spacing_m=max_spacing_m, **kw)
 
 
 def _from_file(path, category_keys, lat_col: str = "lat", lon_col: str = "lon",
-               category_col: Optional[str] = None, max_spacing_m: Optional[float] = None) -> pd.DataFrame:
-    """Read POIs / roads from GeoJSON (no geopandas needed) or CSV/Parquet."""
+               category_col: Optional[str] = None, max_spacing_m: Optional[float] = None,
+               layer: Optional[str] = None) -> pd.DataFrame:
+    """Read POIs / roads from GeoJSON (no geopandas needed), a GeoPackage / shapefile / other
+    OGR format (needs geopandas), or CSV/Parquet with lat & lon columns."""
     path = Path(path)
-    if path.suffix.lower() in (".geojson", ".json"):
-        rows = []
-        for feat in json.loads(path.read_text()).get("features", []):
-            geom, props = feat.get("geometry") or {}, feat.get("properties") or {}
-            coords = _flatten_coords(geom)
-            if not coords:
-                continue
-            cat = _category(props, category_keys)
-            if max_spacing_m and len(coords) > 1:
-                rows += [(lat, lon, cat) for lon, lat in _sample_line(coords, max_spacing_m)]
-            else:
-                arr = np.asarray(coords, float)
-                rows.append((float(arr[:, 1].mean()), float(arr[:, 0].mean()), cat))
-        return pd.DataFrame(rows, columns=COLUMNS)
-    df = pd.read_parquet(path) if path.suffix.lower() == ".parquet" else pd.read_csv(path)
+    suffix = path.suffix.lower()
+
+    if suffix in (".geojson", ".json"):
+        feats = json.loads(path.read_text()).get("features", [])
+        pairs = [(_flatten_coords(f.get("geometry") or {}), f.get("properties") or {}) for f in feats]
+        return _rows_to_frame(pairs, category_keys, category_col, max_spacing_m)
+
+    if suffix == ".gpkg":
+        pairs, srs = _read_gpkg(path, layer)
+        if srs in (4326, 0, -1, None):                      # already WGS84 degrees: no GDAL needed
+            return _rows_to_frame(pairs, category_keys, category_col, max_spacing_m)
+        log.info(f"{path.name}: EPSG:{srs}, reprojecting to EPSG:4326")
+        try:
+            import geopandas                                # noqa: F401  (reprojection only)
+        except ImportError as e:                            # pragma: no cover - depends on env
+            raise ImportError(
+                f"{path.name} is in EPSG:{srs}; reprojecting needs geopandas. Either install it, or "
+                f"convert the file once with GDAL: "
+                f"`ogr2ogr -f GPKG -t_srs EPSG:4326 wgs84.gpkg {path}`") from e
+
+    if suffix in GEO_SUFFIXES:
+        try:
+            import geopandas as gpd
+        except ImportError as e:                                # pragma: no cover - depends on env
+            raise ImportError(
+                f"reading {suffix} needs geopandas (`pip install geopandas`). If it will not install, "
+                f"convert the file once with GDAL: `ogr2ogr -f GeoJSON -t_srs EPSG:4326 out.geojson "
+                f"{path}` and pass the GeoJSON instead.") from e
+        gdf = gpd.read_file(path, layer=layer) if layer else gpd.read_file(path)
+        # A GeoPackage may hold any CRS (often a projected, metric one); mobeval works in WGS84
+        # degrees throughout, and GeoJSON is WGS84 by definition, so anything else is reprojected.
+        if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
+            log.info(f"{path.name}: reprojecting from {gdf.crs.to_string()} to EPSG:4326")
+            gdf = gdf.to_crs(4326)
+        elif gdf.crs is None:
+            log.warning(f"{path.name}: no CRS recorded, assuming the coordinates are WGS84 degrees")
+        props = gdf.drop(columns=[gdf.geometry.name]).to_dict("records")
+        pairs = [(_geom_coords(g), p) for g, p in zip(gdf.geometry, props)]
+        return _rows_to_frame(pairs, category_keys, category_col, max_spacing_m)
+
+    df = pd.read_parquet(path) if suffix == ".parquet" else pd.read_csv(path)
     missing = [c for c in (lat_col, lon_col) if c not in df.columns]
     if missing:
         raise ValueError(f"{path}: columns {missing} not found; available: {list(df.columns)}")
@@ -137,6 +172,161 @@ def _from_file(path, category_keys, lat_col: str = "lat", lon_col: str = "lon",
            else df.apply(lambda r: _category(r.to_dict(), category_keys), axis=1))
     return pd.DataFrame({"lat": df[lat_col].astype(float), "lon": df[lon_col].astype(float),
                          "category": cat}).reset_index(drop=True)
+
+
+def _rows_to_frame(pairs, category_keys, category_col, max_spacing_m) -> pd.DataFrame:
+    """(coords, properties) pairs -> the canonical lat / lon / category frame. Lines and areas
+    become one row per sample point when `max_spacing_m` is set, otherwise a single centroid."""
+    rows = []
+    for coords, props in pairs:
+        if not coords:
+            continue
+        cat = (str(props.get(category_col, "other")) if category_col
+               else _category(props, category_keys))
+        if max_spacing_m and len(coords) > 1:
+            rows += [(lat, lon, cat) for lon, lat in _sample_line(coords, max_spacing_m)]
+        else:
+            arr = np.asarray(coords, float)
+            rows.append((float(arr[:, 1].mean()), float(arr[:, 0].mean()), cat))
+    return pd.DataFrame(rows, columns=COLUMNS)
+
+
+# --------------------------------------------------------------------------- GeoPackage (stdlib)
+# A GeoPackage is SQLite + a short binary header + standard WKB, so it can be read without
+# geopandas/GDAL - useful on machines where those will not install. geopandas is still used when a
+# file needs reprojecting, or for the other OGR formats.
+ENVELOPE_BYTES = {0: 0, 1: 32, 2: 48, 3: 48, 4: 64}
+
+
+def _sqlite_connect(path):
+    """Read-only connection, imported lazily: some Python builds (several HPC modules among them)
+    ship without the _sqlite3 extension, and only GeoPackage reading needs it."""
+    try:
+        import sqlite3
+    except ImportError:
+        try:
+            import pysqlite3 as sqlite3                     # pip install pysqlite3-binary
+        except ImportError as e:
+            raise ImportError(
+                "reading a GeoPackage needs SQLite, and this Python was built without the _sqlite3 "
+                "module. Either convert the file once with GDAL "
+                "(`ogr2ogr -f GeoJSON -t_srs EPSG:4326 out.geojson in.gpkg`) and pass the GeoJSON, "
+                "install a SQLite for this interpreter (`pip install pysqlite3-binary`), or use a "
+                "Python build that includes sqlite3.") from e
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
+def gpkg_layers(path) -> List[str]:
+    """Feature layers of a GeoPackage, alphabetically."""
+    con = _sqlite_connect(path)
+    try:
+        rows = con.execute("SELECT table_name FROM gpkg_contents WHERE data_type='features' "
+                           "ORDER BY table_name").fetchall()
+    finally:
+        con.close()
+    return [r[0] for r in rows]
+
+
+def _wkb_coords(buf: bytes, off: int) -> Tuple[List[Tuple[float, float]], int]:
+    """(x, y) of any WKB geometry, ignoring Z/M. Returns the coordinates and the new offset."""
+    endian = struct.unpack_from("B", buf, off)[0]
+    e = "<" if endian == 1 else ">"
+    kind = struct.unpack_from(e + "I", buf, off + 1)[0]
+    off += 5
+    base, dims = kind % 1000, 2 + (1 if 1000 <= kind < 3000 else 2 if kind >= 3000 else 0)
+    fmt, size = e + "d" * dims, 8 * dims
+
+    def points(n, keep=True):
+        nonlocal off
+        out = []
+        for _ in range(n):
+            v = struct.unpack_from(fmt, buf, off)
+            off += size
+            if keep:
+                out.append((v[0], v[1]))
+        return out
+
+    if base == 1:                                                    # Point
+        return points(1), off
+    if base == 2:                                                    # LineString
+        n = struct.unpack_from(e + "I", buf, off)[0]
+        off += 4
+        return points(n), off
+    if base == 3:                                                    # Polygon: exterior ring only
+        n_rings = struct.unpack_from(e + "I", buf, off)[0]
+        off += 4
+        out = []
+        for ring in range(n_rings):
+            n = struct.unpack_from(e + "I", buf, off)[0]
+            off += 4
+            out += points(n, keep=ring == 0)
+        return out, off
+    if base in (4, 5, 6, 7):                                         # Multi* and GeometryCollection
+        n_geom = struct.unpack_from(e + "I", buf, off)[0]
+        off += 4
+        out = []
+        for _ in range(n_geom):
+            sub, off = _wkb_coords(buf, off)
+            out += sub
+        return out, off
+    return [], off
+
+
+def _gpkg_geom_coords(blob) -> List[Tuple[float, float]]:
+    """(lon, lat) pairs of one GeoPackage geometry blob; [] for empty or unreadable values."""
+    if not isinstance(blob, (bytes, bytearray)) or len(blob) < 8 or bytes(blob[:2]) != b"GP":
+        return []
+    flags = blob[3]
+    if flags & 0x10:                                                 # empty-geometry flag
+        return []
+    off = 8 + ENVELOPE_BYTES.get((flags >> 1) & 0x07, 0)
+    try:
+        coords, _ = _wkb_coords(bytes(blob), off)
+    except (struct.error, IndexError):
+        return []
+    return [(float(x), float(y)) for x, y in coords]
+
+
+def _read_gpkg(path: Path, layer: Optional[str]):
+    """-> (list of (coords, properties), srs_id). Raises ValueError for an unknown layer."""
+    layers = gpkg_layers(path)
+    if not layers:
+        raise ValueError(f"{path}: no feature layers found")
+    if layer is None:
+        layer = layers[0]
+        if len(layers) > 1:
+            log.warning(f"{path.name} has layers {layers}; using '{layer}' - pass layer= to choose")
+    elif layer not in layers:
+        raise ValueError(f"{path}: layer '{layer}' not found; available: {layers}")
+    con = _sqlite_connect(path)
+    try:
+        geom_col, srs = con.execute("SELECT column_name, srs_id FROM gpkg_geometry_columns "
+                                    "WHERE table_name=?", (layer,)).fetchone()
+        cur = con.execute(f'SELECT * FROM "{layer}"')
+        cols = [d[0] for d in cur.description]
+        pairs = []
+        for row in cur:
+            props = dict(zip(cols, row))
+            pairs.append((_gpkg_geom_coords(props.pop(geom_col, None)), props))
+    finally:
+        con.close()
+    return pairs, srs
+
+
+def _geom_coords(geom) -> List[Tuple[float, float]]:
+    """All (lon, lat) pairs of a shapely geometry."""
+    if geom is None or geom.is_empty:
+        return []
+    kind = geom.geom_type
+    if kind == "Point":
+        return [(float(geom.x), float(geom.y))]
+    if kind in ("LineString", "LinearRing"):
+        return [(float(x), float(y)) for x, y, *_ in geom.coords]
+    if kind == "Polygon":
+        return [(float(x), float(y)) for x, y, *_ in geom.exterior.coords]
+    if hasattr(geom, "geoms"):
+        return [c for g in geom.geoms for c in _geom_coords(g)]
+    return []
 
 
 def _flatten_coords(geom) -> List[Tuple[float, float]]:

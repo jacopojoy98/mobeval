@@ -5,6 +5,11 @@
 title: Mobility foundation models on vehicle panel data
 output_dir: results/vehicle_panel
 
+# Keep finished work outside scratch as it is produced (a checkpoint after every
+# improving epoch, results after every task), so a crash or walltime kill loses nothing.
+# The PBS scripts set MOBEVAL_PERSIST_DIR instead, which overrides this.
+# persist_dir: /home/jcolombini/results
+
 dataset:
   loader: csv                     # .csv or .parquet
   train_path: data/train.csv

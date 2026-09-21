@@ -7,6 +7,11 @@
 # Train ONE model and write its checkpoint.  GPUs exist only on the daneel queues.
 #   qsub -v MODEL=TrajGPT jobs/train_model.pbs
 # The job's stdout/stderr end up in mobeval_train.o<jobid> in the submission directory.
+#
+# The checkpoint is copied to $RESULTS_DIR/checkpoints/ after every epoch that improves, so if
+# this job dies or runs out of walltime the best model so far is already there. To carry on from
+# it instead of starting over:
+#   qsub -v MODEL=TrajGPT,RESUME=1 jobs/train_model.pbs
 
 cd "$PBS_O_WORKDIR"
 source jobs/env.sh
@@ -16,7 +21,10 @@ restore_checkpoints
 
 : "${MODEL:?pass the model name: qsub -v MODEL=TrajGPT jobs/train_model.pbs}"
 echo "=== training $MODEL ==="
-python -m mobeval train --config "$SCRATCH/config.yaml" --models "$MODEL" --device cuda -v
+status=0
+run_mobeval train --config "$SCRATCH/config.yaml" --models "$MODEL" --device cuda -v \
+    ${RESUME:+--resume} || status=$?
 
 stage_out
-exit 0
+echo "checkpoint: $RESULTS_DIR/checkpoints/$MODEL.pt"
+exit $status

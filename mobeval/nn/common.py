@@ -6,6 +6,7 @@ import copy
 import json
 import logging
 import math
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -74,9 +75,15 @@ def minibatches(n: int, batch_size: int, shuffle: bool, rng: Optional[np.random.
 
 
 def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarray, bool], torch.Tensor],
-        cfg: TrainConfig, params: Optional[Iterable] = None, drop_last: bool = True) -> List[dict]:
+        cfg: TrainConfig, params: Optional[Iterable] = None, drop_last: bool = True,
+        on_best: Optional[Callable[[List[dict]], None]] = None) -> List[dict]:
     """Generic loop. `loss_fn(indices, train)` builds the batch for those sample indices
-    and returns a scalar loss. Restores the best validation state at the end."""
+    and returns a scalar loss. Restores the best validation state at the end.
+
+    `on_best(history)` is called every time validation improves, with the model's weights
+    already at that best state. Adapters pass a checkpoint saver, so a run that is killed
+    at epoch 40 of 100 still leaves the best-so-far model on disk instead of nothing.
+    """
     set_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
     opt = torch.optim.AdamW(params if params is not None else model.parameters(),
@@ -126,6 +133,17 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
         sched.step(vl)
         if vl < best - 1e-6:
             best, bad, best_state = vl, 0, copy.deepcopy(model.state_dict())
+            if on_best is not None:
+                # The live weights ARE the best weights at this instant, so the saver can just
+                # write model.state_dict(). Never let a failed save abort a good training run.
+                try:
+                    on_best(history)
+                except Exception as e:                                  # noqa: BLE001
+                    log.warning(f"could not save the epoch-{epoch} checkpoint: {e!r}")
+                    rep.event("checkpoint_failed", model=who, epoch=epoch, error=repr(e))
+                else:
+                    rep.event("checkpoint", model=who, epoch=epoch, val_loss=float(f"{vl:.6g}"),
+                              message=f"{who}: saved checkpoint at epoch {epoch} (val {vl:.4g})")
         else:
             bad += 1
             if bad >= cfg.patience:
@@ -141,15 +159,62 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
 
 # ------------------------------------------------------------------ checkpoints
 def save_checkpoint(path, model: nn.Module, model_type: str, config: dict, meta: Optional[dict] = None,
-                    history: Optional[list] = None):
+                    history: Optional[list] = None, quiet: bool = False, complete: bool = True):
+    """Write a checkpoint atomically, then mirror it to durable storage.
+
+    Atomicity matters because this is now called after every improving epoch: a job killed
+    part-way through `torch.save` must not be able to destroy the previous good checkpoint.
+    We write to a temporary file in the same directory and rename, which is atomic on POSIX.
+    """
+    from .. import layout
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"format": CHECKPOINT_FORMAT, "model_type": model_type, "config": config,
-                "meta": meta or {}, "history": history or [], "state_dict": model.state_dict()}, path)
-    path.with_suffix(".json").write_text(json.dumps(
-        {"model_type": model_type, "config": config, "meta": meta or {}, "history": history or []},
-        indent=2, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
-    log.info(f"saved checkpoint -> {path}")
+    # `complete` marks the difference between "this is the best epoch so far" and "training
+    # finished". A training job that is killed leaves complete=False, which tells a resumed run
+    # to continue from these weights instead of accepting a half-trained model as final.
+    blob = {"format": CHECKPOINT_FORMAT, "model_type": model_type, "config": config, "complete": complete,
+            "meta": meta or {}, "history": history or [], "state_dict": model.state_dict()}
+    sidecar = {"model_type": model_type, "config": config, "complete": complete,
+               "meta": meta or {}, "history": history or []}
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    torch.save(blob, tmp)
+    os.replace(tmp, path)
+    json_path = path.with_suffix(".json")
+    tmp_json = json_path.with_suffix(f".json.tmp{os.getpid()}")
+    tmp_json.write_text(json.dumps(sidecar, indent=2,
+                                   default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
+    os.replace(tmp_json, json_path)
+    kept = layout.mirror(path)
+    layout.mirror(json_path)
+    if not quiet:
+        log.info(f"saved checkpoint -> {path}" + (f"  (kept in {kept.parent})" if kept else ""))
+
+
+def checkpoint_status(path) -> str:
+    """'missing' | 'partial' | 'complete', read from the sidecar so nothing has to be unpickled.
+
+    'partial' means the last training of this model was interrupted: the weights are the best
+    epoch it reached, and training should continue from them rather than be skipped.
+    """
+    path = Path(path)
+    if not path.exists():
+        return "missing"
+    side = path.with_suffix(".json")
+    if side.exists():
+        try:
+            return "complete" if json.loads(side.read_text()).get("complete", True) else "partial"
+        except (OSError, json.JSONDecodeError):
+            pass
+    return "complete"                       # checkpoints from before this field existed
+
+
+def last_epoch(path) -> Optional[int]:
+    side = Path(path).with_suffix(".json")
+    try:
+        hist = json.loads(side.read_text()).get("history") or []
+    except (OSError, json.JSONDecodeError):
+        return None
+    return hist[-1].get("epoch") if hist else None
 
 
 def load_checkpoint(path, map_location="cpu") -> dict:

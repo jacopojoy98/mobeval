@@ -29,6 +29,15 @@ RECENT_EVENTS = 12
 STALE_AFTER_S = 180.0        # no update for this long while "running" -> flagged as stale
 
 
+class Interrupted(RuntimeError):
+    """The scheduler asked the job to stop - SIGTERM, which on PBS means the walltime expired.
+
+    Defined here rather than in the CLI so the runner and the registry can let it through
+    instead of filing it as a model or task failure. It is not an error in the work; it means
+    the work should be continued with --resume.
+    """
+
+
 def _atomic_write(path: Path, text: str):
     tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
     with open(tmp, "w") as f:
@@ -282,7 +291,7 @@ def bar(done: int, total: int, width: int = 24, ascii_only: bool = False) -> str
     return f"[{full * filled}{empty * (width - filled)}] {done}/{total}"
 
 
-MARK = {"running": "*", "done": "+", "failed": "!", "stale": "?"}
+MARK = {"running": "*", "done": "+", "failed": "!", "stale": "?", "interrupted": "~"}
 
 
 def format_runs(runs: List[dict], verbose: bool = False, ascii_only: bool = False) -> str:
@@ -299,6 +308,8 @@ def format_runs(runs: List[dict], verbose: bool = False, ascii_only: bool = Fals
         out.append(f"  started {started}   elapsed {human_time(r.get('elapsed_s'))}"
                    f"   last update {human_time(r.get('age_s'))} ago")
         out.append(f"  phase: {r.get('phase', '?')}")
+        if r.get("persist_dir"):
+            out.append(f"  keeping results in: {r['persist_dir']}")
         if r.get("steps_total"):
             eta = ""
             done, total = r["steps_done"], r["steps_total"]
@@ -312,7 +323,14 @@ def format_runs(runs: List[dict], verbose: bool = False, ascii_only: bool = Fals
         if any(c.values()):
             out.append("  " + "   ".join(f"{k}: {v}" for k, v in c.items() if v))
         if r.get("failure"):
-            out.append(f"  FAILED {r['failure']}")
+            if r.get("state") == "interrupted":
+                # Not a failure: the scheduler stopped it. Everything finished is already saved.
+                out.append(f"  STOPPED {r['failure']} - finished work was written as it went; "
+                           f"re-submit with --resume to continue")
+                if r.get("run_dir"):
+                    out.append(f"  results so far: {r['run_dir']}")
+            else:
+                out.append(f"  FAILED {r['failure']}")
         for e in (r.get("errors") or [])[-3:]:
             out.append(f"  ERROR {e.get('message', '')}")
         if r.get("stale"):

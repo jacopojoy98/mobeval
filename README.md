@@ -41,9 +41,12 @@ models:
   - {name: CLIPMobility, type: clip_mobility, train: {epochs: 50, device: cuda}}
 ```
 
-Outputs in `output_dir`: `report.md`, `results.jsonl` (every metric with bootstrap CIs),
-`leaderboard.csv`, `family_summary.csv`, `run_info.json`, and `checkpoints/<name>.pt` (+ a
-readable `.json` with config, training history and provenance).
+Outputs land in `<output_dir>/runs/<run_id>/` — `report.md`, `results.jsonl` (every metric with
+bootstrap CIs), `leaderboard.csv`, `family_summary.csv`, `run_info.json` — with
+`<output_dir>/latest` pointing at the newest run, and `checkpoints/<name>.pt` (+ a readable
+`.json` with config, training history and provenance) shared across runs. See
+[one directory per run](#one-directory-per-run), and
+[surviving a crash](#surviving-a-crash-or-a-walltime-kill) for `--persist-dir` and `--resume`.
 
 ## Using your own data
 
@@ -116,6 +119,30 @@ patience, grad_clip, max_steps_per_epoch, device, seed`, plus `init_from` and `o
 model-specific training arguments) and `adapter:` (`device, batch_size, head_train, head_hidden,
 head_class_weighted`, ...).
 
+## Controlling how much data training sees
+
+Visit sequences are built with a sliding window over each user's staypoints, so with the default
+`visit_stride: 1` consecutive samples share `visit_context - 1` visits. On a panel dataset that can
+mean millions of nearly identical training sequences (and `mobeval info` warns when it does).
+
+```yaml
+eval:
+  visit_context: 32        # history per sample; also how many targets TrajGPT learns from per sample
+  visit_stride: 8          # thin overlapping training sequences (train split only)
+  max_train_samples: 200000   # hard cap on training windows and visit sequences
+  max_eval_samples: 5000      # val/test views (unchanged by the two above)
+```
+
+`visit_stride` and `max_train_samples` affect only the training split, so evaluation stays comparable
+and the split fingerprint is unchanged - existing checkpoints remain valid. A third lever lives in the
+model's own `train:` section and bounds work per epoch without changing the dataset:
+
+```yaml
+    train: {max_steps_per_epoch: 2000, ...}
+```
+
+Run `mobeval info --config exp.yaml` to see the resulting sizes before submitting anything.
+
 ## Watching a run in progress
 
 Batch jobs are opaque: the work happens on a compute node, possibly for hours. Every run therefore
@@ -137,6 +164,11 @@ mobeval status --progress-dir DIR --events 20               # plus the recent ev
     TrajGPT                pending
   records: 124   skipped: 8
 ```
+
+Reporting starts before the configuration is read whenever the directory is known from
+`MOBEVAL_PROGRESS_DIR` or `--progress-dir`, so even a broken config leaves a `failed` run with the
+reason. An empty progress directory therefore means the command never started at all - a wrong
+interpreter, a failed import, or the command missing from the job script.
 
 A run is marked `stale` when it stops updating while still claiming to run, which is what a killed or
 crashed job looks like; `failed` runs show the reason. Several jobs can share one progress directory
@@ -164,13 +196,72 @@ qsub jobs/all_in_one.pbs                              # train missing checkpoint
 bash jobs/submit_all.sh UniTraj-finetuned TrajGPT CLIPMobility   # one job per model + evaluation after
 qsub -v MODEL=TrajGPT jobs/train_model.pbs            # a single model
 qsub jobs/evaluate.pbs                                # evaluation only, from existing checkpoints
+qsub -v RESUME=latest jobs/all_in_one.pbs             # continue where a killed job stopped
 qstat -u $USER                                        # is it queued or running?
 python -m mobeval status --progress-dir ~/MobFM/results/progress --watch   # what is it doing?
 ```
 
-The scripts copy data to `/scratch/$USER`, run there, and copy `results/` (report, metrics, checkpoints)
-back to `RESULTS_DIR`. Checkpoints from earlier jobs are restored first, so a job killed by the walltime
-can be re-submitted and continues with the models that are already trained.
+The scripts copy data to `/scratch/$USER` and run there, as the cluster requires.
+
+## Surviving a crash or a walltime kill
+
+Nothing finished waits for the end of the job. `MOBEVAL_PERSIST_DIR` (set to `$RESULTS_DIR` by
+`jobs/env.sh`, or `--persist-dir` / `persist_dir:`) is a durable directory outside scratch that is
+written to *as the work completes*:
+
+| what | when it is written |
+|---|---|
+| a model's checkpoint | after **every epoch that improves**, not at the end of training |
+| a task's metrics | after **every task**, not at the end of the evaluation |
+| report, leaderboard, `run_info.json` | when the evaluation finishes |
+
+So a job that dies at hour 11 of 12 leaves behind every model that finished training, the best epoch
+of the one that was still training, and every metric computed so far. Writes are atomic (temporary
+file plus rename), so an interrupted write cannot corrupt the previous good copy, and a truncated
+last line in `results.jsonl` costs one record rather than the file.
+
+PBS sends `SIGTERM` before `SIGKILL` when the walltime expires. mobeval catches it, finishes its
+current write, marks the run `interrupted` in the progress file with a pointer to the results so far,
+and exits 143 (so `depend=afterok` chains do not continue on half-finished work).
+
+**Continuing.** Re-submit with `RESUME`:
+
+```bash
+qsub -v RESUME=latest jobs/all_in_one.pbs        # continue the newest run
+qsub -v RESUME=20260921-100122-994-run jobs/all_in_one.pbs   # or a specific one
+mobeval run --config exp.yaml --resume           # the same thing, directly
+```
+
+A resumed run reuses the *same* run directory and:
+
+* skips models whose checkpoint is marked complete;
+* **continues** a model whose checkpoint is marked incomplete, from its best epoch — an
+  interrupted model is never silently accepted as trained;
+* keeps every evaluation task that already has results and computes only what is missing.
+
+It works even when scratch is empty, which is the normal case for the next job: checkpoints and the
+earlier run's `results.jsonl` are restored from the persist directory first.
+
+## One directory per run
+
+Each invocation writes into `<output_dir>/runs/<run_id>/`, with `<output_dir>/latest` pointing at the
+newest:
+
+```
+$RESULTS_DIR/
+  checkpoints/                 one per model, SHARED by every run so re-runs do not retrain
+    TrajGPT.pt  TrajGPT.json   (the .json sidecar holds config, history and complete: true/false)
+  runs/
+    20260921-100122-994-run/   report.md  results.jsonl  leaderboard.csv  family_summary.csv  run_info.json
+    20260921-143010-1002-run/
+  latest -> runs/20260921-143010-1002-run
+  progress/                    live status files (see above)
+```
+
+The run id matches the one `mobeval status` shows, so a progress line and a results directory are
+easy to line up. Checkpoints are deliberately *not* per-run: training is the expensive part, and a
+second evaluation must be able to reuse the first one's weights. Set `run_dirs: false` in the config
+for the old flat layout, or `checkpoint_dir:` to put weights somewhere else entirely.
 
 ## Python API
 
@@ -210,6 +301,7 @@ mobeval/
   context.py, runner.py, tasks.py  EvalConfig / shared context, pipeline, tasks
   metrics/, baselines.py, stats.py metrics registry and implementations, baselines, bootstrap
   results.py, report.py            result schema with sanity flags, reports
+  layout.py, progress.py           per-run directories + durable mirroring, live status
   adapters/  base.py, torch_base.py, unitraj.py, trajgpt.py, clip_mobility.py, reference.py
   nn/        common.py (training loop, checkpoints, heads), features.py (tokenizers),
              unitraj_net.py, trajgpt_net.py, clip_net.py (networks, checkpoint-compatible)

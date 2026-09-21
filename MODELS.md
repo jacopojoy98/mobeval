@@ -61,6 +61,19 @@ stayed at chance level):
    hundreds of hours against an initial location of about 0, the NLL gradients were so large that, after
    clipping, the region cross-entropy on the shared encoder barely moved.
 
+**Context length.** mobeval's `visit_context` defines the task for every model ("predict the next visit
+given the last C visits"), and TrajGPT is trained teacher-forced on exactly that shape, so one sample
+yields C prediction targets. The original repository instead trains on sequences of up to
+RAW_SEQ_LEN = 128 visits and evaluates at the last position. The difference is not the mask size -
+`sequence_len` only dimensions the pre-computed causal masks, no parameter depends on it, and the masks
+are non-persistent so checkpoints are portable across values (it is kept at >= 128 for that reason).
+The difference is `visit_context`, which is worth raising on dense data: a larger context gives every
+model more history AND gives TrajGPT more targets per forward pass. Combined with `visit_stride` it
+also shrinks the epoch dramatically - with 5.9M staypoints, context 8 / stride 1 gives 5.65M samples
+and 45M targets per epoch, whereas context 32 / stride 32 gives 184k samples and the same 5.9M targets
+in 30x fewer steps. Checkpoints record the context they were trained with, and evaluating at a
+different one warns.
+
 **Evaluation.** Location predictions are region-token scores mapped onto the shared grid through region
 centroids. When the target location is hidden, travel-time and duration distributions marginalise over
 the top-5 predicted regions (the result is still a Gaussian mixture); for duration the unknown arrival is

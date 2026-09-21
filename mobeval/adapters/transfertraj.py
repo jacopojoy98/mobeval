@@ -80,11 +80,12 @@ class TransferTrajAdapter(TorchAdapter):
         return out
 
     # ------------------------------------------------------------------ persistence
-    def save(self, path, history=None):
+    def save(self, path, history=None, quiet: bool = False, complete: bool = True):
         from ..nn.common import save_checkpoint
         save_checkpoint(path, self.net, self.model_type, {"arch": self.arch},
                         {"center": [self.proj.lat0, self.proj.lon0], "coord_scale": self.coord_scale,
-                         "context": self.context, "pooling": self.pooling, "provenance": self.provenance}, history)
+                         "context": self.context, "pooling": self.pooling, "provenance": self.provenance}, history,
+                        quiet=quiet, complete=complete)
 
     @classmethod
     def from_checkpoint(cls, path, **kw) -> "TransferTrajAdapter":
@@ -218,7 +219,7 @@ class TransferTrajAdapter(TorchAdapter):
 
         ad.provenance = ctx.provenance(init_from=init_from)
         ad.net.train()
-        history = fit_loop(ad.net, len(tr), len(va), loss_fn, cfg)
+        history = fit_loop(ad.net, len(tr), len(va), loss_fn, cfg, on_best=ad.epoch_checkpointer(out))
         ad.invalidate_cache()
         if out:
             ad.save(out, history)

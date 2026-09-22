@@ -191,3 +191,19 @@ split fingerprint.
 The previous "My Model" recovery results came from `Trajectory_transformer` with a randomly initialised
 reconstruction head (its script never loaded weights), so they carry no information about the model.
 The TrajGPT duration NLL was produced by a head that could see the answer. Neither should be reported.
+
+
+## What each model can be asked for
+
+| model | native | via linear probe on frozen embeddings |
+|---|---|---|
+| UniTraj | recovery | next location, travel time, duration, user identification, anomaly detection |
+| TransferTraj | recovery | next location, travel time, duration, user identification, anomaly detection |
+| TrajGPT | next location, travel time, duration, generation | — (declares no embedding) |
+| CLIPMobility | recovery, next location, travel time, duration | user identification, anomaly detection |
+
+A model is never given a head it does not have. The probe is linear, the encoder is frozen, and
+every probe result is tagged `protocol: linear_probe` in `results.jsonl` and named
+`<task>/linear_probe` in the report, so it cannot be confused with a native capability. See the
+README for the candidate-set accounting on the location probe and for the baselines that make
+user identification and anomaly detection interpretable.

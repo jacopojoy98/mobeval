@@ -58,6 +58,21 @@ class EvalConfig:
     mode_protocols: Sequence[str] = ("native", "linear_probe")
     label_fractions: Sequence[float] = (1.0, 0.1)
     generation_max_trajectories: int = 500
+    # Protocols for the prediction tasks. 'native' uses the model's own head; 'linear_probe'
+    # fits a linear head on frozen embeddings, which is the only way to put an encoder with no
+    # such head (UniTraj, TransferTraj) on the same axis as a generative model.
+    location_protocols: Sequence[str] = ("native", "linear_probe")
+    continuous_protocols: Sequence[str] = ("native", "linear_probe")
+    probe_top_k: int = 1000                     # candidate cells the location probe may predict
+    probe_max_train: Optional[int] = 100_000    # cap on probe training samples (speed, not semantics)
+    # Representation-level tasks. Both read the frozen embedding and never fine-tune it.
+    user_id_max_users: int = 100                # re-identification is over this many users
+    user_id_min_windows: int = 8                # ... each needing this many windows per split
+    anomaly_kinds: Sequence[str] = ("teleport", "detour", "loop")
+    anomaly_rate: float = 0.1                   # share of test windows corrupted
+    anomaly_knn_k: int = 10
+    anomaly_protocols: Sequence[str] = ("embedding_knn", "reconstruction")
+    anomaly_mask_ratio: float = 0.3             # masking used by the 'reconstruction' protocol
 
 
 class EvalContext:

@@ -41,6 +41,9 @@ _SPECS = [
     _S("dist_err_m", "location", False, "m", "ratio", (0, INF), 50_000, "mean", "Top-1 location -> true visit"),
     _S("median_dist_err_m", "location", False, "m", "ratio", (0, INF), 50_000, "median"),
     _S("acc_1km", "location", True, "fraction", "bounded", (0, 1), None, "mean", "Top-1 within 1 km"),
+    _S("probe_coverage", "location", True, "fraction", "none", (0, 1), None, "mean",
+       "Share of test targets the location probe's candidate cells can reach at all - this is "
+       "its accuracy ceiling, so read acc@1 against it and not against 1.0"),
     # --- continuous values (canonical unit: minutes) -------------------------
     _S("mae_min", "continuous", False, "min", "ratio", (0, INF), 24 * 60),
     _S("rmse_min", "continuous", False, "min", "ratio", (0, INF), 24 * 60, "rmse"),
@@ -65,6 +68,22 @@ _SPECS = [
     _S("nn_train_dist_m", "generation", True, "m", "none", (0, INF), None, "median",
        "Median distance from generated trajectory to nearest train trajectory"),
     _S("spearman_paired", "generation", True, "rho", "none", (-1, 1), None, "mean", "Per-user stat, real vs generated"),
+    # --- user identification from the latent space ------------------------------
+    # Separate names from the location family: these are a property of the representation,
+    # not of a prediction task, and must not be averaged into the location summary.
+    _S("user_acc@1", "identity", True, "fraction", "bounded", (0, 1), None, "mean",
+       "Correct user identified from one window's embedding"),
+    _S("user_acc@5", "identity", True, "fraction", "bounded", (0, 1)),
+    _S("user_mrr@20", "identity", True, "fraction", "bounded", (0, 1)),
+    _S("user_macro_f1", "identity", True, "fraction", "bounded", (0, 1)),
+    _S("user_nll", "identity", False, "nats", "difference", (0, INF), None, "mean", "NLL of the true user"),
+    # --- anomaly detection --------------------------------------------------------
+    _S("roc_auc", "anomaly", True, "auc", "bounded", (0, 1), None, "mean",
+       "Ranking quality; 0.5 = chance, threshold-free"),
+    _S("pr_auc", "anomaly", True, "auc", "bounded", (0, 1), None, "mean",
+       "Average precision; compare against the anomaly rate, not against 0.5"),
+    _S("precision@k", "anomaly", True, "fraction", "bounded", (0, 1), None, "mean",
+       "Precision among the k highest-scored windows, k = number of injected anomalies"),
     # --- efficiency -------------------------------------------------------------
     _S("n_parameters", "efficiency", False, "count", "none", (0, INF)),
     _S("latency_ms_per_sample", "efficiency", False, "ms", "none", (0, INF)),
@@ -74,7 +93,7 @@ REGISTRY = {s.name: s for s in _SPECS}
 # Non-redundant metrics used in cross-family summaries (ADE/median/p90/RMSE are highly
 # correlated; averaging all of them would silently up-weight recovery error).
 HEADLINE = {"ade_m", "fde_m", "dtw_m", "acc_100m", "acc@1", "acc@5", "dist_err_m", "crps_min", "mae_min",
-            "macro_f1", "balanced_accuracy", "jsd"}
+            "macro_f1", "balanced_accuracy", "jsd", "user_acc@1", "user_macro_f1", "roc_auc", "pr_auc"}
 
 
 def get_spec(name: str) -> MetricSpec:

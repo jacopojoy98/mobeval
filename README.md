@@ -96,6 +96,108 @@ yourself — any real-valued `(N, d)` matrix works, paired with `(N, 2)` (lat, l
 The model compares every trajectory point with every context entry, so cost grows with the number of
 entries; `--max-features` caps it. Only TransferTraj uses these today; the other models ignore them.
 
+## Protocols: native heads vs. linear probes
+
+A model is only asked natively for what it declares. UniTraj and TransferTraj are masked
+reconstruction encoders with no next-location or time head, so on those tasks they used to
+appear as "skipped (capability not declared)". The **linear probe** puts them on the same axis
+without inventing a head for them:
+
+```yaml
+eval:
+  location_protocols:   [native, linear_probe]
+  continuous_protocols: [native, linear_probe]
+  probe_top_k: 1000            # candidate cells the location probe may predict
+  probe_max_train: 100000      # cap on probe training samples (speed only)
+```
+
+The probe is **linear** (no hidden layer, so the score is a property of the representation, not
+of capacity bolted on top), the encoder is **frozen**, and every model gets the same probe on
+the same data. Results carry `protocol: linear_probe` and land in tasks named
+`next_location/linear_probe`, so a probe number can never be read as a native capability.
+
+Two details worth knowing:
+
+* **The location probe scores a candidate set.** One output per grid cell is impossible when the
+  shared grid has half a million of them (a dense score matrix would be tens of gigabytes), so
+  the probe predicts the `probe_top_k` most-visited training cells and everything else falls
+  back to training popularity. Targets outside that set count as misses, and the log reports
+  what share of test targets the candidates cover — that share is the protocol's accuracy
+  ceiling, and acc@1 should be read against it rather than against 1.0.
+* **The continuous probe returns a distribution**, not just a point: ridge on log(minutes), with
+  the spread fitted on the *validation* residuals, so CRPS, NLL and PIT are all defined and
+  comparable with the native heads.
+
+## Representation-level tasks
+
+Two tasks score the embedding itself rather than a prediction head. Both are applicable to any
+model declaring `embedding`.
+
+### User identification
+
+Can a linear model recover **who** produced a window from its frozen embedding? Closed-set, over
+the users with enough windows in both splits.
+
+```yaml
+eval:
+  user_id_max_users: 100
+  user_id_min_windows: 8
+```
+
+Read it against the **`mean_location` baseline**, never against chance. Mobility identity is
+largely home and work location, so an embedding that merely records absolute position will
+re-identify users very well while having learned nothing about behaviour. That baseline is
+exactly such an "embedding" — latitude/longitude statistics and nothing else. A model only
+demonstrates that it captures individual mobility style if it clears that line. In practice it
+often does not, and that is the useful finding.
+
+### Anomaly detection
+
+There are no anomaly labels in a GPS panel, so anomalies are injected into the test windows and
+each kind is scored separately. Both protocols are unsupervised — fitted on normal training
+data, with the labels used only to score:
+
+| protocol | needs | score |
+|---|---|---|
+| `embedding_knn` | `embedding` | distance to the nearest training embeddings |
+| `reconstruction` | `recovery` | error when filling in masked points |
+
+The kinds are graded by how much of the signal is kinematic, and this is the whole point:
+
+| kind | what it does | step lengths |
+|---|---|---|
+| `teleport` | displaces a chunk far away | changed — trivially detectable |
+| `speed` | scales displacements up | changed — trivially detectable |
+| `noise` | heavy GPS jitter | changed — trivially detectable |
+| `detour` | rotates the middle heading | **preserved exactly** |
+| `loop` | retraces the middle in reverse | **preserved exactly** |
+
+`detour` and `loop` are permutations and rotations of the original displacements, so every step
+length survives (verified to ~0.2%, the projection round-trip) and mean/median/percentile speed,
+acceleration and total distance are unchanged. A speed check is therefore at chance on them *by
+construction* — `max_step` measures 0.54.
+
+They are not invisible to *all* kinematics, and this is the part to be careful about when
+reading results: splicing in a rotated or reversed span inserts a sharp turn, so turning-angle
+features do carry signal — `turn.mean` alone reaches 0.66 on detour and 0.70 on loop, and the
+full `kinematic_knn` baseline reaches 0.60–0.64. **That is the bar, not 0.5.** A model has only
+demonstrated learned route plausibility if it clears `kinematic_knn`. Timestamps are never
+touched, so nothing can be inferred from the time axis.
+
+```yaml
+eval:
+  anomaly_kinds: [teleport, detour, loop]
+  anomaly_rate: 0.1
+  anomaly_protocols: [embedding_knn, reconstruction]
+```
+
+Two baselines are always reported: `max_step` (the classic GPS-jump check, no training) and
+`kinematic_knn` (distance to training windows in handcrafted speed/acceleration/turn feature
+space). Beating chance on `teleport` means nothing — `max_step` gets 1.0 there. Beating
+`kinematic_knn` on `detour` or `loop` is the result that means something. A ROC-AUC clearly
+*below* 0.5 is also informative: it means the model finds the corrupted windows easier than
+normal ones, which is what happens when a retraced route is more predictable than a real one.
+
 ## Training is always on the evaluation split
 
 `train` builds the same `EvalContext` as `evaluate` and trains only on its `train` split, with early

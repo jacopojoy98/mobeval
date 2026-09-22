@@ -113,6 +113,27 @@ def pareto_front(df: pd.DataFrame) -> pd.DataFrame:
     return q.sort_values("mean_skill", ascending=False)
 
 
+TITLES = {"identity": "User identification (from frozen embeddings)",
+          "anomaly": "Anomaly detection (injected anomalies)"}
+
+# Printed under the section heading. These two families are the easiest in the whole report to
+# over-read, so the caveat travels with the numbers instead of living only in the docs.
+NOTES = {
+    "identity": "Closed-set re-identification with a linear probe on frozen embeddings. Read every "
+                "model against **mean_location**, not against chance: individual mobility is largely "
+                "home and work location, so an embedding that merely records position re-identifies "
+                "users well without having learned anything about behaviour.",
+    "anomaly": "Unsupervised: scorers are fitted on normal training data and the labels are used only "
+               "to score. `teleport`, `speed` and `noise` change step lengths and are caught by any "
+               "speed check - **max_step** is usually near 1.0 on them, so beating chance there means "
+               "little. `detour` and `loop` preserve every step length exactly, so speed and distance "
+               "statistics carry no signal at all (max_step ~0.54); they do insert a sharp turn, which "
+               "**kinematic_knn** picks up (~0.60-0.64). Compare against kinematic_knn, not against "
+               "0.5. A value clearly below 0.5 is also informative: it means the model finds the "
+               "corrupted windows *more* predictable than real ones.",
+}
+
+
 def markdown_report(store, ctx=None, title: str = "Mobility foundation model evaluation") -> str:
     df = store.to_frame()
     out: List[str] = [f"# {title}", ""]
@@ -129,11 +150,19 @@ def markdown_report(store, ctx=None, title: str = "Mobility foundation model eva
     if not pf.empty and pf[["n_parameters", "latency_ms"]].notna().any().any():
         out += ["## Efficiency (Pareto front)", "", md_table(pf, index=False), ""]
     a = _agg(df)
-    for fam in ["recovery", "location", "continuous", "classification", "generation", "efficiency"]:
+    # Ordered so related families read together; anything new in the registry is appended
+    # rather than silently dropped from the report.
+    order = ["recovery", "location", "continuous", "classification", "identity", "anomaly",
+             "generation", "efficiency"]
+    families = order + sorted(set(a.family.dropna()) - set(order))
+    for fam in families:
         sub = a[a.family == fam]
         if sub.empty:
             continue
-        out += [f"## {fam.capitalize()}", "", md_table(wide_table(sub, fam != "efficiency")), ""]
+        out += [f"## {TITLES.get(fam, fam.capitalize())}", ""]
+        if fam in NOTES:
+            out += [NOTES[fam], ""]
+        out += [md_table(wide_table(sub, fam != "efficiency")), ""]
     flagged = df[df["flags"].map(len) > 0]
     if len(flagged):
         out += ["## Sanity flags", ""]

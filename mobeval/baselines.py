@@ -94,13 +94,20 @@ class ContinuousBaselines:
 
 # ---------------------------------------------------------- classification ---
 def handcrafted_features(batch: TrajectoryBatch) -> np.ndarray:
-    """Speed/acceleration/heading statistics - a strong classical mode baseline."""
+    """Speed/acceleration/heading statistics - a strong classical mode baseline.
+
+    Every feature is a function of ITS OWN ROW only. That matters because train and test are
+    featurised in separate calls: a projection whose origin came from the batch (as this used
+    to use) puts the two sets in slightly different frames, so a nearest-neighbour distance
+    between them measures the frame shift as well as the trajectory. Headings are therefore
+    computed with a per-row cosine scaling rather than a shared projection.
+    """
     d = haversine_m(batch.lat[:, :-1], batch.lon[:, :-1], batch.lat[:, 1:], batch.lon[:, 1:])
     dt = np.maximum(np.diff(batch.t, axis=1), 1.0)
     v = d / dt
     a = np.diff(v, axis=1) / dt[:, 1:]
-    proj = LocalProjection.from_points(batch.lat, batch.lon)
-    x, y = proj.to_xy(batch.lat, batch.lon)
+    y = np.radians(batch.lat)
+    x = np.radians(batch.lon) * np.cos(y.mean(1, keepdims=True))     # row-wise local frame
     head = np.arctan2(np.diff(y, axis=1), np.diff(x, axis=1))
     turn = np.abs(np.angle(np.exp(1j * np.diff(head, axis=1))))
     q = lambda arr, p: np.percentile(arr, p, axis=1)
@@ -152,3 +159,63 @@ def uniform_bbox_generator(reference: MobilityDataset, n_trajectories: int, seed
                                       "lat": stops[s, 0] + rng.normal(0, 1e-4, len(idx)),
                                       "lon": stops[s, 1] + rng.normal(0, 1e-4, len(idx))}))
     return MobilityDataset(pd.concat(rows, ignore_index=True), "uniform_bbox")
+
+
+# ------------------------------------------------------- anomaly detection ---
+# These must be UNSUPERVISED, like the models they are compared against: fit on normal
+# training windows, score test windows. A baseline trained on the anomaly labels would be
+# solving a different (much easier) problem and would make every model look bad for the
+# wrong reason.
+def max_step_score(test: TrajectoryBatch) -> np.ndarray:
+    """The classic GPS-jump check: the largest single displacement in the window.
+
+    Needs no training at all. It is near-perfect on teleport/speed/noise anomalies and at
+    chance on the step-length-preserving ones, which is exactly what makes it a useful
+    yardstick - it separates "spotted an impossible speed" from "understood the route".
+    """
+    d = haversine_m(test.lat[:, :-1], test.lon[:, :-1], test.lat[:, 1:], test.lon[:, 1:])
+    return d.max(1)
+
+
+def kinematic_knn_score(train: TrajectoryBatch, test: TrajectoryBatch, k: int = 10) -> np.ndarray:
+    """Distance to the k nearest TRAIN windows in handcrafted-kinematic feature space.
+
+    The strong classical baseline: everything a speed/acceleration/turn-statistics detector
+    can do without learning a representation. A model only earns credit above this line.
+    """
+    from .metrics.detection import knn_distance
+    ftr, fte = handcrafted_features(train), handcrafted_features(test)
+    ok = np.isfinite(ftr).all(1)
+    return knn_distance(ftr[ok], np.nan_to_num(fte, nan=0.0, posinf=0.0, neginf=0.0), k=k)
+
+
+# --------------------------------------------------- user identification ---
+def _location_features(b: TrajectoryBatch) -> np.ndarray:
+    return np.column_stack([b.lat.mean(1), b.lon.mean(1), b.lat.std(1), b.lon.std(1),
+                            b.lat.min(1), b.lat.max(1), b.lon.min(1), b.lon.max(1)])
+
+
+def mean_location_classifier(train: TrajectoryBatch, train_y, test: TrajectoryBatch,
+                             n_classes: int, seed: int = 0, nonlinear: bool = False) -> np.ndarray:
+    """Identify the user from WHERE the window is, and nothing else.
+
+    This is the control that makes the user-identification number interpretable. Mobility
+    identity is mostly home and work location, so a model whose embedding merely records
+    absolute position will score highly while having learned nothing about behaviour. Any
+    claim that a representation captures individual mobility style has to clear this line.
+
+    Two versions are reported, because they answer different questions:
+      nonlinear=False  a LINEAR probe on position features - like-for-like with the linear
+                       probe the models get, so the comparison isolates the representation;
+      nonlinear=True   a gradient-boosted tree on the same features - an upper bound on how
+                       much of identity position alone can explain, whatever the decoder.
+    """
+    ftr, fte = _location_features(train), _location_features(test)
+    if not nonlinear:
+        return linear_probe(ftr, train_y, fte, n_classes, seed)
+    clf = HistGradientBoostingClassifier(random_state=seed, max_iter=200)
+    clf.fit(ftr, train_y)
+    proba = clf.predict_proba(fte)
+    full = np.full((len(test), n_classes), 1e-9)
+    full[:, clf.classes_] = proba
+    return full

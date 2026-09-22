@@ -7,16 +7,18 @@ import logging
 from typing import Callable, Dict, List, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 from scipy import sparse
 
 from . import baselines as B
 from .adapters.base import (CONTINUOUS, EMBEDDING, GENERATION, MODE_CLASSIFICATION, NEXT_LOCATION, RECOVERY,
                             ContinuousPrediction, MobilityModelAdapter, TargetGuard)
 from .context import EvalContext
-from .data import MobilityDataset, TrajectoryBatch, detect_staypoints, make_mask
+from .data import MobilityDataset, TrajectoryBatch, VisitBatch, detect_staypoints, make_mask
 from .geo import haversine_m
 from .metrics import generative as G
-from .metrics.classification import classification_metrics, normalise_probs, ranking_metrics
+from .metrics.classification import classification_metrics, macro_f1, normalise_probs, ranking_metrics
+from .metrics.detection import detection_metrics
 from .metrics.probabilistic import continuous_metrics, pit_ks
 from .metrics.reconstruction import recovery_metrics
 from .results import ResultRecord
@@ -29,6 +31,45 @@ Scores = Tuple[Dict[str, np.ndarray], Dict[str, Callable]]   # (per-sample, set-
 
 def _key(a: MobilityModelAdapter) -> str:
     return f"{a.name}@{a.run_tag}"
+
+
+def visits_as_windows(v: VisitBatch, tag: str = "") -> TrajectoryBatch:
+    """The visit context seen as a short trajectory, so ANY model with an embedding can encode it.
+
+    This is what lets a masked-reconstruction encoder be probed on next location and travel
+    time: it never had a head for those, but it can encode the C context visits as C points and
+    a linear probe can be fitted on that. Target fields are not touched here - callers pass an
+    already-hidden VisitBatch, so nothing about the target can reach the embedding.
+
+    `tag` names the split. Adapters cache embeddings on (traj_id, first time, last time), so
+    ids restarting at 0 in every split could collide on coarsely quantised data - hourly bins
+    and a repeating weekly schedule are enough - and a test context would then be handed a
+    training sample's embedding.
+    """
+    ids = np.array([f"vctx:{tag}:{i}" for i in range(len(v))], dtype=object)
+    return TrajectoryBatch(v.ctx_lat, v.ctx_lon, v.ctx_t_arrive, v.user_id, ids, None)
+
+
+def _context_embeddings(adapter, ctx, reveal=()):
+    """Embed the visit context of every split once per adapter, and cache it.
+
+    Deliberately embeds all three splits regardless of what the caller needs right now: the
+    cache is keyed on the adapter, so a caller that only asked for train+test would otherwise
+    poison it for the next one, and the continuous probe would silently lose the validation
+    split it fits its predictive spread on.
+    """
+    key = ("visit_emb", _key(adapter), reveal)
+    if key not in ctx.cache:
+        out = {}
+        for name in ("train", "val", "test"):
+            v = ctx.visits.get(name)
+            if v is None or not len(v):
+                continue
+            w = visits_as_windows(TargetGuard.hide_visits(v, reveal), tag=f"{name}:{reveal}")
+            with ctx.timed(_key(adapter), EMBEDDING, len(v)):
+                out[name] = adapter.embed(w)
+        ctx.cache[key] = out
+    return ctx.cache[key]
 
 
 class Task:
@@ -136,14 +177,36 @@ class NextLocationTask(Task):
         rm.update({"dist_err_m": d, "median_dist_err_m": d, "acc_1km": (d <= 1000).astype(float)})
         return rm, {}
 
+    def applicable(self, adapter):
+        return bool({NEXT_LOCATION, EMBEDDING} & adapter.capabilities)
+
+    def _probe_score(self, adapter, ctx, v, grid) -> Scores:
+        """Linear probe over the most-visited training cells, on the frozen visit-context
+        embedding. Metrics come out on the same shared grid as the native protocol."""
+        from .metrics.classification import candidate_ranking_metrics
+        from .probes import location_probe
+        cfg = ctx.cfg
+        emb = _context_embeddings(adapter, ctx)
+        tr_v = ctx.visits["train"]
+        probs, cand, counts = location_probe(emb["train"], tr_v.tgt_cell, emb["test"], grid.n_cells,
+                                             top_k=cfg.probe_top_k, seed=cfg.eval_seeds[0],
+                                             device=str(getattr(adapter, "device", "auto")),
+                                             max_train=cfg.probe_max_train)
+        rm = candidate_ranking_metrics(probs, cand, v.tgt_cell, counts)
+        # Reported, not just logged: acc@1 cannot exceed this, so a reader needs it next to the
+        # number rather than buried in a job log they may never see.
+        rm["probe_coverage"] = rm.pop("_coverage")
+        cover = float(rm["probe_coverage"].mean())
+        top1 = np.column_stack(grid.centroid(cand[probs.argmax(1)]))
+        d = haversine_m(top1[:, 0], top1[:, 1], v.tgt_lat, v.tgt_lon)
+        rm.update({"dist_err_m": d, "median_dist_err_m": d, "acc_1km": (d <= 1000).astype(float)})
+        log.info(f"[{_key(adapter)}] next_location/linear_probe: {len(cand)} candidate cells cover "
+                 f"{cover:.1%} of test targets - that is this protocol's accuracy ceiling")
+        return rm, {}
+
     def run(self, adapter, ctx):
         v, grid, recs = ctx.visits["test"], ctx.grid, []
         seed = ctx.cfg.eval_seeds[0]                   # deterministic task: one pass
-        adapter.prepare(self.name, ctx.visits.get("train"), ctx.visits.get("val"))
-        with ctx.timed(_key(adapter), self.capability, len(v)):
-            pred = adapter.predict_location(TargetGuard.hide_visits(v), grid)
-        pred.check()
-        p, top1, ranked = self._grid_probs(pred, grid, len(v))
         if "loc_baselines" not in ctx.cache:
             lb = B.LocationBaselines(ctx.visits["train"], grid.n_cells)
             ctx.cache["loc_baselines"] = {}
@@ -151,8 +214,21 @@ class NextLocationTask(Task):
                            ("global_popular", lb.global_popular)]:
                 bp = fn(v)
                 ctx.cache["loc_baselines"][bn] = self._score(bp, np.column_stack(grid.centroid(bp.argmax(1))), v, True)
-        recs += self.emit(ctx, adapter, "next_location", len(v), self._score(p, top1, v, ranked),
-                          ctx.cache["loc_baselines"], ["markov1", "user_frequent"], seed)
+        for protocol in ctx.cfg.location_protocols:
+            if protocol == "native" and NEXT_LOCATION in adapter.capabilities:
+                adapter.prepare(self.name, ctx.visits.get("train"), ctx.visits.get("val"))
+                with ctx.timed(_key(adapter), self.capability, len(v)):
+                    pred = adapter.predict_location(TargetGuard.hide_visits(v), grid)
+                pred.check()
+                p, top1, ranked = self._grid_probs(pred, grid, len(v))
+                scores = self._score(p, top1, v, ranked)
+            elif protocol == "linear_probe" and EMBEDDING in adapter.capabilities:
+                scores = self._probe_score(adapter, ctx, v, grid)
+            else:
+                continue
+            task = "next_location" if protocol == "native" else f"next_location/{protocol}"
+            recs += self.emit(ctx, adapter, task, len(v), scores, ctx.cache["loc_baselines"],
+                              ["markov1", "user_frequent"], seed, protocol)
         return recs
 
 
@@ -187,27 +263,49 @@ class ContinuousValueTask(Task):
             sets["pit_ks"] = lambda i: pit_ks(pit[i])
         return scores, sets
 
+    def applicable(self, adapter):
+        return bool({CONTINUOUS, EMBEDDING} & adapter.capabilities)
+
+    @staticmethod
+    def _revealed_features(v, reveal):
+        """The teacher-forced fields, as extra probe inputs.
+
+        `visits_as_windows` only ever reads the CONTEXT, so `reveal` could not reach the probe
+        through the embedding. Without this the probe would be an unconditional predictor
+        reported next to a native head that was told the answer's location, under a task name
+        claiming both were given it. Appending the revealed fields makes the two comparable.
+        """
+        cols = []
+        if "location" in reveal:
+            cols += [v.tgt_lat, v.tgt_lon]
+        if "arrival" in reveal:
+            t = np.asarray(v.tgt_t_arrive, float)
+            cols += [np.sin(2 * np.pi * (t % 86400) / 86400), np.cos(2 * np.pi * (t % 86400) / 86400)]
+        return np.column_stack(cols) if cols else None
+
+    def _probe(self, adapter, ctx, reveal):
+        """Ridge on the frozen visit-context embedding -> a log-normal predictive distribution.
+        The spread is fitted on VALIDATION residuals, never on the test data being scored."""
+        from .probes import continuous_probe
+        emb = _context_embeddings(adapter, ctx, reveal)
+        feats = {}
+        for name, e in emb.items():
+            extra = self._revealed_features(ctx.visits[name], reveal)
+            feats[name] = e if extra is None else np.column_stack([e, extra])
+        ytr = self._y(ctx.visits["train"])
+        ok = self._valid(ytr, ctx.cfg)
+        ev, yv = None, None
+        if "val" in feats:
+            yval = self._y(ctx.visits["val"])
+            okv = self._valid(yval, ctx.cfg)
+            ev, yv = feats["val"][okv], yval[okv]
+        return continuous_probe(feats["train"][ok], ytr[ok], feats["test"], ev, yv)
+
     def run(self, adapter, ctx):
-        cfg, v = ctx.cfg, ctx.visits["test"]
+        cfg, v, recs = ctx.cfg, ctx.visits["test"], []
         reveal = tuple(cfg.continuous_reveal.get(self.target, ()))
         keep = self._valid(self._y(v), cfg)
-        seed = cfg.eval_seeds[0]
-        adapter.prepare(self.name, ctx.visits.get("train"), ctx.visits.get("val"))
-        with ctx.timed(_key(adapter), f"{self.capability}/{self.target}", len(v)):
-            pred = adapter.predict_continuous(TargetGuard.hide_visits(v, reveal), self.target)
-        point, mix, samples = self._to_minutes(pred)
-        y = self._y(v)
-        sigma = None
-        if mix is None and samples is None:            # point model: sigma from VALIDATION residuals
-            vv = ctx.visits["val"]
-            vp = adapter.predict_continuous(TargetGuard.hide_visits(vv, reveal), self.target).point
-            okv = self._valid(self._y(vv), cfg)
-            sigma = float(np.std((self._y(vv) - np.asarray(vp) / 60.0)[okv])) or 1.0
-        sel = lambda a: None if a is None else a[keep]
-        if mix is not None:
-            from .metrics.probabilistic import Mixture
-            mix = Mixture(mix.weights[keep], mix.means[keep], mix.stds[keep], mix.space)
-        model = self._with_pit(continuous_metrics(y[keep], sel(point), mix, sel(samples), sigma))
+        seed, y = cfg.eval_seeds[0], self._y(v)
         ck = ("cont_baselines", self.target, reveal)
         if ck not in ctx.cache:
             ytr = self._y(ctx.visits["train"])
@@ -217,10 +315,40 @@ class ContinuousValueTask(Task):
             pt = continuous_metrics(y[keep], cb.point(n))
             prob["mae_min"], prob["rmse_min"] = pt["mae_min"], pt["rmse_min"]   # median is the MAE-optimal point
             ctx.cache[ck] = {"train_marginal": self._with_pit(prob)}
-        task = self.name + (f"|given:{'+'.join(reveal)}" if reveal else "")
-        if self.target == "travel_time" and cfg.travel_time_max_h is not None:
-            task += f"|<={cfg.travel_time_max_h:g}h"
-        return self.emit(ctx, adapter, task, int(keep.sum()), model, ctx.cache[ck], ["train_marginal"], seed)
+        for protocol in cfg.continuous_protocols:
+            sigma, samples = None, None
+            if protocol == "native" and CONTINUOUS in adapter.capabilities:
+                adapter.prepare(self.name, ctx.visits.get("train"), ctx.visits.get("val"))
+                with ctx.timed(_key(adapter), f"{self.capability}/{self.target}", len(v)):
+                    pred = adapter.predict_continuous(TargetGuard.hide_visits(v, reveal), self.target)
+                point, mix, samples = self._to_minutes(pred)
+                vv = ctx.visits.get("val")
+                if mix is None and samples is None and vv is not None and len(vv):
+                    # point model: sigma from VALIDATION residuals. `.get` because a split can
+                    # legitimately yield no visit sequences, and a KeyError here would take down
+                    # the whole continuous task rather than just the predictive spread.
+                    vp = adapter.predict_continuous(TargetGuard.hide_visits(vv, reveal), self.target).point
+                    okv = self._valid(self._y(vv), cfg)
+                    resid = (self._y(vv) - np.asarray(vp) / 60.0)[okv]
+                    s = float(np.std(resid)) if resid.size > 1 else 0.0
+                    sigma = s if np.isfinite(s) and s > 0 else 1.0
+            elif protocol == "linear_probe" and EMBEDDING in adapter.capabilities:
+                point, mix = self._probe(adapter, ctx, reveal)
+            else:
+                continue
+            sel = lambda a: None if a is None else a[keep]
+            m = mix
+            if m is not None:
+                from .metrics.probabilistic import Mixture
+                m = Mixture(m.weights[keep], m.means[keep], m.stds[keep], m.space)
+            model = self._with_pit(continuous_metrics(y[keep], sel(point), m, sel(samples), sigma))
+            task = self.name + (f"/{protocol}" if protocol != "native" else "")
+            task += f"|given:{'+'.join(reveal)}" if reveal else ""
+            if self.target == "travel_time" and cfg.travel_time_max_h is not None:
+                task += f"|<={cfg.travel_time_max_h:g}h"
+            recs += self.emit(ctx, adapter, task, int(keep.sum()), model, ctx.cache[ck],
+                              ["train_marginal"], seed, protocol)
+        return recs
 
 
 # =========================================================================== #
@@ -345,14 +473,26 @@ class GenerationTask(Task):
                                 recs.append(ResultRecord(model=f"baseline:{nm}", run_tag="-",
                                                          task=f"generation/{stat}", metric=f"{metric}:{stat}",
                                                          value=val[metric], eval_seed=seed, dataset=ctx.dataset_name))
+            # `_cells` exists only when staypoints were detected, which is not guaranteed for the
+            # BASELINES either: the uniform-bbox generator scatters points at random, so on data
+            # where stays are inferred from trip gaps it can produce none at all. Guarding only
+            # `real` and `gen` made that a KeyError that killed the whole generation task.
             if "_cells" in real and "_cells" in gen:
+                cells = lambda d: d["_cells"].to_numpy() if "_cells" in d else None
                 v = G.cell_jsd(real["_cells"].to_numpy(), gen["_cells"].to_numpy(), ctx.grid.n_cells)
-                b = G.cell_jsd(real["_cells"].to_numpy(), lower["_cells"].to_numpy(), ctx.grid.n_cells)
-                f = G.cell_jsd(real["_cells"].to_numpy(), floor["_cells"].to_numpy(), ctx.grid.n_cells)
+                b = None if cells(lower) is None else G.cell_jsd(real["_cells"].to_numpy(), cells(lower),
+                                                                 ctx.grid.n_cells)
+                f = None if cells(floor) is None else G.cell_jsd(real["_cells"].to_numpy(), cells(floor),
+                                                                 ctx.grid.n_cells)
+                if b is None:
+                    log.warning(f"{adapter.name}: no staypoints detected in the uniform-bbox baseline's output, "
+                                f"so visited_cells has no baseline to compare against (skill omitted)")
                 recs.append(ResultRecord(model=adapter.name, run_tag=adapter.run_tag, task="generation/visited_cells",
-                                         metric="jsd:visited_cells", value=v, baseline="uniform_bbox",
-                                         baseline_value=b, skill=skill_score("jsd", v, b, f), eval_seed=seed,
-                                         dataset=ctx.dataset_name))
+                                         metric="jsd:visited_cells", value=v,
+                                         baseline="uniform_bbox" if b is not None else None,
+                                         baseline_value=b,
+                                         skill=None if b is None else skill_score("jsd", v, b, f),
+                                         eval_seed=seed, dataset=ctx.dataset_name))
             # memorisation check: distributional metrics cannot tell a copier from a good model
             trp = ctx.splits["train"].points
             if "gen_nn_ref" not in ctx.cache:
@@ -368,6 +508,183 @@ class GenerationTask(Task):
                 recs.append(ResultRecord(model=adapter.name, run_tag=adapter.run_tag, task="generation/radius_of_gyration",
                                          metric="spearman_paired:radius_of_gyration", value=rho, eval_seed=seed,
                                          dataset=ctx.dataset_name))
+        return recs
+
+
+# =========================================================================== #
+class UserIdentificationTask(Task):
+    """Can a linear model recover WHO produced a window from the frozen embedding?
+
+    A standard representation-learning probe, and for mobility it needs a control. Individual
+    identity is largely home and work location, so an embedding that merely records absolute
+    position will re-identify users very well while having learned nothing about behaviour.
+    The `mean_location` baseline is exactly that embedding - latitude/longitude statistics and
+    nothing else - so a model only demonstrates that it captures individual mobility style if
+    it clears that line, not if it merely beats chance.
+
+    The task is closed-set: the same users appear in train and test, and the probe chooses
+    among them. Open-set re-identification is a different (harder) problem.
+    """
+    name, capability = "user_identification", EMBEDDING
+
+    def applicable(self, adapter):
+        return EMBEDDING in adapter.capabilities
+
+    @staticmethod
+    def _cohort(ctx):
+        """Users with enough windows in BOTH splits, capped at cfg.user_id_max_users.
+
+        Chosen once and cached, so every model is scored on exactly the same users and the
+        same windows - otherwise the number would depend on which model ran first.
+        """
+        if "user_cohort" in ctx.cache:
+            return ctx.cache["user_cohort"]
+        cfg = ctx.cfg
+        tr, te = ctx.windows.get("train"), ctx.windows.get("test")
+        if tr is None or te is None:
+            ctx.cache["user_cohort"] = None
+            return None
+        ctr = pd.Series(tr.user_id).value_counts()
+        cte = pd.Series(te.user_id).value_counts()
+        ok = [u for u in ctr.index
+              if ctr.get(u, 0) >= cfg.user_id_min_windows and cte.get(u, 0) >= cfg.user_id_min_windows]
+        ok = sorted(ok, key=lambda u: -min(ctr[u], cte[u]))[:cfg.user_id_max_users]
+        if len(ok) < 2:
+            ctx.cache["user_cohort"] = None
+            return None
+        users = {u: i for i, u in enumerate(sorted(ok, key=str))}
+        itr = np.flatnonzero(np.isin(tr.user_id, list(users)))
+        ite = np.flatnonzero(np.isin(te.user_id, list(users)))
+        ytr = np.array([users[u] for u in tr.user_id[itr]])
+        yte = np.array([users[u] for u in te.user_id[ite]])
+        ctx.cache["user_cohort"] = (itr, ite, ytr, yte, len(users))
+        log.info(f"user identification: {len(users)} users, {len(itr)} train / {len(ite)} test windows "
+                 f"(chance accuracy {1 / len(users):.3%})")
+        return ctx.cache["user_cohort"]
+
+    @staticmethod
+    def _scores(probs, y, K) -> Scores:
+        """Ranking + calibration metrics under `user_`-prefixed names, so they stay out of the
+        location and classification families in every summary."""
+        rm = ranking_metrics(normalise_probs(probs), y)
+        per = {"user_acc@1": rm["acc@1"], "user_nll": rm["loc_nll"]}
+        # With few users a top-k metric is 1.0 for every model by construction and says nothing,
+        # so it is omitted rather than printed as a fake perfect score.
+        if K > 5:
+            per["user_acc@5"] = rm["acc@5"]
+        if K > 20:
+            per["user_mrr@20"] = rm["mrr@20"]
+        pred = probs.argmax(1)
+        return per, {"user_macro_f1": lambda i: macro_f1(y[i], pred[i], K)}
+
+    def run(self, adapter, ctx):
+        cohort = self._cohort(ctx)
+        if cohort is None:
+            ctx.skipped.append((_key(adapter), self.name,
+                                f"fewer than 2 users have >= {ctx.cfg.user_id_min_windows} windows in "
+                                f"both the train and test splits"))
+            return []
+        itr, ite, ytr, yte, K = cohort
+        tr, te = ctx.windows["train"].take(itr), ctx.windows["test"].take(ite)
+        seed = ctx.cfg.eval_seeds[0]
+        if "user_baselines" not in ctx.cache:
+            ctx.cache["user_baselines"] = {
+                # like-for-like with the model's own linear probe; this is the one skill is measured against
+                "mean_location": self._scores(B.mean_location_classifier(tr, ytr, te, K, seed), yte, K),
+                # upper bound on what position alone can explain, whatever the decoder
+                "mean_location_gbdt": self._scores(
+                    B.mean_location_classifier(tr, ytr, te, K, seed, nonlinear=True), yte, K),
+                "majority": self._scores(B.majority_class_probs(ytr, len(te), K), yte, K)}
+        ek = ("user_emb", _key(adapter))
+        if ek not in ctx.cache:
+            with ctx.timed(_key(adapter), EMBEDDING, len(te)):
+                ctx.cache[ek] = (adapter.embed(tr), adapter.embed(te))
+        etr, ete = ctx.cache[ek]
+        probs = B.linear_probe(etr, ytr, ete, K, seed)
+        return self.emit(ctx, adapter, f"user_identification@{K}users", len(te),
+                         self._scores(probs, yte, K), ctx.cache["user_baselines"],
+                         ["mean_location", "mean_location_gbdt", "majority"], seed, "linear_probe")
+
+
+# =========================================================================== #
+class AnomalyDetectionTask(Task):
+    """Score every test window for how unusual it is, having seen only normal training data.
+
+    There are no anomaly labels in a raw GPS panel, so anomalies are injected (see
+    `mobeval.anomalies`) and each kind is reported separately. That separation is the point:
+    `teleport` is caught by any speed check, while `detour` and `loop` preserve every step
+    length exactly, so a kinematic detector is at chance on them by construction and only a
+    model that has learned what plausible movement looks like can do better.
+
+    Two protocols, both unsupervised - the labels are used to score, never to fit:
+      embedding_knn   distance to the nearest training embeddings
+      reconstruction  error when asked to fill in masked points
+    """
+    name, capability = "anomaly_detection", EMBEDDING
+
+    def applicable(self, adapter):
+        return bool({EMBEDDING, RECOVERY} & adapter.capabilities)
+
+    def _injected(self, ctx, kind, seed):
+        """Corrupt the test windows once per (kind, seed) so every model sees identical data."""
+        k = ("anomaly", kind, seed)
+        if k not in ctx.cache:
+            from . import anomalies
+            ctx.cache[k] = anomalies.inject(ctx.windows["test"], kind, ctx.cfg.anomaly_rate, seed)
+        return ctx.cache[k]
+
+    def _baselines(self, ctx, aset, seed):
+        k = ("anomaly_baselines", aset.kind, seed)
+        if k not in ctx.cache:
+            y = aset.is_anomalous
+            ctx.cache[k] = {
+                "kinematic_knn": detection_metrics(y, B.kinematic_knn_score(ctx.windows["train"], aset.batch,
+                                                                           ctx.cfg.anomaly_knn_k)),
+                "max_step": detection_metrics(y, B.max_step_score(aset.batch))}
+        return ctx.cache[k]
+
+    def _embedding_score(self, adapter, ctx, aset):
+        from .metrics.detection import knn_distance
+        tk = ("anomaly_train_emb", _key(adapter))
+        if tk not in ctx.cache:
+            ctx.cache[tk] = adapter.embed(ctx.windows["train"])
+        with ctx.timed(_key(adapter), EMBEDDING, len(aset.batch)):
+            ete = adapter.embed(aset.batch)
+        return knn_distance(ctx.cache[tk], ete, k=ctx.cfg.anomaly_knn_k)
+
+    def _reconstruction_score(self, adapter, ctx, aset, seed):
+        """How badly the model fills in masked points. An anomalous window is one the model
+        cannot predict, so its reconstruction error should be larger."""
+        b = aset.batch
+        mask = make_mask(len(b), b.length, ctx.cfg.anomaly_mask_ratio, "random", seed)
+        with ctx.timed(_key(adapter), RECOVERY, len(b)):
+            plat, plon = adapter.reconstruct(TargetGuard.hide_masked(b, mask), mask)
+        err = haversine_m(np.asarray(plat), np.asarray(plon), b.lat, b.lon)
+        n_masked = mask.sum(1)
+        total = np.where(mask, err, 0.0).sum(1)
+        # A row with nothing masked has no evidence either way; NaN keeps it out of the
+        # ranking rather than giving it a fabricated score of 0 (which would rank it "normal").
+        return np.where(n_masked > 0, total / np.maximum(n_masked, 1), np.nan)
+
+    def run(self, adapter, ctx):
+        cfg, recs = ctx.cfg, []
+        if "test" not in ctx.windows or len(ctx.windows["test"]) < 20:
+            ctx.skipped.append((_key(adapter), self.name, "too few test windows to inject anomalies into"))
+            return recs
+        for kind in cfg.anomaly_kinds:
+            for seed in cfg.eval_seeds:
+                aset = self._injected(ctx, kind, seed)
+                base = self._baselines(ctx, aset, seed)
+                for protocol in cfg.anomaly_protocols:
+                    if protocol == "embedding_knn" and EMBEDDING in adapter.capabilities:
+                        score = self._embedding_score(adapter, ctx, aset)
+                    elif protocol == "reconstruction" and RECOVERY in adapter.capabilities:
+                        score = self._reconstruction_score(adapter, ctx, aset, seed)
+                    else:
+                        continue
+                    recs += self.emit(ctx, adapter, f"anomaly/{kind}", len(aset),
+                                      detection_metrics(aset.is_anomalous, score), base,
+                                      ["kinematic_knn", "max_step"], seed, protocol)
         return recs
 
 
@@ -405,4 +722,5 @@ class EfficiencyTask(Task):
 
 def default_tasks(cfg) -> List[Task]:
     return ([RecoveryTask(), NextLocationTask()] + [ContinuousValueTask(t) for t in cfg.continuous_targets]
-            + [ModeClassificationTask(), GenerationTask(), EfficiencyTask()])
+            + [ModeClassificationTask(), GenerationTask(), UserIdentificationTask(),
+               AnomalyDetectionTask(), EfficiencyTask()])

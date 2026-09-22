@@ -86,7 +86,17 @@ class MobilityModelAdapter(ABC):
         raise NotImplementedError
 
     def embed(self, batch: TrajectoryBatch) -> np.ndarray:
-        """(N, d) frozen trajectory embeddings (used for linear probing)."""
+        """(N, d) frozen trajectory embeddings (used for linear probing).
+
+        MUST be a pure function of each row: `embed(b)[i]` may depend on row `i` and on the
+        model's weights, never on the other rows in the batch. The pipeline embeds train, val
+        and test in separate calls and compares the results directly (linear probes, kNN
+        anomaly scores), so any per-batch statistic - standardising by the batch mean, fitting
+        a projection to the batch extent - puts those sets in different spaces and the
+        comparison silently measures the difference between batches. It bites hardest in
+        anomaly detection, where the injected anomalies would set the test batch's scale and
+        hide themselves.
+        """
         raise NotImplementedError
 
     def generate(self, reference: MobilityDataset, n_trajectories: int, seed: int = 0) -> MobilityDataset:

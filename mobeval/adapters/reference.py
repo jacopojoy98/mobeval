@@ -22,6 +22,7 @@ class KinematicReference(MobilityModelAdapter):
     def __init__(self, token_cell_m: float = 300.0, seed: int = 0):
         self.token_cell_m, self.seed = token_cell_m, seed
         self._proj = np.random.default_rng(seed).normal(size=(11, 32))
+        self._norm = None                  # fixed on first embed() so the mapping is row-wise
 
     def num_parameters(self):
         return 11 * 32
@@ -59,9 +60,20 @@ class KinematicReference(MobilityModelAdapter):
         return ContinuousPrediction(mixture=Mixture(np.ones((len(d), 1)), mu[:, None], sd[:, None], space="log"))
 
     def embed(self, batch):
+        """`embed` must be a pure function of each row (see MobilityModelAdapter.embed).
+
+        This used to standardise with statistics of the batch it was handed, which made a
+        window's embedding depend on what it was embedded alongside. Train and test are
+        embedded in separate calls, so they landed in different spaces - and in the anomaly
+        task the injected anomalies themselves set the test-batch scale, squashing every test
+        embedding toward zero and hiding the very thing being detected. The normalisation is
+        now fixed on first use and reused for every later batch.
+        """
         f = handcrafted_features(batch)
-        f = (f - f.mean(0)) / (f.std(0) + 1e-9)
-        return np.tanh(f @ self._proj)
+        if self._norm is None:
+            self._norm = (f.mean(0), f.std(0) + 1e-9)
+        mu, sd = self._norm
+        return np.tanh(((f - mu) / sd) @ self._proj)
 
     def generate(self, reference: MobilityDataset, n_trajectories: int, seed: int = 0):
         rng = np.random.default_rng(seed)

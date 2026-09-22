@@ -38,6 +38,24 @@ eval:
   max_eval_samples: 5000
   travel_time_max_h: 4.0
 
+
+  # --- protocols -------------------------------------------------------------
+  # UniTraj and TransferTraj have no next-location or time head; the linear probe puts them on
+  # the same axis using their frozen embeddings. Probe results are reported separately.
+  location_protocols:   [native, linear_probe]
+  continuous_protocols: [native, linear_probe]
+  probe_top_k: 2000               # candidate cells; the log prints what share of targets they cover
+  probe_max_train: 100000
+
+  # --- representation-level tasks --------------------------------------------
+  # Read user identification against the `mean_location` baseline, not against chance.
+  user_id_max_users: 100
+  user_id_min_windows: 8
+  # teleport is caught by any speed check; detour and loop preserve every step length exactly,
+  # so only a model that learned plausible routes can beat the kinematic baseline on them.
+  anomaly_kinds: [teleport, detour, loop]
+  anomaly_rate: 0.1
+  anomaly_protocols: [embedding_knn, reconstruction]
 models:
   - name: UniTraj-zeroshot
     type: unitraj

@@ -286,3 +286,33 @@ def test_run_info_and_report_land_in_the_run_directory(tmp_path):
     assert (home / "checkpoints" / "TrajGPT-tiny.pt").exists()
     assert (home / "runs" / run["run_id"] / "results.jsonl").exists()
     assert (home / "runs" / run["run_id"] / "report.md").exists()
+
+
+# --------------------------------------------------------------------- config typos
+def test_a_misspelled_model_key_is_refused_not_ignored(tmp_path):
+    """`chechpoint:` silently fell back to the default path, so a run looked fine while
+    evaluating a different file than the config named."""
+    from mobeval.config import apply_defaults
+    cfg = {"dataset": {}, "models": [{"name": "TrajGPT", "type": "trajgpt",
+                                      "chechpoint": "/home/me/TrajGPT.pt"}]}
+    with pytest.raises(ValueError, match="did you mean 'checkpoint'"):
+        apply_defaults(cfg)
+    with pytest.raises(ValueError, match="did you mean 'models'"):
+        apply_defaults({"dataset": {}, "modles": [], "models": [{"name": "A", "type": "unitraj"}]})
+    # the spelling that was meant still works
+    ok = apply_defaults({"dataset": {}, "models": [{"name": "TrajGPT", "type": "trajgpt",
+                                                    "checkpoint": "/home/me/TrajGPT.pt"}]})
+    assert ok["models"][0]["checkpoint"].endswith("TrajGPT.pt")
+
+
+def test_generation_survives_a_baseline_with_no_staypoints(tmp_path):
+    """Regression for KeyError('_cells'): the uniform-bbox baseline can produce no stays at all
+    on data where stays are inferred from trip gaps, which killed the whole generation task."""
+    import pandas as pd
+    from mobeval.metrics import generative as G
+    from mobeval.data import SpatialGrid
+    pts = pd.DataFrame({"user_id": [1, 1, 1], "traj_id": [1, 1, 1],
+                        "lat": [45.0, 45.01, 45.02], "lon": [9.0, 9.01, 9.02], "t": [0.0, 60.0, 120.0]})
+    grid = SpatialGrid(44.9, 45.1, 8.9, 9.1, 500.0)
+    empty = G.trajectory_stats(pts, pd.DataFrame(columns=["user_id", "lat", "lon", "t_arrive", "t_leave"]), grid)
+    assert "_cells" not in empty, "no staypoints must mean no _cells - the task has to cope with that"

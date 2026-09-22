@@ -71,11 +71,18 @@ class TorchAdapter(MobilityModelAdapter):
         raise NotImplementedError
 
     def embed(self, batch: TrajectoryBatch) -> np.ndarray:
+        """Embeddings, cached on (traj_id, first time, last time).
+
+        That key assumes a trajectory id identifies its coordinates. Anything that CHANGES the
+        coordinates while keeping the id - injected anomalies, most obviously - must give the
+        batch fresh ids, or it silently receives the original window's embedding back. See
+        `anomalies.inject`, which re-tags every window for exactly this reason.
+        """
         self._require_net()
         keys = list(zip(batch.traj_id.tolist(), batch.t[:, 0].tolist(), batch.t[:, -1].tolist()))
         todo = [i for i, k in enumerate(keys) if k not in self._emb_cache]
         for s in range(0, len(todo), self.batch_size):
-            idx = np.array(todo[s:s + self.batch_size])
+            idx = np.asarray(todo[s:s + self.batch_size], dtype=int)      # dtype matters when empty
             for i, z in zip(idx, self._embed_batch(batch.take(idx))):
                 self._emb_cache[keys[i]] = z
         return np.stack([self._emb_cache[k] for k in keys])

@@ -36,10 +36,38 @@ def load_config(path) -> dict:
     return apply_defaults(cfg)
 
 
+# Every key a model entry may have. A misspelled key used to be silently ignored, which is the
+# worst possible outcome: `chechpoint:` simply fell back to the default checkpoint path and the
+# run looked fine while evaluating a different file than the one named in the config.
+MODEL_KEYS = {"name", "type", "checkpoint", "train", "arch", "adapter", "run_tag", "external_pretraining"}
+TOP_LEVEL_KEYS = {"title", "output_dir", "persist_dir", "progress_dir", "checkpoint_dir", "run_dirs",
+                  "dataset", "eval", "models", "check_provenance"}
+
+
+def _did_you_mean(key: str, known) -> str:
+    import difflib
+    close = difflib.get_close_matches(key, sorted(known), n=1, cutoff=0.6)
+    return f" - did you mean '{close[0]}'?" if close else ""
+
+
+def _check_keys(d: dict, known, where: str):
+    unknown = sorted(set(d) - known)
+    if unknown:
+        raise ValueError(f"{where}: unknown key(s) {unknown}"
+                         + "".join(_did_you_mean(k, known) for k in unknown)
+                         + f". Valid keys: {sorted(known)}")
+
+
 def apply_defaults(cfg: dict) -> dict:
     names = [m["name"] for m in cfg["models"]]
     if len(set(names)) != len(names):
         raise ValueError(f"model names must be unique: {names}")
+    _check_keys(cfg, TOP_LEVEL_KEYS, "config")
+    for m in cfg["models"]:
+        for required in ("name", "type"):
+            if required not in m:
+                raise ValueError(f"model entry {m} is missing '{required}'")
+        _check_keys(m, MODEL_KEYS, f"model '{m['name']}'")
     cfg.setdefault("output_dir", "results")
     cfg.setdefault("eval", {})
     cfg.setdefault("check_provenance", "error")

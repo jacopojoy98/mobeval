@@ -5,7 +5,8 @@ reconstruction, visit-token generators with probabilistic time heads, dual-view 
 encoders) on the **same data, the same splits, the same samples and the same baselines**.
 Built-in models: **UniTraj**, **TrajGPT** and the **CLIP mobility model**. See
 `EVALUATION_PROTOCOL.md` for the evaluation design and `MODELS.md` for how each model is
-wrapped, what was changed and why.
+wrapped, what was changed and why. `CODE_GUIDE.md` walks through the code: how each model's
+training data is prepared and how each metric is computed.
 
 ## Install
 

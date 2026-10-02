@@ -75,6 +75,22 @@ def paired_spearman(real: pd.Series, gen: pd.Series) -> Optional[float]:
     return float(spearmanr(r[common], g[common]).statistic)
 
 
+def sample_trajectories(points: pd.DataFrame, max_n: Optional[int], seed: int = 0) -> pd.DataFrame:
+    """Keep at most `max_n` whole trajectories, chosen with a fixed seed.
+
+    Subsampling has to happen BEFORE any per-trajectory work. Resampling every trajectory in a
+    40-million-point panel and then keeping 3,000 of them costs gigabytes and is what made the
+    generation task get OOM-killed on a real dataset.
+    """
+    if max_n is None:
+        return points
+    ids = points.traj_id.unique()
+    if len(ids) <= max_n:
+        return points
+    keep = np.random.default_rng(seed).choice(ids, max_n, replace=False)
+    return points[points.traj_id.isin(keep)]
+
+
 def _resample(points: pd.DataFrame, k: int = 16) -> np.ndarray:
     """(T, k, 2) lat/lon of every trajectory resampled to k points by arc index."""
     out = []
@@ -85,16 +101,29 @@ def _resample(points: pd.DataFrame, k: int = 16) -> np.ndarray:
     return np.stack(out) if out else np.zeros((0, k, 2))
 
 
+# The pairwise comparison below materialises (n_query, block, k) doubles. Bounding the element
+# count rather than fixing `block` keeps that array the same size whatever the query count is -
+# at a fixed block of 256 it was 9.8 GB for 300k query trajectories.
+_MAX_PAIRWISE_ELEMENTS = 8_000_000
+
+
 def nearest_train_distance(query: pd.DataFrame, train: pd.DataFrame, k: int = 16, max_train: int = 3000,
-                           seed: int = 0) -> np.ndarray:
+                           max_query: Optional[int] = 2000, seed: int = 0) -> np.ndarray:
     """Per query trajectory: mean point-wise haversine distance (m) to its closest
-    training trajectory. Low values for GENERATED data indicate copying."""
-    Q, T = _resample(query, k), _resample(train, k)
-    if len(T) > max_train:
-        T = T[np.random.default_rng(seed).choice(len(T), max_train, replace=False)]
+    training trajectory. Low values for GENERATED data indicate copying.
+
+    Both sides are subsampled to whole trajectories first. The result is a distance
+    distribution, and the statistics taken from it (a 5th percentile, a copy rate) are
+    estimated just as well from a few thousand trajectories as from millions.
+    """
+    Q = _resample(sample_trajectories(query, max_query, seed), k)
+    T = _resample(sample_trajectories(train, max_train, seed), k)
     best = np.full(len(Q), np.inf)
-    for i in range(0, len(T), 256):
-        t = T[i:i + 256]
+    if not len(Q) or not len(T):
+        return best
+    block = max(1, min(len(T), _MAX_PAIRWISE_ELEMENTS // max(len(Q) * k, 1)))
+    for i in range(0, len(T), block):
+        t = T[i:i + block]
         d = haversine_m(Q[:, None, :, 0], Q[:, None, :, 1], t[None, :, :, 0], t[None, :, :, 1]).mean(-1)
         best = np.minimum(best, d.min(1))
     return best

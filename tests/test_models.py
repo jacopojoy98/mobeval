@@ -321,3 +321,106 @@ def test_trajgpt_mask_capacity_is_generous_and_context_mismatch_warns(ctx, tmp_p
         assert not [r for r in caplog.records if "trained with" in r.message]
         reloaded._check_len(trained_context + 4)                  # different: warns once
         assert [r for r in caplog.records if "trained with" in r.message]
+
+
+def test_transfertraj_context_radius_is_in_metres_whatever_the_coord_scale(tmp_path):
+    """poi_dist / rn_dist are squared METRES, as in the original. The network sees coordinates
+    divided by coord_scale, so passing the threshold through unchanged turned the original 10 m
+    radius into 10 km at coord_scale=1000: every point averaged nearly every POI in the city."""
+    import numpy as np
+    from mobeval.adapters.transfertraj import TransferTrajAdapter
+    rng = np.random.default_rng(0)
+    lat0, lon0 = 45.0, 9.0
+    poi = np.column_stack([lat0 + rng.normal(0, 0.02, 3000), lon0 + rng.normal(0, 0.02, 3000)])
+    np.save(tmp_path / "pe.npy", rng.normal(size=(3000, 8)).astype(np.float32))
+    np.save(tmp_path / "pl.npy", poi)
+    ctx = {"poi_embed": str(tmp_path / "pe.npy"), "poi_latlon": str(tmp_path / "pl.npy")}
+    pts_lat, pts_lon = lat0 + rng.normal(0, 0.02, 500), lon0 + rng.normal(0, 0.02, 500)
+    counts = {}
+    for scale in (1.0, 1000.0):
+        ad = TransferTrajAdapter(arch={"embed_size": 8, "d_model": 16, "rafee_layer": 1,
+                                       "poi_dist": 100.0 ** 2, "rn_dist": 100.0 ** 2},
+                                 center=(lat0, lon0), coord_scale=scale, context=ctx, device="cpu")
+        x, y = ad.proj.to_xy(pts_lat, pts_lon)
+        pts = np.column_stack([x, y]) / scale
+        coors = ad.net.poi_coors.cpu().numpy()
+        d2 = ((coors[None, :, :] - pts[:, None, :]) ** 2).sum(-1)
+        counts[scale] = (d2 < ad.net.poi_dist).sum(1)
+        assert ad.arch["poi_dist"] == 100.0 ** 2, "the checkpoint must keep the user-facing squared metres"
+    assert np.array_equal(counts[1.0], counts[1000.0]), "matched POIs changed with coord_scale"
+    assert 0 < counts[1.0].mean() < 100, f"a 100 m radius matched {counts[1.0].mean():.0f} POIs per point"
+
+
+def test_visit_sequences_flag_context_visits_from_other_splits():
+    """Contexts may reach into a user's visits from another split (that is history a deployed
+    model has), but anything trained on every context position must know which ones they are."""
+    import numpy as np, pandas as pd
+    from mobeval.data import SpatialGrid, make_visit_sequences
+    n = 12
+    sp = pd.DataFrame({"user_id": "u", "traj_id": [f"{'tr' if i % 2 == 0 else 'te'}{i}" for i in range(n)],
+                       "lat": 45 + np.arange(n) * 1e-3, "lon": 9.0,
+                       "t_arrive": np.arange(n) * 7200.0, "t_leave": np.arange(n) * 7200.0 + 3600})
+    grid = SpatialGrid(44.9, 45.1, 8.9, 9.1, 500.0)
+    train_ids = {t for t in sp.traj_id if t.startswith("tr")}
+    v = make_visit_sequences(sp, grid, context=4, target_traj_ids=train_ids)
+    assert len(v) > 0
+    for i in range(len(v)):
+        start = int(round((v.tgt_t_arrive[i] / 7200.0))) - 4
+        expected = [sp.traj_id[start + j] in train_ids for j in range(4)]
+        assert list(v.ctx_in_split[i]) == expected
+    # without a split restriction everything counts as the sample's own split
+    assert make_visit_sequences(sp, grid, context=4).ctx_in_split.all()
+
+
+def test_trajgpt_does_not_train_on_other_splits_visits(caplog):
+    """Regression: TrajGPT's loss is taken at every position, and under interleaved predefined
+    splits those positions include test visits - the model was training on the test set."""
+    import logging
+    import numpy as np, pandas as pd
+    from mobeval import EvalConfig, EvaluationPipeline, synthetic_dataset
+    from mobeval.adapters.trajgpt import TrajGPTAdapter
+    from mobeval.data import MobilityDataset
+    ds = synthetic_dataset(n_users=12, n_days=10, seed=0)
+    pts = ds.points.copy()
+    order = {t: i for i, t in enumerate(pts.drop_duplicates("traj_id").sort_values("t").traj_id)}
+    pts["split"] = ["test" if order[t] % 3 == 2 else "train" for t in pts.traj_id]   # interleaved
+    cfg = EvalConfig(split_by="predefined", window_length=16, visit_context=4, max_eval_samples=100)
+    ctx = EvaluationPipeline(cfg).prepare(MobilityDataset(pts, "interleaved"))
+    assert (~ctx.visits["train"].ctx_in_split).any(), "the fixture must actually interleave splits"
+    with caplog.at_level(logging.INFO, logger="mobeval"):
+        TrajGPTAdapter.train(ctx, train={"epochs": 1, "batch_size": 32, "device": "cpu"},
+                             arch={"num_layers": 1}, tokenizer={"cell_m": 1000})
+    assert any("excluded from the training loss" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("head_extra", [4, 0])     # HEAD commit: nr+8 outputs; paper-era 49aad40: nr+4
+def test_trajgpt_loads_original_repository_state_dicts(tmp_path, head_extra):
+    """The original main.py passes num_regions + 4 and the modules add 4 again: the embedding has
+    nr+8 rows, the head nr+8 (HEAD) or nr+4 (49aad40). Both must load, and only real regions scored."""
+    torch = pytest.importorskip("torch")
+    h3 = pytest.importorskip("h3")
+    from mobeval.adapters.trajgpt import TrajGPTAdapter
+    from mobeval.nn.trajgpt_net import TrajGPT
+    nr = 12
+    cells = sorted({h3.latlng_to_cell(43.7 + 0.08 * i, 10.4 + 0.08 * (i % 3), 7) for i in range(40)})[:nr]
+    orig = TrajGPT(nr + 4, 128, 20000.0, embedding_rows=nr + 8, head_rows=nr + 4 + head_extra)
+    p = tmp_path / "orig.pt"
+    torch.save(orig.state_dict(), p)
+    ad = TrajGPTAdapter.from_original_state_dict(p, cells, 20000.0, 4.0, 24.0, 0.0, (43.9, 10.5), device="cpu")
+    assert ad.net.region_id_head.out_features == nr + 4 + head_extra
+    B, S = 2, 6
+    inp = dict(region_id=torch.randint(4, 4 + nr, (B, S)), x=torch.randn(B, S), y=torch.randn(B, S),
+               arrival_time=torch.linspace(0, 1, S).repeat(B, 1), departure_time=torch.linspace(0, 1, S).repeat(B, 1))
+    with torch.no_grad():
+        assert ad._region_logits(ad.net(inp)).shape == (B, nr)
+    with pytest.raises(ValueError, match="room for"):
+        TrajGPTAdapter.from_original_state_dict(p, cells * 3, 20000.0, 4.0, 24.0, 0.0, (43.9, 10.5), device="cpu")
+
+
+def test_unitraj_rejects_unequal_visible_counts():
+    from mobeval.nn.unitraj_net import UniTraj
+    hidden = np.zeros((2, 10), bool)
+    hidden[0, :5] = True
+    hidden[1, :4] = True
+    with pytest.raises(ValueError, match="same number of visible"):
+        UniTraj.permutations(hidden, np.random.default_rng(0))

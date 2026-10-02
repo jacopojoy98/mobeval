@@ -23,6 +23,7 @@ status=0
 run_mobeval run --config "$SCRATCH/config.yaml" --device cuda -v \
     ${RESUME:+--resume "$RESUME"} || status=$?
 
+explain_exit $status
 stage_out
 echo "report: $RESULTS_DIR/latest/report.md"
 exit $status

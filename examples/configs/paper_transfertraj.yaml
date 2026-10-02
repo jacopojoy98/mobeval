@@ -1,0 +1,71 @@
+# TransferTraj retrained with its original methodology on its original data (DiDi Chengdu, in the
+# repository's processed HDF5 layout; Xi'an and Porto work the same way - see DATASETS.md).
+#   python -c "from mobeval.loaders import load_transfertraj_h5; load_transfertraj_h5('/scratch/USER/data/chengdu.h5', context_out='/scratch/USER/data/chengdu_ctx')"
+#   mobeval run --config examples/configs/paper_transfertraj.yaml
+title: TransferTraj reproduction on DiDi Chengdu
+output_dir: results/paper_transfertraj
+check_provenance: error
+
+dataset:
+  loader: transfertraj_h5
+  path: /scratch/USER/data/chengdu.h5
+  prepare:
+    min_traj_points: 5                     # utils.traj_clip: trips of 5..120 points
+    max_traj_points: 120
+
+eval:
+  tasks: [recovery, continuous, efficiency]
+  staypoint_method: trips                  # a stay = the gap between two orders of one driver,
+  staypoint_time_s: 60                     # so travel time between stays = the trip's duration (OD travel time)
+  split_by: time                           # chronological 8:1:1 by departure time
+  split_ratios: [0.8, 0.1, 0.1]
+  window_length: 32                        # mobeval scores fixed windows; the paper whole trips
+  max_gap_s: 600
+  recovery_schemes: [[last, 5], [keep_every, 8]]     # trajectory prediction and TRec (mu = 8)
+  recovery_ratios: [0.5]
+  continuous_paper_conditioning: true      # travel time given the destination ~ OD travel time
+  eval_seeds: [0]
+
+models:
+  - name: TransferTraj-paper               # pre-training (paper's single-span masking, 100 m context)
+    type: transfertraj
+    recipe: paper
+    train:
+      device: cuda
+      options:
+        context: {poi_embed: /scratch/USER/data/chengdu_poi_embed.npy,
+                  poi_latlon: /scratch/USER/data/chengdu_ctx/poi_latlon.npy,
+                  road_embed: /scratch/USER/data/chengdu_road_embed.npy,
+                  road_latlon: /scratch/USER/data/chengdu_ctx/road_latlon.npy}
+    adapter: {device: cuda}
+
+  # The paper fine-tunes on each task before testing it (trained after TransferTraj-paper).
+  - name: TransferTraj-paper-tp            # next-points prediction (last 5 points)
+    type: transfertraj
+    recipe: paper
+    train:
+      device: cuda
+      init_from: model:TransferTraj-paper   # this config's pre-trained model
+      options: {objective: tp, pred_len: 5}
+    adapter: {device: cuda}
+
+  - name: TransferTraj-paper-trec          # trajectory recovery, every 8th point kept
+    type: transfertraj
+    recipe: paper
+    train:
+      device: cuda
+      init_from: model:TransferTraj-paper   # this config's pre-trained model
+      options: {objective: trec, keep_every: 8}
+    adapter: {device: cuda}
+
+  - name: TransferTraj-code                # repository masking and its 10 m context radius
+    type: transfertraj
+    recipe: code
+    train:
+      device: cuda
+      options:
+        context: {poi_embed: /scratch/USER/data/chengdu_poi_embed.npy,
+                  poi_latlon: /scratch/USER/data/chengdu_ctx/poi_latlon.npy,
+                  road_embed: /scratch/USER/data/chengdu_road_embed.npy,
+                  road_latlon: /scratch/USER/data/chengdu_ctx/road_latlon.npy}
+    adapter: {device: cuda}

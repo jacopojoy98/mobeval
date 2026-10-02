@@ -336,3 +336,111 @@ def test_the_location_probe_reports_its_own_ceiling():
     acc = [r for r in store.records if r.metric == "acc@1" and r.protocol == "linear_probe"
            and not r.model.startswith("baseline:")]
     assert acc and acc[0].value <= cov[0].value + 1e-9, "accuracy exceeded the reachable share"
+
+
+def test_one_protocol_failing_does_not_discard_the_others():
+    """CLIPMobility's native location head needs a ~450k-way output layer on a fine grid and
+    raised; the whole next_location task then failed for that model and its linear probe - which
+    costs nothing and would have worked - was thrown away with it."""
+    from mobeval.tasks import NextLocationTask
+    _, ctx = _ctx()
+    ad = KinematicReference()
+
+    def boom(*a, **k):
+        raise RuntimeError("CUDA out of memory (simulated)")
+
+    ad.predict_location = boom
+    recs = NextLocationTask().run(ad, ctx)
+    protocols = {r.protocol for r in recs if not r.model.startswith("baseline:")}
+    assert protocols == {"linear_probe"}, f"expected the probe to survive, got {protocols}"
+    assert any("next_location/native" in e[1] for e in ctx.errors), "the failure must be recorded"
+
+
+def test_a_failing_protocol_is_recorded_rather_than_swallowed():
+    from mobeval.tasks import ContinuousValueTask
+    _, ctx = _ctx()
+    ad = KinematicReference()
+    ad.predict_continuous = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("nope"))
+    task = ContinuousValueTask("duration")
+    recs = task.run(ad, ctx)
+    assert {r.protocol for r in recs if not r.model.startswith("baseline:")} == {"linear_probe"}
+    assert any("native" in e[1] for e in ctx.errors)
+
+
+# --------------------------------------------------------------------- generation by rollout
+def _rollout_ctx():
+    cfg = EvalConfig(window_length=32, max_eval_samples=200, visit_context=4, eval_seeds=(0,),
+                     n_boot=20, generation_max_trajectories=25, rollout_seed_points=4, rollout_block=8)
+    pipe = EvaluationPipeline(cfg)
+    return pipe, pipe.prepare(synthetic_dataset(n_users=30, n_days=10, seed=0))
+
+
+def test_rollout_produces_objects_comparable_to_real_trajectories():
+    """The generation metrics compare per-trajectory statistics against real trajectories.
+    Generating fixed-length windows would compare fragments with whole trips, and every model
+    would look wrong for a reason that has nothing to do with the model."""
+    from mobeval.rollout import masked_rollout
+    _, ctx = _rollout_ctx()
+    ad = KinematicReference()
+    ref = ctx.splits["train"]
+    gen = masked_rollout(ad, ref, 20, seed=0, seed_points=4, block=8, window=32)
+    gl = gen.points.groupby("traj_id").size()
+    rl = ref.points.groupby("traj_id").size()
+    assert gl.min() > 4, "generated trajectories must be longer than the seed"
+    # the length distribution follows the real one it seeded from, not a fixed window size
+    assert gl.nunique() > 1, "every trajectory came out the same length - the real axis was lost"
+    assert rl.min() <= gl.median() <= rl.max()
+    assert np.isfinite(gen.points.lat).all() and np.isfinite(gen.points.lon).all()
+    # timestamps are real, never synthesised
+    assert gen.points.groupby("traj_id").t.apply(lambda s: s.is_monotonic_increasing).all()
+
+
+def test_the_seed_only_control_generates_nothing_after_the_seed():
+    """The seed prefix is real data and already fixes much of a trajectory's statistics; the
+    control exists so a model's contribution can be separated from the seed it was given."""
+    from mobeval.rollout import seed_only
+    _, ctx = _rollout_ctx()
+    ds = seed_only(ctx.splits["train"], 15, seed=0, seed_points=4)
+    for _, g in ds.points.groupby("traj_id"):
+        tail = g.iloc[4:]
+        if len(tail):
+            assert tail.lat.nunique() == 1 and tail.lon.nunique() == 1, "the control must stand still"
+
+
+def test_a_reconstruction_model_is_evaluated_on_generation_via_rollout():
+    from mobeval.tasks import GenerationTask
+    from mobeval.adapters.base import GENERATION
+    _, ctx = _rollout_ctx()
+    ad = KinematicReference()
+    ad.capabilities = ad.capabilities - {GENERATION}      # a pure reconstruction model
+    task = GenerationTask()
+    assert task.applicable(ad), "a RECOVERY model must be eligible for generation by rollout"
+    recs = task.run(ad, ctx)
+    mine = [r for r in recs if not r.model.startswith("baseline:")]
+    assert mine and {r.protocol for r in mine} == {"rollout"}
+    assert "baseline:seed_only" in {r.model for r in recs}, "the seed control must be reported"
+    # and the ordinary generation baselines are still there for this protocol
+    assert {"baseline:uniform_bbox"} <= {r.model for r in recs}
+
+
+def test_a_native_generator_is_not_also_rolled_out():
+    """Doing both would double the cost and put two numbers for the same model in one column."""
+    from mobeval.tasks import GenerationTask
+    _, ctx = _rollout_ctx()
+    recs = GenerationTask().run(KinematicReference(), ctx)   # declares GENERATION
+    mine = [r for r in recs if not r.model.startswith("baseline:")]
+    assert {r.protocol for r in mine} == {"native"}
+
+
+def test_the_rollout_uses_the_model_and_not_just_the_seed():
+    """If a rollout matched the seed-only control it would mean the decoder never consulted the
+    model - which is the failure mode the control is there to expose."""
+    from mobeval.rollout import masked_rollout, seed_only
+    from mobeval.geo import radius_of_gyration_m
+    _, ctx = _rollout_ctx()
+    ref = ctx.splits["train"]
+    rg = lambda ds: np.median(ds.points.groupby("traj_id").apply(
+        lambda g: radius_of_gyration_m(g.lat.to_numpy(), g.lon.to_numpy()), include_groups=False))
+    moved = rg(masked_rollout(KinematicReference(), ref, 20, seed=0, seed_points=4, block=8, window=32))
+    frozen = rg(seed_only(ref, 20, seed=0, seed_points=4))
+    assert moved > 10 * frozen, f"rollout {moved:.0f} m vs frozen {frozen:.0f} m - the model added nothing"

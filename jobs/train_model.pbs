@@ -25,6 +25,7 @@ status=0
 run_mobeval train --config "$SCRATCH/config.yaml" --models "$MODEL" --device cuda -v \
     ${RESUME:+--resume} || status=$?
 
+explain_exit $status
 stage_out
 echo "checkpoint: $RESULTS_DIR/checkpoints/$MODEL.pt"
 exit $status

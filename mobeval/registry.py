@@ -67,12 +67,25 @@ def train_model(spec: dict, ctx, output_dir) -> Path:
     if mtype not in TRAIN_METHOD:
         raise ValueError(f"model type '{mtype}' has no training routine")
     cls = MODEL_TYPES[mtype]()
+    from . import recipes
+    spec, recipe_record = recipes.apply(spec)
+    if recipe_record:
+        recipe_record["eval_differences"] = recipes.check_eval(spec["name"], mtype, spec["recipe"], ctx.cfg)
     tr = dict(spec.get("train", {}))
     out = Path(tr.pop("out", None) or checkpoint_path(spec, output_dir))
     kwargs = dict(tr.pop("options", {}))
     if "arch" in spec:
         kwargs["arch"] = spec["arch"]
     init_from = tr.pop("init_from", None)
+    if isinstance(init_from, str) and init_from.startswith("model:"):
+        # another model of this config, e.g. a fine-tuning run starting from the pre-trained model:
+        # resolved to wherever that model's checkpoint lives in THIS run (also inside a PBS job,
+        # where output_dir is rewritten to scratch)
+        base = init_from.split(":", 1)[1]
+        init_from = str(checkpoint_path({"name": base}, output_dir))
+        if not Path(init_from).exists():
+            raise FileNotFoundError(f"{spec['name']}: init_from model '{base}' has no checkpoint at {init_from}; "
+                                    f"list '{base}' before '{spec['name']}' in the config so it is trained first")
     if init_from:
         kwargs["init_from"] = init_from
     from . import progress
@@ -82,6 +95,7 @@ def train_model(spec: dict, ctx, output_dir) -> Path:
     rep.model(spec["name"], state="training", detail="starting")
     rep.event("train_start", model=spec["name"], model_type=mtype, epochs=tr.get("epochs"),
               message=f"training {spec['name']} ({mtype})")
+    ctx.active_recipe = recipe_record or None          # stored in the checkpoint's provenance
     try:
         with rep.scoped(spec["name"]):
             getattr(cls, TRAIN_METHOD[mtype])(ctx, train=tr, out=str(out), **kwargs, **spec.get("adapter", {}))
@@ -94,9 +108,11 @@ def train_model(spec: dict, ctx, output_dir) -> Path:
                   message=f"{spec['name']}: interrupted after {time.time() - t0:.0f}s, best epoch kept")
         raise
     except Exception as e:                                             # noqa: BLE001
+        ctx.active_recipe = None
         rep.model(spec["name"], state="failed", detail=repr(e)[:80])
         rep.error(f"training {spec['name']} failed: {e!r}", model=spec["name"])
         raise
+    ctx.active_recipe = None
     # The checkpoint was already mirrored after every improving epoch; mirror once more so the
     # durable copy is the final one (best weights + full history) the moment training ends,
     # rather than whenever the job gets around to staging out.

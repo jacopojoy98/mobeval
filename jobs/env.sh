@@ -1,10 +1,12 @@
 # Shared environment for all mobeval PBS jobs. Edit this file once; the job scripts source it.
 # ---------------------------------------------------------------------------------------------
 # Where the code, the data and the results live (home or a project folder, NOT scratch)
-MOBEVAL_DIR="$HOME/MobFM/BMdir/mobeval"
-CONFIG="$MOBEVAL_DIR/examples/configs/vehicle_panel.yaml"
-DATA_DIR="$HOME/MobFM/data"                 # the CSV/Parquet files referenced by the config
-RESULTS_DIR="$HOME/MobFM/results"           # final outputs are copied back here
+MOBEVAL_DIR="${MOBEVAL_DIR:-$HOME/MobFM/BMdir/mobeval}"
+# Override per job, e.g. for a paper reproduction:
+#   qsub -v CONFIG=$HOME/MobFM/BMdir/mobeval/examples/configs/paper_trajgpt.yaml,DATA_DIR=/scratch/$USER/data/geolife,RESULTS_DIR=$HOME/MobFM/results_trajgpt jobs/all_in_one.pbs
+CONFIG="${CONFIG:-$MOBEVAL_DIR/examples/configs/vehicle_panel.yaml}"
+DATA_DIR="${DATA_DIR:-$HOME/MobFM/data}"    # the data files/folder referenced by the config
+RESULTS_DIR="${RESULTS_DIR:-$HOME/MobFM/results}"   # final outputs are copied back here
 
 # Scratch: all job I/O happens here (mandatory on this cluster; not backed up)
 SCRATCH="/scratch/$USER/mobeval/${PBS_JOBID:-manual-$$}"   # always a per-job subdirectory
@@ -100,6 +102,30 @@ on_term() {
     wait "$MOBEVAL_PID" 2>/dev/null
     stage_out
     exit 143
+}
+
+# Turn a bare "Killed" into something actionable. A job that exceeds its memory allowance is
+# SIGKILLed by the kernel or by PBS: there is no Python traceback, no exception and nothing in
+# the progress file, just exit 137 and a one-word message.
+explain_exit() {
+    if [ "${1:-0}" -eq 137 ]; then
+        cat <<'MSG'
+
+=== the job was KILLED (exit 137) ===
+That is almost always the memory limit, not a bug in your data. Nothing was raised in Python,
+so there is no traceback to look for. Options, cheapest first:
+
+  1. Ask for more memory in the #PBS -l select=... line (e.g. mem=64gb).
+  2. Lower the settings that drive peak memory, in the `eval:` block of the config:
+       max_eval_samples                 fewer test samples scored at once
+       generation_max_real_trajectories fewer trajectories behind the generation reference
+       generation_nn_max_train / _query smaller memorisation comparison
+       grid_cell_m                      a LARGER cell size means far fewer grid cells
+  3. Evaluate one model at a time with --models, so only one model's caches are live.
+
+Whatever had finished is already in $RESULTS_DIR; re-submit with RESUME to continue.
+MSG
+    fi
 }
 
 # Run mobeval so that the trap above can reach it, instead of blocking the shell. Returns

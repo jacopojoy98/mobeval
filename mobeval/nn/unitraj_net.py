@@ -126,7 +126,15 @@ class UniTraj(nn.Module):
     @staticmethod
     def permutations(hidden: np.ndarray, rng: np.random.Generator):
         """hidden [B,T] bool (equal count per row) -> forward/backward index tensors [T,B].
-        Visible tokens are shuffled (as in pre-training), hidden ones are placed last."""
+        Visible tokens are shuffled (as in pre-training), hidden ones are placed last.
+
+        The encoder keeps the first n_vis tokens of every row, so n_vis must be the same for all rows:
+        with unequal counts, rows with fewer visible points would feed hidden points to the encoder
+        (target leak) and rows with more would drop visible ones. Raise rather than guess."""
+        n_vis_rows = (~np.asarray(hidden, bool)).sum(1)
+        if len(n_vis_rows) and (n_vis_rows != n_vis_rows[0]).any():
+            raise ValueError(f"UniTraj needs the same number of visible points in every row, got "
+                             f"{n_vis_rows.min()}..{n_vis_rows.max()}; pad or top up the mask per row")
         fw = []
         for row in hidden:
             vis, hid = np.where(~row)[0], np.where(row)[0]

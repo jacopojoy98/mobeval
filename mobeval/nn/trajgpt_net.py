@@ -42,8 +42,14 @@ class PositionalEncoding(nn.Module):
 
 
 class Space2Vec(nn.Module):
-    def __init__(self, d_embed, lambda_min, lambda_max, num_scales=64):
+    def __init__(self, d_embed, lambda_min, lambda_max, num_scales=64, exponent="s/(S-1)"):
+        """`exponent` selects the scale schedule g^e. "s/(S-1)" is the Space2Vec paper's and the original
+        repository's since commit 2d47f78; "s/S-1" is the operator-precedence bug of the paper-era commit
+        49aad40 (scales from lambda_min/g up to ~lambda_min), kept only so checkpoints from it load."""
         super().__init__()
+        if exponent not in ("s/(S-1)", "s/S-1"):
+            raise ValueError("space2vec exponent must be 's/(S-1)' or 's/S-1'")
+        self.exponent = exponent
         self.lambda_min, self.g, self.S = lambda_min, lambda_max / lambda_min, num_scales
         self.register_buffer("scales", torch.arange(num_scales).reshape(1, num_scales), persistent=False)
         a = torch.tensor([[1.0, 0.0], [-0.5, math.sqrt(3) / 2], [-0.5, -math.sqrt(3) / 2]])
@@ -51,7 +57,8 @@ class Space2Vec(nn.Module):
         self.location_embedding = nn.Sequential(nn.Linear(num_scales * 6, d_embed), nn.ReLU())
 
     def forward(self, x):
-        frac = (x @ self.a.T).unsqueeze(-1) / (self.lambda_min * torch.pow(self.g, self.scales / (self.S - 1)))
+        e = self.scales / (self.S - 1) if self.exponent == "s/(S-1)" else self.scales / self.S - 1
+        frac = (x @ self.a.T).unsqueeze(-1) / (self.lambda_min * torch.pow(self.g, e))
         frac = frac.reshape(*frac.shape[:-2], -1)
         return self.location_embedding(torch.cat([torch.cos(frac), torch.sin(frac)], -1))
 
@@ -67,10 +74,11 @@ class Time2Vec(nn.Module):
 
 
 class SourceInput(nn.Module):
-    def __init__(self, num_regions, d_embed, lambda_min, lambda_max, input_order="fixed"):
+    def __init__(self, num_regions, d_embed, lambda_min, lambda_max, input_order="fixed",
+                 space2vec_exponent="s/(S-1)", space2vec_scales=64):
         super().__init__()
         self.order = input_order
-        self.space2vec = Space2Vec(d_embed, lambda_min, lambda_max)
+        self.space2vec = Space2Vec(d_embed, lambda_min, lambda_max, space2vec_scales, space2vec_exponent)
         self.time2vec = Time2Vec(d_embed)
         self.region_embedding = nn.Embedding(N_SPECIAL_TOKENS + num_regions, d_embed, padding_idx=PAD)
 
@@ -140,13 +148,22 @@ def gmm_nll(out, y, mask, min_scale: float = 0.0):
 
 class TrajGPT(nn.Module):
     def __init__(self, num_regions, sequence_len, lambda_max, num_heads=2, num_layers=4, num_gaussians=3,
-                 d_feedforward=32, d_embed=32, lambda_min=1e0, input_order="fixed"):
+                 d_feedforward=32, d_embed=32, lambda_min=1e0, input_order="fixed",
+                 embedding_rows=None, head_rows=None, space2vec_exponent="s/(S-1)", space2vec_scales=64):
+        """`embedding_rows` / `head_rows` override the vocabulary sizes, only so that state dicts saved
+        by the original repository load: its main.py passes `num_regions + N_SPECIAL_TOKENS` and the
+        modules add N_SPECIAL_TOKENS again, so the embedding has 4 unused rows, and the head has 4
+        unused outputs at HEAD (nr+8) but not at the paper-era commit 49aad40 (nr+4). Rows past
+        N_SPECIAL_TOKENS + num_regions are never produced by the tokenizer; the adapter drops them."""
         super().__init__()
         self.num_regions, self.d_model, self.input_order = num_regions, d_embed * 4, input_order
-        self.input = SourceInput(num_regions, d_embed, lambda_min, lambda_max, input_order)
+        self.input = SourceInput(num_regions, d_embed, lambda_min, lambda_max, input_order,
+                                 space2vec_exponent, space2vec_scales)
+        if embedding_rows is not None:
+            self.input.region_embedding = nn.Embedding(int(embedding_rows), d_embed, padding_idx=PAD)
         self.encoder = CausalEncoder(self.d_model, num_heads, num_layers, sequence_len)
         self.region_id_decoder = CausalEncoder(self.d_model, num_heads, 1, sequence_len)
-        self.region_id_head = nn.Linear(self.d_model, num_regions + N_SPECIAL_TOKENS)
+        self.region_id_head = nn.Linear(self.d_model, int(head_rows or num_regions + N_SPECIAL_TOKENS))
         self.d_travel, self.d_duration = d_embed * 2, d_embed * 3
         self.travel_decoder = CausalMemoryDecoder(self.d_travel, num_heads, sequence_len, d_feedforward)
         self.travel_head = GMM(self.d_travel, num_gaussians)

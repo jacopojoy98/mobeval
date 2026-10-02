@@ -132,6 +132,9 @@ class SpatialGrid:
     def n_cells(self) -> int:
         return self.nx * self.ny
 
+    def describe(self) -> str:
+        return f"{self.nx}x{self.ny} cells @ {self.cell_size_m:.0f} m"
+
     def cell_of(self, lat, lon) -> np.ndarray:
         x, y = self.proj.to_xy(lat, lon)
         ix = np.clip(np.floor((np.asarray(x) - self.x0) / self.cell_size_m), 0, self.nx - 1).astype(int)
@@ -202,6 +205,24 @@ def make_mask(n: int, length: int, ratio: float, kind: str = "random", seed: int
     """Boolean mask, True = hidden from the model. Generated ONCE by the pipeline
     (seeded) and passed to every model, so all models reconstruct the same points.
     Endpoints are kept observed so interpolation baselines are well defined."""
+    if kind == "last":
+        # Trajectory PREDICTION as TransferTraj and UniTraj evaluate it: hide the final k points.
+        # `ratio` >= 1 is a point count (the papers use 5), < 1 a fraction. No endpoint is kept -
+        # the last point is the target.
+        k = int(ratio) if ratio >= 1 else int(round(ratio * length))
+        k = int(np.clip(k, 1, length - 2))
+        mask = np.zeros((n, length), dtype=bool)
+        mask[:, length - k:] = True
+        return mask
+    if kind == "keep_every":
+        # TransferTraj's TRec protocol: keep every `ratio`-th point and the last one, recover the rest.
+        step = int(ratio)
+        if step < 2:
+            raise ValueError("keep_every needs a stride >= 2")
+        mask = np.ones((n, length), dtype=bool)
+        mask[:, ::step] = False
+        mask[:, -1] = False
+        return mask
     rng = np.random.default_rng(seed)
     lo, hi = (1, length - 1) if keep_endpoints else (0, length)
     avail = hi - lo
@@ -214,8 +235,82 @@ def make_mask(n: int, length: int, ratio: float, kind: str = "random", seed: int
             s = rng.integers(lo, hi - k + 1)
             mask[i, s:s + k] = True
         else:
-            raise ValueError("kind must be 'random' or 'block'")
+            raise ValueError("kind must be 'random', 'block', 'last' or 'keep_every'")
     return mask
+
+
+class H3Grid:
+    """Shared label space made of H3 cells, for reproducing evaluations defined on H3 regions
+    (TrajGPT scores next-visit Acc@k on resolution-7 cells). Same interface as SpatialGrid.
+
+    The cell list is built from every GPS point and staypoint of the dataset - the label space,
+    like the square grid's bounding box, is a property of the study area, not of a split (TrajGPT
+    also builds its vocabulary over all splits). A location outside it (a generated point) maps to
+    the nearest cell centroid."""
+
+    def __init__(self, latlon_arrays, resolution: int = 7):
+        import h3
+        from scipy.spatial import cKDTree
+        self.resolution = int(resolution)
+        keys = set()
+        for k, (lat, lon) in enumerate(latlon_arrays):
+            ll = np.column_stack([np.asarray(lat, float), np.asarray(lon, float)])
+            ll = ll[np.isfinite(ll).all(1)]
+            if k == 0:
+                # GPS fixes: cells of the unique positions rounded to 1e-5 degrees (~1 m), which keeps
+                # the h3 calls proportional to distinct places rather than to hundreds of millions of
+                # fixes. A fix within ~1 m of a cell edge whose own cell holds no other position can
+                # thereby miss its cell and map to the nearest one - rare, and never for a visit, because
+                # the staypoints (the location targets) are added exactly below.
+                ll = np.unique(np.round(ll, 5), axis=0)
+            keys.update(h3.latlng_to_cell(float(a), float(o), self.resolution) for a, o in ll)
+        self.keys = np.array(sorted(keys))
+        self._index = {k: i for i, k in enumerate(self.keys.tolist())}
+        self.latlon = np.array([h3.cell_to_latlng(k) for k in self.keys], float)
+        self.proj = LocalProjection(*self.latlon.mean(0))
+        self._tree = cKDTree(np.column_stack(self.proj.to_xy(self.latlon[:, 0], self.latlon[:, 1])))
+        pad = 0.02
+        self.bounds = (self.latlon[:, 0].min() - pad, self.latlon[:, 0].max() + pad,
+                       self.latlon[:, 1].min() - pad, self.latlon[:, 1].max() + pad)
+
+    @classmethod
+    def from_dataset(cls, ds: "MobilityDataset", resolution: int = 7, staypoints=None) -> "H3Grid":
+        arrays = [(ds.points.lat.to_numpy(), ds.points.lon.to_numpy())]
+        if staypoints is not None and len(staypoints):
+            arrays.append((staypoints.lat.to_numpy(), staypoints.lon.to_numpy()))
+        return cls(arrays, resolution)
+
+    @property
+    def n_cells(self) -> int:
+        return len(self.keys)
+
+    def describe(self) -> str:
+        return f"{self.n_cells} H3 cells @ resolution {self.resolution}"
+
+    def cell_of(self, lat, lon) -> np.ndarray:
+        import h3
+        lat, lon = np.asarray(lat, float), np.asarray(lon, float)
+        flat_lat, flat_lon = lat.ravel(), lon.ravel()
+        out = np.empty(flat_lat.shape, int)
+        miss = []
+        for i, (a, o) in enumerate(zip(flat_lat, flat_lon)):
+            j = self._index.get(h3.latlng_to_cell(a, o, self.resolution)) if np.isfinite(a) and np.isfinite(o) else None
+            if j is None:
+                miss.append(i)
+            else:
+                out[i] = j
+        if miss:
+            m = np.array(miss)
+            ok = np.isfinite(flat_lat[m]) & np.isfinite(flat_lon[m])
+            out[m] = 0
+            if ok.any():
+                x, y = self.proj.to_xy(flat_lat[m][ok], flat_lon[m][ok])
+                out[m[ok]] = self._tree.query(np.column_stack([x, y]))[1]
+        return out.reshape(lat.shape)
+
+    def centroid(self, cell):
+        c = self.latlon[np.asarray(cell)]
+        return c[..., 0], c[..., 1]
 
 
 # --------------------------------------------------------------------------- #
@@ -317,9 +412,30 @@ class VisitBatch:
     tgt_travel_time_s: np.ndarray   # arrival(target) - departure(last context visit)
     tgt_duration_s: np.ndarray      # leave(target) - arrive(target)
     tgt_t_arrive: np.ndarray
+    # (N, C) whether each CONTEXT visit belongs to the same split as the target. Contexts may
+    # legitimately reach into a user's earlier visits from other splits - that is what a deployed
+    # model sees - but a model that is trained on EVERY position of the sequence (TrajGPT is
+    # teacher-forced on all C of them) must not take a loss on those: under interleaved
+    # predefined splits it would be training on test visits.
+    ctx_in_split: np.ndarray = None
+
+    def __post_init__(self):
+        if self.ctx_in_split is None:
+            self.ctx_in_split = np.ones(np.shape(self.ctx_cell), bool)
 
     def __len__(self):
         return len(self.tgt_cell)
+
+    def take(self, idx) -> "VisitBatch":
+        """A sub-batch, so location scoring can run in chunks. A dense (n, n_cells) score
+        matrix is 18 GB for 5,000 samples on a 500 m grid over a region, which is more than a
+        typical job's whole memory allowance; every location metric is per-sample, so scoring
+        in chunks gives bit-identical results at a fraction of the peak."""
+        return VisitBatch(self.ctx_lat[idx], self.ctx_lon[idx], self.ctx_cell[idx],
+                          self.ctx_t_arrive[idx], self.ctx_t_leave[idx], self.user_id[idx],
+                          self.tgt_lat[idx], self.tgt_lon[idx], self.tgt_cell[idx],
+                          self.tgt_travel_time_s[idx], self.tgt_duration_s[idx], self.tgt_t_arrive[idx],
+                          self.ctx_in_split[idx])
 
 
 def make_visit_sequences(staypoints: pd.DataFrame, grid: SpatialGrid, context: int = 8,
@@ -346,6 +462,8 @@ def make_visit_sequences(staypoints: pd.DataFrame, grid: SpatialGrid, context: i
             buf["tgt_lat"].append(la[t]); buf["tgt_lon"].append(lo[t]); buf["tgt_cell"].append(cells[t])
             buf["tgt_travel_time_s"].append(ta[t] - tl[t - 1]); buf["tgt_duration_s"].append(tl[t] - ta[t])
             buf["tgt_t_arrive"].append(ta[t])
+            buf["ctx_in_split"].append(np.ones(context, bool) if keep_targets is None
+                                       else np.array([x in keep_targets for x in tr[c]]))
     if not buf["tgt_cell"]:
         raise ValueError("no visit sequences produced - reduce `context`")
     return VisitBatch(**{k: np.asarray(v) for k, v in buf.items()})

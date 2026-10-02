@@ -118,7 +118,8 @@ class TargetGuard:
                           v.tgt_lat if loc else nan(v.tgt_lat), v.tgt_lon if loc else nan(v.tgt_lon),
                           v.tgt_cell if loc else np.full(v.tgt_cell.shape, -1),
                           nan(v.tgt_travel_time_s), nan(v.tgt_duration_s),
-                          v.tgt_t_arrive if "arrival" in reveal else nan(v.tgt_t_arrive))
+                          v.tgt_t_arrive if "arrival" in reveal else nan(v.tgt_t_arrive),
+                          v.ctx_in_split)
 
     @staticmethod
     def hide_masked(b: TrajectoryBatch, mask: np.ndarray) -> TrajectoryBatch:

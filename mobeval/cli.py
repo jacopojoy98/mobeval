@@ -246,9 +246,35 @@ SMOKE = {
 }
 
 
+def cmd_recipes(types=None):
+    """Print every training recipe that reproduces an original methodology, with its sources and
+    what it deliberately does not reproduce (`mobeval recipes [--models unitraj trajgpt]`)."""
+    import json
+    from . import recipes
+    from .paper_metrics import describe
+    for mtype, rs in recipes.RECIPES.items():
+        if types and mtype not in types:
+            continue
+        for name, r in rs.items():
+            print(f"=== {mtype} / recipe: {name}")
+            print("sources:  " + "; ".join(r["sources"]))
+            for k in ("arch", "train", "options", "eval"):
+                if r.get(k):
+                    print(f"{k + ':':9s} {json.dumps(r[k])}")
+            print(f"dataset:  {r.get('dataset')}  (see DATASETS.md)")
+            for item in r.get("not_reproduced", []):
+                print(f"  not reproduced: {item}")
+            if r.get("finetune"):
+                print(f"finetune: {json.dumps(r['finetune'])}")
+            print()
+    print("clip_mobility: no recipe (no publication to reproduce)\n")
+    print("Metrics the papers report (marked in report.md and by make_table.py):\n")
+    print(describe())
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="mobeval", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["train", "evaluate", "run", "smoke", "info", "context", "status"])
+    ap.add_argument("command", choices=["train", "evaluate", "run", "smoke", "info", "context", "status", "recipes"])
     ap.add_argument("--config")
     ap.add_argument("--models", nargs="*")
     ap.add_argument("--out", help="override output_dir")
@@ -279,6 +305,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s %(name)s: %(message)s")
 
+    if args.command == "recipes":
+        return cmd_recipes(args.models) or 0
     if args.command == "status" and not args.config:
         return cmd_status(args) or 0                # inspecting only needs the progress directory
 

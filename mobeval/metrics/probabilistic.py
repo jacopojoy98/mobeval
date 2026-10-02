@@ -111,12 +111,43 @@ def gaussian_pseudo_nll(pred, y, sigma: float) -> np.ndarray:
     return 0.5 * LOG_2PI + np.log(sigma) + 0.5 * (r / sigma) ** 2
 
 
+WITHIN_MIN = (5, 10, 20)
+
+
+def p_within(y, support_max: float, point=None, mixture: Optional[Mixture] = None, samples=None,
+             within=WITHIN_MIN) -> Dict[str, np.ndarray]:
+    """TrajGPT's P(+-t): probability mass the forecast puts within t minutes of the truth, with the
+    forecast truncated to [0, support_max] and renormalised (original utils/metrics.py,
+    compute_p_within_t). The original clips its labels at support_max during preprocessing, so y is
+    clipped the same way here. A point forecast scores 1 if it lands within t, else 0."""
+    y = np.clip(np.asarray(y, float), 0.0, support_max)
+    out = {}
+    for t in within:
+        lo, hi = np.maximum(y - t, 0.0), np.minimum(y + t, support_max)
+        if mixture is not None:
+            den = mixture.cdf(np.full_like(y, support_max)) - mixture.cdf(np.zeros_like(y))
+            num = mixture.cdf(hi) - mixture.cdf(lo)
+            v = np.where(den > 1e-12, num / np.maximum(den, 1e-12), 0.0)
+        elif samples is not None:
+            sm = np.asarray(samples, float)
+            ok = (sm >= 0) & (sm <= support_max)
+            inside = ok & (sm >= lo[:, None]) & (sm <= hi[:, None])
+            v = inside.sum(1) / np.maximum(ok.sum(1), 1)
+        else:
+            v = (np.abs(np.clip(np.asarray(point, float), 0.0, support_max) - y) <= t).astype(float)
+        out[f"p_within_{t:g}min"] = np.clip(v, 0.0, 1.0)
+    return out
+
+
 def continuous_metrics(y, point: Optional[np.ndarray] = None, mixture: Optional[Mixture] = None,
-                       samples: Optional[np.ndarray] = None, pseudo_sigma: Optional[float] = None
-                       ) -> Dict[str, np.ndarray]:
-    """y and every prediction must already be in canonical units (minutes)."""
+                       samples: Optional[np.ndarray] = None, pseudo_sigma: Optional[float] = None,
+                       support_max: Optional[float] = None) -> Dict[str, np.ndarray]:
+    """y and every prediction must already be in canonical units (minutes). `support_max` (the TRAIN
+    99th percentile of the target) enables TrajGPT's P(+-t) metrics."""
     y = np.asarray(y, float)
     out: Dict[str, np.ndarray] = {}
+    if support_max is not None:
+        out.update(p_within(y, support_max, point, mixture, samples))
     if mixture is not None:
         pt = mixture.median() if point is None else point
         out["crps_min"] = crps_mixture(mixture, y)
@@ -136,6 +167,7 @@ def continuous_metrics(y, point: Optional[np.ndarray] = None, mixture: Optional[
         raise ValueError("need point, mixture or samples")
     out["mae_min"] = np.abs(pt - y)
     out["rmse_min"] = (pt - y) ** 2
+    out["mape"] = np.abs(pt - y) / np.maximum(y, 1e-9)     # TransferTraj's travel-time MAPE (fraction)
     if pit is not None:
         out["coverage80"] = ((pit >= 0.1) & (pit <= 0.9)).astype(float)
         out["_pit"] = pit

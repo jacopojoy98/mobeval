@@ -1,0 +1,43 @@
+# TrajGPT retrained with its original methodology on its original data (GeoLife 1.3).
+#   mobeval run --config examples/configs/paper_trajgpt.yaml
+# Download GeoLife first (see DATASETS.md). `mobeval recipes --models trajgpt` lists every setting
+# and what the recipes deliberately do not reproduce.
+title: TrajGPT reproduction on GeoLife
+output_dir: results/paper_trajgpt
+check_provenance: error
+
+dataset:
+  loader: geolife
+  path: /scratch/USER/data/geolife        # folder containing Data/
+  max_speed_mps: null                      # TrajGPT reads GeoLife with trackintel, no speed filter
+  prepare:
+    time_from: "2007-01-01 00:00:00"       # the original keeps visits in 2007-2008
+    time_to: "2008-12-31 23:59:59"
+
+eval:
+  split_by: time                           # chronological 8:1:1, as the original
+  split_ratios: [0.8, 0.1, 0.1]
+  staypoint_method: points
+  staypoint_dist_m: 200                    # paper: 200 m / 10 min (the 49aad40 code: 100 m / 5 min)
+  staypoint_time_s: 600
+  visit_context: 127                       # sequences of 128 visits, evaluated at the last one
+  grid_backend: h3                         # next-visit Acc@k over H3 resolution-7 regions,
+  grid_h3_resolution: 7                    # the paper's label space
+  travel_time_max_h: 4.0                   # MAX_VALID_TRAVEL_TIME
+  continuous_paper_conditioning: true      # P(+-t) given the target visit, as the paper evaluates
+  window_length: 64
+  eval_seeds: [0]
+  n_boot: 1000
+
+models:
+  - name: TrajGPT-paper
+    type: trajgpt
+    recipe: paper
+    train: {device: cuda}
+    adapter: {device: cuda}
+
+  - name: TrajGPT-code                     # the 49aad40 code as released (incl. its target leak)
+    type: trajgpt
+    recipe: code
+    train: {device: cuda}
+    adapter: {device: cuda}

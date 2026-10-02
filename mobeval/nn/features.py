@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import logging
+
 from typing import Optional
 
 import numpy as np
@@ -14,6 +16,8 @@ from scipy.spatial import cKDTree
 
 from ..data import SpatialGrid
 from ..geo import LocalProjection, haversine_m
+
+log = logging.getLogger("mobeval.features")
 
 POINT_TOKEN_DIM = 9
 MAX_OFFSET_KM = 200.0      # clip for local offsets within a window
@@ -28,6 +32,8 @@ class RegionTokenizer:
         self.backend, self.cell_m, self.res, self.offset = backend, float(cell_m), int(h3_resolution), int(offset)
         self.keys = None
         self._grid: Optional[SpatialGrid] = None
+        self.snapped = None            # stats from the last tokens() call that missed
+        self._warned = False
 
     # -- raw cell keys --------------------------------------------------------------
     def _raw(self, lat, lon):
@@ -71,7 +77,24 @@ class RegionTokenizer:
         miss = out < 0
         if miss.any():
             xy = np.column_stack(self._proj.to_xy(lat.ravel()[miss], lon.ravel()[miss]))
-            out[miss] = self._tree.query(xy)[1]
+            d, idx = self._tree.query(xy)
+            out[miss] = idx
+            # Snapping is a reasonable fallback for a place just outside the vocabulary and a
+            # silent disaster for one far outside it: the model is then asked about a region
+            # tens of kilometres from where the visit actually was, and can never be right.
+            # Report it once rather than letting it surface as an unexplained 100 km error.
+            self.snapped = {"n": int(miss.sum()), "of": int(miss.size),
+                            "median_m": float(np.median(d)), "p95_m": float(np.percentile(d, 95)),
+                            "max_m": float(np.max(d))}
+            if not self._warned and np.median(d) > 2_000:
+                self._warned = True
+                log.warning(
+                    f"region tokenizer: {miss.sum():,}/{miss.size:,} ({miss.mean():.1%}) of these locations are "
+                    f"in cells never seen in training and were snapped to the nearest known region - a median of "
+                    f"{np.median(d) / 1000:.1f} km away (p95 {np.percentile(d, 95) / 1000:.1f} km, max "
+                    f"{d.max() / 1000:.1f} km). Location metrics for this model are bounded by that distance. "
+                    f"Check that the train and test splits cover the same area (`mobeval info` prints the "
+                    f"overlap), or widen the vocabulary with a larger `tokenizer.cell_m`.")
         return (out + self.offset).reshape(lat.shape)
 
     def token_latlon(self) -> np.ndarray:

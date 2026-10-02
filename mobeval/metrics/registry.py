@@ -36,6 +36,8 @@ _SPECS = [
     # --- location prediction on the SHARED grid ------------------------------
     _S("acc@1", "location", True, "fraction", "bounded", (0, 1)),
     _S("acc@5", "location", True, "fraction", "bounded", (0, 1)),
+    _S("acc@10", "location", True, "fraction", "bounded", (0, 1)),
+    _S("acc@20", "location", True, "fraction", "bounded", (0, 1)),
     _S("mrr@20", "location", True, "fraction", "bounded", (0, 1)),
     _S("loc_nll", "location", False, "nats", "difference", (0, INF), None, "mean", "NLL of true cell (eps-smoothed)"),
     _S("dist_err_m", "location", False, "m", "ratio", (0, INF), 50_000, "mean", "Top-1 location -> true visit"),
@@ -51,6 +53,12 @@ _SPECS = [
     _S("nll", "continuous", False, "nats", "difference", (-INF, INF), None, "mean", "NLL of value measured in minutes"),
     _S("pseudo_nll", "continuous", False, "nats", "difference", (-INF, INF), None, "mean",
        "Gaussian NLL, sigma fitted on VALIDATION residuals (point models only)"),
+    _S("mape", "continuous", False, "fraction", "ratio", (0, INF), 10, "mean",
+       "Mean absolute percentage error of the point forecast (TransferTraj's travel-time metric)"),
+    _S("p_within_5min", "continuous", True, "fraction", "bounded", (0, 1), None, "mean",
+       "TrajGPT's P(+-5 min): forecast mass within 5 min of the truth, truncated to [0, train p99]"),
+    _S("p_within_10min", "continuous", True, "fraction", "bounded", (0, 1), None, "mean", "TrajGPT's P(+-10 min)"),
+    _S("p_within_20min", "continuous", True, "fraction", "bounded", (0, 1), None, "mean", "TrajGPT's P(+-20 min)"),
     _S("coverage80", "continuous", True, "fraction", "none", (0, 1), None, "mean", "Ideal value 0.80"),
     _S("pit_ks", "continuous", False, "stat", "none", (0, 1), None, "mean", "KS distance of PIT from U(0,1)"),
     # --- classification -------------------------------------------------------

@@ -30,7 +30,15 @@ class TrainConfig:
     lr: float = 1e-4
     weight_decay: float = 0.01
     patience: int = 8                      # early stopping on validation loss (epochs)
-    grad_clip: float = 1.0
+    grad_clip: float = 1.0                 # 0 / None: no clipping
+    optimizer: str = "adamw"               # adamw | adam (L2-coupled weight decay, as torch.optim.Adam) | adafactor
+    scheduler: str = "plateau"             # plateau | step | none
+    step_size: int = 5                     # StepLR (scheduler: step)
+    step_gamma: float = 0.5
+    restore_best: bool = True              # False: keep the last epoch's weights (original TransferTraj)
+    drop_last: bool = True                 # drop the last incomplete training batch (the originals keep it)
+    plateau_factor: float = 0.5
+    plateau_patience: Optional[int] = None # default: max(1, patience // 3)
     max_steps_per_epoch: Optional[int] = None
     device: str = "auto"
     seed: int = 0
@@ -74,6 +82,18 @@ def minibatches(n: int, batch_size: int, shuffle: bool, rng: Optional[np.random.
         yield idx[s:s + batch_size]
 
 
+def make_optimizer(params, cfg: TrainConfig):
+    if cfg.optimizer == "adamw":
+        return torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    if cfg.optimizer == "adam":
+        return torch.optim.Adam(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    if cfg.optimizer == "adafactor":
+        # torch's defaults (lr 1e-2, relative-step decay), as TrajGPT's HEAD calls Adafactor(params)
+        # without arguments; `lr` is ignored so the default recipe cannot silently override it.
+        return torch.optim.Adafactor(params)
+    raise ValueError("optimizer must be 'adamw', 'adam' or 'adafactor'")
+
+
 def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarray, bool], torch.Tensor],
         cfg: TrainConfig, params: Optional[Iterable] = None, drop_last: bool = True,
         on_best: Optional[Callable[[List[dict]], None]] = None) -> List[dict]:
@@ -86,9 +106,16 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
     """
     set_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
-    opt = torch.optim.AdamW(params if params is not None else model.parameters(),
-                            lr=cfg.lr, weight_decay=cfg.weight_decay)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=max(1, cfg.patience // 3))
+    opt = make_optimizer(params if params is not None else model.parameters(), cfg)
+    if cfg.scheduler == "plateau":
+        pp = cfg.plateau_patience if cfg.plateau_patience is not None else max(1, cfg.patience // 3)
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=cfg.plateau_factor, patience=pp)
+    elif cfg.scheduler == "step":
+        sched = torch.optim.lr_scheduler.StepLR(opt, step_size=cfg.step_size, gamma=cfg.step_gamma)
+    elif cfg.scheduler == "none":
+        sched = None
+    else:
+        raise ValueError("scheduler must be 'plateau', 'step' or 'none'")
     best, best_state, bad, history = math.inf, None, 0, []
     rep = progress.get()
     who = getattr(rep, "scope", None) or "model"
@@ -96,7 +123,8 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         t0, tr_losses = time.time(), []
-        for step, idx in enumerate(minibatches(n_train, cfg.batch_size, True, rng, drop_last and n_train > cfg.batch_size)):
+        for step, idx in enumerate(minibatches(n_train, cfg.batch_size, True, rng,
+                                               drop_last and cfg.drop_last and n_train > cfg.batch_size)):
             if cfg.max_steps_per_epoch and step >= cfg.max_steps_per_epoch:
                 break
             loss = loss_fn(idx, True)
@@ -130,7 +158,10 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
                                                  f"  best {min(best, vl):.4g}")
         rep.event("epoch", model=who, epoch=epoch, epochs=cfg.epochs, train_loss=float(f"{tr:.6g}"),
                   val_loss=float(f"{vl:.6g}"), improved=improved, seconds=round(time.time() - t0, 1))
-        sched.step(vl)
+        if isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            sched.step(vl)
+        elif sched is not None:
+            sched.step()
         if vl < best - 1e-6:
             best, bad, best_state = vl, 0, copy.deepcopy(model.state_dict())
             if on_best is not None:
@@ -151,7 +182,7 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
                 rep.event("early_stop", model=who, epoch=epoch, best_val=best,
                           message=f"{who}: early stop at epoch {epoch} (best val {best:.4g})")
                 break
-    if best_state is not None:
+    if best_state is not None and cfg.restore_best:
         model.load_state_dict(best_state)
     model.eval()
     return history

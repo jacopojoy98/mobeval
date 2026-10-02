@@ -4,16 +4,18 @@ and emits ResultRecords with bootstrap CIs and paired skill-score CIs."""
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
 
 from . import baselines as B
+from . import progress
 from .adapters.base import (CONTINUOUS, EMBEDDING, GENERATION, MODE_CLASSIFICATION, NEXT_LOCATION, RECOVERY,
                             ContinuousPrediction, MobilityModelAdapter, TargetGuard)
 from .context import EvalContext
+from .paper_metrics import level_for as paper_level
 from .data import MobilityDataset, TrajectoryBatch, VisitBatch, detect_staypoints, make_mask
 from .geo import haversine_m
 from .metrics import generative as G
@@ -72,6 +74,18 @@ def _context_embeddings(adapter, ctx, reveal=()):
     return ctx.cache[key]
 
 
+def _no_visits(ctx, adapter, task) -> bool:
+    """Visit tasks need train and test visit sequences; say why they are missing instead of failing."""
+    missing = [k for k in ("train", "test") if not len(ctx.visits.get(k, ()) or ())]
+    if missing:
+        key = (_key(adapter), task, "no visit sequences in " + " and ".join(missing) +
+               " (too few staypoints for eval.visit_context?)")
+        if key not in ctx.skipped:
+            ctx.skipped.append(key)
+        return True
+    return False
+
+
 class Task:
     name = "task"
     capability = ""
@@ -103,7 +117,7 @@ class Task:
                 res = evaluate_with_ci(metric, per[metric], n_boot=cfg.n_boot, seed=seed, **kw)
             recs.append(ResultRecord(model=adapter.name, run_tag=adapter.run_tag, task=task, metric=metric, n=n,
                                      protocol=protocol, baseline=bname, eval_seed=seed, dataset=ctx.dataset_name,
-                                     **res))
+                                     paper_match=paper_level(adapter, task, metric, protocol, ctx), **res))
         # baselines themselves (once per task/seed/protocol)
         for bname, (bper, bset) in baselines.items():
             key = (task, seed, protocol, bname)
@@ -122,27 +136,56 @@ class Task:
         return recs
 
 
+    @staticmethod
+    def try_protocol(ctx, adapter, task_name, protocol, fn):
+        """Run one protocol's scoring, recording a failure instead of propagating it.
+
+        A model that cannot run one protocol must not lose the others. CLIPMobility's native
+        location head needs a ~450k-way output layer on a 500 m grid over a region (~20 GB once
+        its optimiser state and logits are counted); when that raised, the whole next_location
+        task failed for that model, and its linear-probe result - which costs nothing and would
+        have worked - was discarded with it.
+        """
+        try:
+            return fn()
+        except progress.Interrupted:
+            raise
+        except Exception as e:                                     # noqa: BLE001
+            import traceback
+            key = f"{adapter.name}@{adapter.run_tag}"
+            ctx.errors.append((key, f"{task_name}/{protocol}", repr(e), traceback.format_exc()))
+            log.error(f"[{key}] {task_name} ({protocol}) failed: {e!r} - other protocols still run")
+            progress.get().error(f"{key} {task_name}/{protocol}: {e!r}", model=adapter.name, task=task_name)
+            return None
+
+
 # =========================================================================== #
 class RecoveryTask(Task):
     name, capability = "recovery", RECOVERY
 
     def run(self, adapter, ctx):
         batch, cfg, recs = ctx.windows["test"], ctx.cfg, []
-        for kind in cfg.recovery_kinds:
-            for ratio in cfg.recovery_ratios:
-                for seed in cfg.eval_seeds:
-                    mask = make_mask(len(batch), batch.length, ratio, kind, seed)
-                    hidden = TargetGuard.hide_masked(batch, mask)
-                    with ctx.timed(_key(adapter), self.capability, len(batch)):
-                        plat, plon = adapter.reconstruct(hidden, mask)
-                    score = lambda la, lo: (recovery_metrics(la, lo, batch.lat, batch.lon, mask, ctx.grid,
-                                                             cfg.recovery_dtw), {})
-                    ck = ("recovery_baselines", kind, ratio, seed)
-                    if ck not in ctx.cache:
-                        ctx.cache[ck] = {"linear_interp": score(*B.linear_interpolation(hidden, mask)),
-                                         "last_observed": score(*B.last_observed(hidden, mask))}
-                    recs += self.emit(ctx, adapter, f"recovery/{kind}@{ratio:g}", len(batch), score(plat, plon),
-                                      ctx.cache[ck], ["linear_interp"], seed)
+        runs = [(k, r, f"recovery/{k}@{r:g}") for k in cfg.recovery_kinds for r in cfg.recovery_ratios]
+        runs += [(k, r, f"recovery/{k}:{r:g}") for k, r in (cfg.recovery_schemes or ())]
+        for kind, ratio, task in runs:
+            # A seed only changes random/block masks; the fixed schemes are scored once.
+            seeds = cfg.eval_seeds if kind in ("random", "block") else cfg.eval_seeds[:1]
+            for seed in seeds:
+                mask = make_mask(len(batch), batch.length, ratio, kind, seed, cfg.recovery_keep_endpoints)
+                hidden = TargetGuard.hide_masked(batch, mask)
+                with ctx.timed(_key(adapter), self.capability, len(batch)):
+                    plat, plon = adapter.reconstruct(hidden, mask)
+                score = lambda la, lo, m=mask: (recovery_metrics(la, lo, batch.lat, batch.lon, m, ctx.grid,
+                                                                 cfg.recovery_dtw), {})
+                ck = ("recovery_baselines", kind, ratio, seed)
+                if ck not in ctx.cache:
+                    base = {"linear_interp": score(*B.linear_interpolation(hidden, mask)),
+                            "last_observed": score(*B.last_observed(hidden, mask))}
+                    if kind == "last":        # interpolation cannot extrapolate: add dead reckoning
+                        base["constant_velocity"] = score(*B.constant_velocity(hidden, mask))
+                    ctx.cache[ck] = base
+                skill = ["constant_velocity"] if kind == "last" else ["linear_interp"]
+                recs += self.emit(ctx, adapter, task, len(batch), score(plat, plon), ctx.cache[ck], skill, seed)
         return recs
 
 
@@ -170,12 +213,65 @@ class NextLocationTask(Task):
 
     @staticmethod
     def _score(p, top1_latlon, v, ranked: bool) -> Scores:
-        rm = ranking_metrics(p, v.tgt_cell)
+        rm = ranking_metrics(p, v.tgt_cell, ks=(1, 5, 10, 20))     # 10 and 20: TrajGPT's Acc@k
         if not ranked:                                  # point predictor: top-k / NLL undefined
             rm = {"acc@1": rm["acc@1"]}
         d = haversine_m(top1_latlon[:, 0], top1_latlon[:, 1], v.tgt_lat, v.tgt_lon)
         rm.update({"dist_err_m": d, "median_dist_err_m": d, "acc_1km": (d <= 1000).astype(float)})
         return rm, {}
+
+    # A dense (n, n_cells) score matrix is 18 GB for 5,000 samples on a 500 m grid covering a
+    # region - more than a whole job's memory allowance, and the pipeline builds one per model
+    # and one per baseline. Every location metric is per-sample, so scoring in chunks is exact:
+    # the peak drops by the chunking factor and the numbers do not move at all.
+    SCORE_CHUNK = 512
+
+    @classmethod
+    def _score_chunked(cls, prob_fn, v, grid, ranked: bool, top1=None) -> Scores:
+        """Score in chunks. `prob_fn(sub_batch, idx) -> (len(idx), n_cells)`.
+
+        `top1` is the per-sample predicted (lat, lon) when the predictor has its own notion of
+        a best location (a token centroid); otherwise the argmax cell centroid is used.
+        """
+        parts: Dict[str, List[np.ndarray]] = {}
+        for s in range(0, len(v), cls.SCORE_CHUNK):
+            idx = np.arange(s, min(s + cls.SCORE_CHUNK, len(v)))
+            sub = v.take(idx)
+            p = prob_fn(sub, idx)
+            best = top1[idx] if top1 is not None else np.column_stack(grid.centroid(p.argmax(1)))
+            for k, arr in cls._score(p, best, sub, ranked)[0].items():
+                parts.setdefault(k, []).append(arr)
+            del p
+        return {k: np.concatenate(vs) for k, vs in parts.items()}, {}
+
+    @classmethod
+    def _model_scores(cls, pred, v, grid) -> Scores:
+        """Score a LocationPrediction without ever holding a full-grid matrix for every sample.
+
+        `token_scores` and `latlon` are compact per-sample forms that only become huge once
+        mapped onto the shared grid, so that mapping is done a chunk at a time. `grid_scores` is
+        already dense when the adapter hands it over, so there is nothing left to save there.
+        """
+        if pred.grid_scores is not None:
+            p = normalise_probs(pred.grid_scores)
+            return cls._score(p, np.column_stack(grid.centroid(p.argmax(1))), v, True)
+        if pred.token_scores is not None:
+            pt = normalise_probs(pred.token_scores)
+            tl = np.asarray(pred.token_latlon, float)
+            cells = grid.cell_of(tl[:, 0], tl[:, 1])
+            M = sparse.csr_matrix((np.ones(len(cells)), (np.arange(len(cells)), cells)),
+                                  shape=(len(cells), grid.n_cells))
+            # top-1 comes from the model's own vocabulary, which is finer than the shared grid
+            return cls._score_chunked(lambda sub, idx: np.asarray((M.T @ pt[idx].T).T), v, grid,
+                                      True, top1=tl[pt.argmax(1)])
+        ll = np.asarray(pred.latlon, float)
+
+        def point_probs(sub, idx):
+            p = np.zeros((len(idx), grid.n_cells))
+            p[np.arange(len(idx)), grid.cell_of(ll[idx, 0], ll[idx, 1])] = 1.0
+            return p
+
+        return cls._score_chunked(point_probs, v, grid, False, top1=ll)
 
     def applicable(self, adapter):
         return bool({NEXT_LOCATION, EMBEDDING} & adapter.capabilities)
@@ -192,7 +288,7 @@ class NextLocationTask(Task):
                                              top_k=cfg.probe_top_k, seed=cfg.eval_seeds[0],
                                              device=str(getattr(adapter, "device", "auto")),
                                              max_train=cfg.probe_max_train)
-        rm = candidate_ranking_metrics(probs, cand, v.tgt_cell, counts)
+        rm = candidate_ranking_metrics(probs, cand, v.tgt_cell, counts, ks=(1, 5, 10, 20))
         # Reported, not just logged: acc@1 cannot exceed this, so a reader needs it next to the
         # number rather than buried in a job log they may never see.
         rm["probe_coverage"] = rm.pop("_coverage")
@@ -205,6 +301,8 @@ class NextLocationTask(Task):
         return rm, {}
 
     def run(self, adapter, ctx):
+        if _no_visits(ctx, adapter, self.name):
+            return []
         v, grid, recs = ctx.visits["test"], ctx.grid, []
         seed = ctx.cfg.eval_seeds[0]                   # deterministic task: one pass
         if "loc_baselines" not in ctx.cache:
@@ -212,19 +310,24 @@ class NextLocationTask(Task):
             ctx.cache["loc_baselines"] = {}
             for bn, fn in [("markov1", lb.markov1), ("user_frequent", lb.user_frequent),
                            ("global_popular", lb.global_popular)]:
-                bp = fn(v)
-                ctx.cache["loc_baselines"][bn] = self._score(bp, np.column_stack(grid.centroid(bp.argmax(1))), v, True)
+                # chunked: each of these would otherwise build its own full-grid score matrix
+                ctx.cache["loc_baselines"][bn] = self._score_chunked(
+                    lambda sub, idx, _f=fn: _f(sub), v, grid, True)
         for protocol in ctx.cfg.location_protocols:
             if protocol == "native" and NEXT_LOCATION in adapter.capabilities:
-                adapter.prepare(self.name, ctx.visits.get("train"), ctx.visits.get("val"))
-                with ctx.timed(_key(adapter), self.capability, len(v)):
-                    pred = adapter.predict_location(TargetGuard.hide_visits(v), grid)
-                pred.check()
-                p, top1, ranked = self._grid_probs(pred, grid, len(v))
-                scores = self._score(p, top1, v, ranked)
+                def _native():
+                    adapter.prepare(self.name, ctx.visits.get("train"), ctx.visits.get("val"))
+                    with ctx.timed(_key(adapter), self.capability, len(v)):
+                        pred = adapter.predict_location(TargetGuard.hide_visits(v), grid)
+                    pred.check()
+                    return self._model_scores(pred, v, grid)
+                scores = self.try_protocol(ctx, adapter, self.name, protocol, _native)
             elif protocol == "linear_probe" and EMBEDDING in adapter.capabilities:
-                scores = self._probe_score(adapter, ctx, v, grid)
+                scores = self.try_protocol(ctx, adapter, self.name, protocol,
+                                           lambda: self._probe_score(adapter, ctx, v, grid))
             else:
+                continue
+            if scores is None:                      # this protocol failed; the others still run
                 continue
             task = "next_location" if protocol == "native" else f"next_location/{protocol}"
             recs += self.emit(ctx, adapter, task, len(v), scores, ctx.cache["loc_baselines"],
@@ -301,29 +404,49 @@ class ContinuousValueTask(Task):
             ev, yv = feats["val"][okv], yval[okv]
         return continuous_probe(feats["train"][ok], ytr[ok], feats["test"], ev, yv)
 
+    # TrajGPT's factorisation p(region) p(travel | region) p(duration | region, travel): travel time
+    # given the next visit's location, duration given its location and arrival. (The released code's
+    # heads instead read the target's own arrival/departure - a leak an honest evaluation cannot
+    # reproduce; see MODELS.md and paper_metrics.py.)
+    PAPER_REVEAL = {"travel_time": ("location",), "duration": ("location", "arrival")}
+
     def run(self, adapter, ctx):
+        if _no_visits(ctx, adapter, self.name):
+            return []
+        cfg, recs = ctx.cfg, []
+        reveals = [tuple(cfg.continuous_reveal.get(self.target, ()))]
+        if cfg.continuous_paper_conditioning and self.PAPER_REVEAL[self.target] not in reveals:
+            reveals.append(self.PAPER_REVEAL[self.target])
+        for reveal in reveals:
+            recs += self._run(adapter, ctx, reveal)
+        return recs
+
+    def _run(self, adapter, ctx, reveal):
         cfg, v, recs = ctx.cfg, ctx.visits["test"], []
-        reveal = tuple(cfg.continuous_reveal.get(self.target, ()))
         keep = self._valid(self._y(v), cfg)
         seed, y = cfg.eval_seeds[0], self._y(v)
+        ytr_all = self._y(ctx.visits["train"])
+        # TrajGPT's P(+-t) truncates every forecast to [0, max]; the original takes max as the 99th
+        # percentile of ALL splits, which reads the test data. The TRAIN percentile is used here.
+        upper = float(np.nanpercentile(ytr_all[self._valid(ytr_all, cfg)], 99))
         ck = ("cont_baselines", self.target, reveal)
         if ck not in ctx.cache:
-            ytr = self._y(ctx.visits["train"])
+            ytr = ytr_all
             cb = B.ContinuousBaselines(ytr[self._valid(ytr, cfg)], seed=seed)
             n = int(keep.sum())
-            prob = continuous_metrics(y[keep], None, cb.mixture(n))
+            prob = continuous_metrics(y[keep], None, cb.mixture(n), support_max=upper)
             pt = continuous_metrics(y[keep], cb.point(n))
-            prob["mae_min"], prob["rmse_min"] = pt["mae_min"], pt["rmse_min"]   # median is the MAE-optimal point
+            prob["mae_min"], prob["rmse_min"], prob["mape"] = pt["mae_min"], pt["rmse_min"], pt["mape"]
             ctx.cache[ck] = {"train_marginal": self._with_pit(prob)}
         for protocol in cfg.continuous_protocols:
-            sigma, samples = None, None
-            if protocol == "native" and CONTINUOUS in adapter.capabilities:
+            def _native():
+                """-> (point, mixture, samples, sigma) from the model's own head."""
                 adapter.prepare(self.name, ctx.visits.get("train"), ctx.visits.get("val"))
                 with ctx.timed(_key(adapter), f"{self.capability}/{self.target}", len(v)):
                     pred = adapter.predict_continuous(TargetGuard.hide_visits(v, reveal), self.target)
-                point, mix, samples = self._to_minutes(pred)
-                vv = ctx.visits.get("val")
-                if mix is None and samples is None and vv is not None and len(vv):
+                pt, mx, sm = self._to_minutes(pred)
+                sg, vv = None, ctx.visits.get("val")
+                if mx is None and sm is None and vv is not None and len(vv):
                     # point model: sigma from VALIDATION residuals. `.get` because a split can
                     # legitimately yield no visit sequences, and a KeyError here would take down
                     # the whole continuous task rather than just the predictive spread.
@@ -331,17 +454,25 @@ class ContinuousValueTask(Task):
                     okv = self._valid(self._y(vv), cfg)
                     resid = (self._y(vv) - np.asarray(vp) / 60.0)[okv]
                     s = float(np.std(resid)) if resid.size > 1 else 0.0
-                    sigma = s if np.isfinite(s) and s > 0 else 1.0
+                    sg = s if np.isfinite(s) and s > 0 else 1.0
+                return pt, mx, sm, sg
+
+            if protocol == "native" and CONTINUOUS in adapter.capabilities:
+                got = self.try_protocol(ctx, adapter, self.name, protocol, _native)
             elif protocol == "linear_probe" and EMBEDDING in adapter.capabilities:
-                point, mix = self._probe(adapter, ctx, reveal)
+                got = self.try_protocol(ctx, adapter, self.name, protocol,
+                                        lambda: (*self._probe(adapter, ctx, reveal), None, None))
             else:
                 continue
+            if got is None:                         # this protocol failed; the others still run
+                continue
+            point, mix, samples, sigma = got
             sel = lambda a: None if a is None else a[keep]
             m = mix
             if m is not None:
                 from .metrics.probabilistic import Mixture
                 m = Mixture(m.weights[keep], m.means[keep], m.stds[keep], m.space)
-            model = self._with_pit(continuous_metrics(y[keep], sel(point), m, sel(samples), sigma))
+            model = self._with_pit(continuous_metrics(y[keep], sel(point), m, sel(samples), sigma, upper))
             task = self.name + (f"/{protocol}" if protocol != "native" else "")
             task += f"|given:{'+'.join(reveal)}" if reveal else ""
             if self.target == "travel_time" and cfg.travel_time_max_h is not None:
@@ -421,11 +552,42 @@ class ModeClassificationTask(Task):
 class GenerationTask(Task):
     name, capability = "generation", GENERATION
 
-    def _stats(self, ctx, ds, generated: bool = False):
+    def applicable(self, adapter):
+        # A reconstruction model can be rolled out into a generator (see mobeval.rollout), so
+        # it belongs here too - under its own protocol, never mixed with a native generator.
+        return bool({GENERATION, RECOVERY} & adapter.capabilities)
+
+    def _generate(self, adapter, ctx, protocol, n, seed):
+        """-> (generated dataset, extra baselines for this protocol)."""
+        cfg = ctx.cfg
+        if protocol == "native":
+            adapter.reference_staypoints = ctx.staypoints["train"]
+            with ctx.timed(_key(adapter), self.capability, n):
+                return adapter.generate(ctx.splits["train"], n, seed), {}
+        from .rollout import masked_rollout, seed_only
+        kw = dict(seed_points=cfg.rollout_seed_points, block=cfg.rollout_block,
+                  window=cfg.window_length, noise_m=cfg.rollout_noise_m, max_len=cfg.rollout_max_len)
+        with ctx.timed(_key(adapter), RECOVERY, n):
+            gen = masked_rollout(adapter, ctx.splits["train"], n, seed, **kw)
+        # The seed prefix is real data and already fixes much of a trajectory's statistics.
+        # This control keeps the same prefix and generates nothing after it, so a model that
+        # does not beat it has added nothing of its own.
+        ck = ("gen_seed_only", seed)
+        if ck not in ctx.cache:
+            ctx.cache[ck] = self._stats(ctx, seed_only(ctx.splits["train"], n, seed,
+                                                       seed_points=cfg.rollout_seed_points,
+                                                       max_len=cfg.rollout_max_len), generated=True)
+        return gen, {"seed_only": ctx.cache[ck]}
+
+    def _stats(self, ctx, ds, generated: bool = False, split: Optional[str] = None):
         # generators emit dwell points (e.g. arrival + departure per visit), so generated data always uses
         # point-based detection per trajectory; real data uses the configured method
-        sp = (detect_staypoints(ds, ctx.cfg.staypoint_dist_m, ctx.cfg.staypoint_time_s, by_trajectory=True)
-              if generated else ctx.detect_staypoints(ds))
+        if generated:
+            sp = detect_staypoints(ds, ctx.cfg.staypoint_dist_m, ctx.cfg.staypoint_time_s, by_trajectory=True)
+        elif split is not None and split in ctx.staypoints:
+            sp = ctx.staypoints[split]          # already computed for this split; do not redo it
+        else:
+            sp = ctx.detect_staypoints(ds)
         return G.trajectory_stats(ds.points, sp, ctx.grid)
 
     def run(self, adapter, ctx):
@@ -433,16 +595,32 @@ class GenerationTask(Task):
         test = ctx.splits["test"]
         n = min(test.points.traj_id.nunique(), cfg.generation_max_trajectories)
         if "gen_real" not in ctx.cache:
-            ctx.cache["gen_real"] = self._stats(ctx, test)
+            # The real reference distribution. Capped: these are per-trajectory statistics whose
+            # distribution is estimated fine from tens of thousands of trajectories, and the
+            # uncapped groupby over a multi-million-trajectory panel is what the job dies on.
+            real_pts = G.sample_trajectories(test.points, cfg.generation_max_real_trajectories, cfg.split_seed)
+            capped = len(real_pts) < len(test.points)
+            if capped:
+                log.info(f"generation: using {real_pts.traj_id.nunique():,} of "
+                         f"{test.points.traj_id.nunique():,} test trajectories for the reference "
+                         f"statistics (eval.generation_max_real_trajectories)")
+            ctx.cache["gen_real"] = self._stats(ctx, MobilityDataset(real_pts, "real"),
+                                                split=None if capped else "test")
             # real-vs-real noise floor: n REAL train trajectories, same sample size as the generator's output
             tr = ctx.splits["train"].points
             ids = np.random.default_rng(cfg.split_seed).choice(tr.traj_id.unique(), n, replace=False)
             ctx.cache["gen_floor"] = self._stats(ctx, MobilityDataset(tr[tr.traj_id.isin(ids)], "floor"))
         real, floor = ctx.cache["gen_real"], ctx.cache["gen_floor"]
-        for seed in cfg.eval_seeds:
-            adapter.reference_staypoints = ctx.staypoints["train"]
-            with ctx.timed(_key(adapter), self.capability, n):
-                gen_ds = adapter.generate(ctx.splits["train"], n, seed)
+        protocols = [p for p in cfg.generation_protocols
+                     if (p == "native" and GENERATION in adapter.capabilities)
+                     or (p == "rollout" and RECOVERY in adapter.capabilities
+                         and GENERATION not in adapter.capabilities)]
+        for protocol, seed in [(p, s) for p in protocols for s in cfg.eval_seeds]:
+            got = self.try_protocol(ctx, adapter, self.name, protocol,
+                                    lambda p=protocol, s=seed: self._generate(adapter, ctx, p, n, s))
+            if got is None:
+                continue
+            gen_ds, extra = got
             gen = self._stats(ctx, gen_ds, generated=True)
             lk = ("gen_lower", seed)
             if lk not in ctx.cache:
@@ -462,17 +640,24 @@ class GenerationTask(Task):
                     recs.append(ResultRecord(
                         model=adapter.name, run_tag=adapter.run_tag, task=f"generation/{stat}",
                         metric=f"{metric}:{stat}", value=mv[metric], ci_low=lo, ci_high=hi, n=len(g),
-                        baseline="uniform_bbox", baseline_value=lv.get(metric),
+                        baseline="uniform_bbox", baseline_value=lv.get(metric), protocol=protocol,
                         skill=skill_score(metric, mv[metric], lv.get(metric), fv.get(metric)),
                         eval_seed=seed, dataset=ctx.dataset_name))
-                    fk = ("gen_ref_emitted", stat, metric)
+                    # keyed by PROTOCOL too: the rollout rows need their own baseline rows, and
+                    # the seed-only control only exists for that protocol
+                    fk = ("gen_ref_emitted", protocol, stat, metric)
                     if fk not in ctx.emitted_baselines and seed == cfg.eval_seeds[0]:
                         ctx.emitted_baselines.add(fk)
-                        for nm, val in (("real_noise_floor", fv), ("uniform_bbox", lv)):
+                        refs = [("real_noise_floor", fv), ("uniform_bbox", lv)]
+                        for nm, st in extra.items():
+                            if stat in st:
+                                refs.append((nm, G.compare_stat(r, st[stat].to_numpy(float), bins)))
+                        for nm, val in refs:
                             if metric in val:
                                 recs.append(ResultRecord(model=f"baseline:{nm}", run_tag="-",
                                                          task=f"generation/{stat}", metric=f"{metric}:{stat}",
-                                                         value=val[metric], eval_seed=seed, dataset=ctx.dataset_name))
+                                                         value=val[metric], eval_seed=seed, protocol=protocol,
+                                                         dataset=ctx.dataset_name))
             # `_cells` exists only when staypoints were detected, which is not guaranteed for the
             # BASELINES either: the uniform-bbox generator scatters points at random, so on data
             # where stays are inferred from trip gaps it can produce none at all. Guarding only
@@ -488,26 +673,30 @@ class GenerationTask(Task):
                     log.warning(f"{adapter.name}: no staypoints detected in the uniform-bbox baseline's output, "
                                 f"so visited_cells has no baseline to compare against (skill omitted)")
                 recs.append(ResultRecord(model=adapter.name, run_tag=adapter.run_tag, task="generation/visited_cells",
-                                         metric="jsd:visited_cells", value=v,
+                                         metric="jsd:visited_cells", value=v, protocol=protocol,
                                          baseline="uniform_bbox" if b is not None else None,
                                          baseline_value=b,
                                          skill=None if b is None else skill_score("jsd", v, b, f),
                                          eval_seed=seed, dataset=ctx.dataset_name))
             # memorisation check: distributional metrics cannot tell a copier from a good model
             trp = ctx.splits["train"].points
+            nn_kw = {"max_train": cfg.generation_nn_max_train, "max_query": cfg.generation_nn_max_query,
+                     "seed": cfg.split_seed}
             if "gen_nn_ref" not in ctx.cache:
-                ctx.cache["gen_nn_ref"] = np.percentile(G.nearest_train_distance(test.points, trp, seed=cfg.split_seed), 5)
-            nn = G.nearest_train_distance(gen_ds.points, trp, seed=cfg.split_seed)
+                ctx.cache["gen_nn_ref"] = np.percentile(G.nearest_train_distance(test.points, trp, **nn_kw), 5)
+            # the generated set is already small, so it is compared in full
+            nn = G.nearest_train_distance(gen_ds.points, trp, **{**nn_kw, "max_query": None})
             thr = ctx.cache["gen_nn_ref"]
             for metric, vals in (("copy_rate", (nn < thr).astype(float)), ("nn_train_dist_m", nn)):
                 res = evaluate_with_ci(metric, vals, n_boot=min(cfg.n_boot, 200), seed=seed)
                 recs.append(ResultRecord(model=adapter.name, run_tag=adapter.run_tag, task="generation/memorisation",
-                                         metric=metric, n=len(nn), eval_seed=seed, dataset=ctx.dataset_name, **res))
+                                         metric=metric, n=len(nn), eval_seed=seed, protocol=protocol,
+                                         dataset=ctx.dataset_name, **res))
             rho = G.paired_spearman(real["radius_of_gyration"], gen["radius_of_gyration"])
             if rho is not None:
                 recs.append(ResultRecord(model=adapter.name, run_tag=adapter.run_tag, task="generation/radius_of_gyration",
                                          metric="spearman_paired:radius_of_gyration", value=rho, eval_seed=seed,
-                                         dataset=ctx.dataset_name))
+                                         protocol=protocol, dataset=ctx.dataset_name))
         return recs
 
 
@@ -720,7 +909,18 @@ class EfficiencyTask(Task):
         return recs
 
 
+TASK_NAMES = ("recovery", "next_location", "continuous", "mode_classification", "generation",
+              "user_identification", "anomaly_detection", "efficiency")
+VISIT_TASKS = {"next_location", "continuous", "generation"}      # need staypoints / visit sequences
+
+
 def default_tasks(cfg) -> List[Task]:
-    return ([RecoveryTask(), NextLocationTask()] + [ContinuousValueTask(t) for t in cfg.continuous_targets]
-            + [ModeClassificationTask(), GenerationTask(), UserIdentificationTask(),
-               AnomalyDetectionTask(), EfficiencyTask()])
+    tasks = ([RecoveryTask(), NextLocationTask()] + [ContinuousValueTask(t) for t in cfg.continuous_targets]
+             + [ModeClassificationTask(), GenerationTask(), UserIdentificationTask(),
+                AnomalyDetectionTask(), EfficiencyTask()])
+    if cfg.tasks is None:
+        return tasks
+    unknown = set(cfg.tasks) - set(TASK_NAMES)
+    if unknown:
+        raise ValueError(f"unknown tasks {sorted(unknown)}; known: {', '.join(TASK_NAMES)}")
+    return [t for t in tasks if t.name.split("/")[0] in set(cfg.tasks)]

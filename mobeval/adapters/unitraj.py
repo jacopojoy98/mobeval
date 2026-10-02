@@ -110,9 +110,21 @@ class UniTrajAdapter(TorchAdapter):
     @classmethod
     def pretrain(cls, ctx, train: Optional[dict] = None, out: Optional[str] = None, init_from: Optional[str] = None,
                  arch: Optional[dict] = None, mask_ratio: float = 0.5, block_prob: float = 0.3,
-                 fit_norm: Optional[bool] = None, **kw) -> "UniTrajAdapter":
-        """Masked-reconstruction pre-training on ctx.windows['train'], early stopping on 'val'.
-        With `init_from`, continues from existing weights and keeps their normalisation."""
+                 fit_norm: Optional[bool] = None, sampling: str = "mobeval", sample_unit: str = "window",
+                 mask_mix: Optional[dict] = None, mask_endpoints: bool = True, resample: str = "none",
+                 fixed_hidden_count: bool = True, offset_from: str = "first", loss_norm: str = "original",
+                 rdp_epsilon: float = 1e-4, min_points: int = 36, max_points: Optional[int] = None,
+                 **kw) -> "UniTrajAdapter":
+        """Masked-reconstruction pre-training, early stopping on 'val'.
+        With `init_from`, continues from existing weights and keeps their normalisation.
+
+        sampling="mobeval" (default): windows from ctx.windows, random or single-block masks
+        (`block_prob`), endpoints kept, padding always hidden.
+        sampling="original": UniTraj's own sample construction (nn/unitraj_sampling.py), controlled by
+        sample_unit ("window" | "trajectory" = whole trips of min_points..max_points points), resample
+        ("atr" | "none"), mask_mix (strategy -> probability), mask_endpoints, fixed_hidden_count,
+        offset_from ("first" | "first_visible"), loss_norm ("original" | "masked_mean") and rdp_epsilon.
+        Use `recipe: paper` / `recipe: code` in the config rather than setting these by hand."""
         import torch
         from ..nn.common import TrainConfig
         from ..nn.common import fit as fit_loop
@@ -129,6 +141,12 @@ class UniTrajAdapter(TorchAdapter):
             log.info(f"fitted normalisation on train windows: {ad.norm}")
         rng = np.random.default_rng(cfg.seed)
         L = tr.length
+        if sampling == "original":
+            return cls._pretrain_original(ad, ctx, cfg, out, init_from, rng, mask_ratio, sample_unit, mask_mix,
+                                          mask_endpoints, resample, fixed_hidden_count, offset_from, loss_norm,
+                                          rdp_epsilon, min_points, max_points)
+        if sampling != "mobeval":
+            raise ValueError("sampling must be 'mobeval' or 'original'")
 
         def masks(n):
             m = make_mask(n, L, mask_ratio, "random", int(rng.integers(1 << 31)))
@@ -151,6 +169,52 @@ class UniTrajAdapter(TorchAdapter):
         ad.provenance = ctx.provenance(init_from=init_from)
         ad.net.train()
         history = fit_loop(ad.net, len(tr), len(va), loss_fn, cfg, on_best=ad.epoch_checkpointer(out))
+        ad.invalidate_cache()
+        if out:
+            ad.save(out, history)
+        return ad
+
+    @classmethod
+    def _pretrain_original(cls, ad, ctx, cfg, out, init_from, rng, mask_ratio, sample_unit, mask_mix,
+                           mask_endpoints, resample, fixed_hidden_count, offset_from, loss_norm, rdp_epsilon,
+                           min_points, max_points):
+        import torch
+        from ..nn import unitraj_sampling as us
+        from ..nn.common import fit as fit_loop
+        Lm = ad.arch["trajectory_length"]
+        if sample_unit == "trajectory":
+            gap = getattr(ctx.cfg, "max_gap_s", None)
+            data = {s: us.trajectories(ctx.splits[s], min_points, max_points, gap) for s in ("train", "val")}
+        elif sample_unit == "window":
+            data = {s: [(w.lat[i], w.lon[i], w.t[i]) for i in range(len(w))]
+                    for s, w in (("train", ctx.windows["train"]), ("val", ctx.windows["val"]))}
+        else:
+            raise ValueError("sample_unit must be 'window' or 'trajectory'")
+        if not data["train"] or not data["val"]:
+            raise ValueError(f"no {sample_unit}s with >= {min_points} points for UniTraj's original sampling")
+        log.info(f"UniTraj original sampling: {len(data['train']):,} train / {len(data['val']):,} val "
+                 f"{sample_unit.replace('trajectory', 'trajectorie')}s, resample={resample}, mask mix={mask_mix or us.ORIGINAL_MIX}, "
+                 f"endpoints {'maskable' if mask_endpoints else 'kept'}, "
+                 f"{'fixed' if fixed_hidden_count else 'per-window'} hidden count")
+
+        def loss_fn(idx, training):
+            src = data["train" if training else "val"]
+            g = rng if training else np.random.default_rng(int(idx[0]))      # stable validation masks
+            x, x_true, iv, hid, tgt = us.build_batch([src[i] for i in idx], g, Lm, ad.norm, mask_ratio, mask_mix,
+                                                     resample, mask_endpoints, fixed_hidden_count, offset_from,
+                                                     rdp_epsilon)
+            T = lambda a: torch.as_tensor(a, device=ad.device)
+            pred, _ = ad.net(T(x), T(iv), hid, g)
+            sq = (pred - T(x_true)) ** 2
+            tm = T(tgt)
+            if loss_norm == "original":          # mean over (B, 2, Lm) of masked real errors, / 0.5
+                return (sq * tm.unsqueeze(1)).mean() / 0.5
+            return sq.sum(1)[tm].mean()
+
+        ad.provenance = ctx.provenance(init_from=init_from)
+        ad.net.train()
+        history = fit_loop(ad.net, len(data["train"]), len(data["val"]), loss_fn, cfg,
+                           on_best=ad.epoch_checkpointer(out))
         ad.invalidate_cache()
         if out:
             ad.save(out, history)

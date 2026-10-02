@@ -128,6 +128,44 @@ Two details worth knowing:
   the spread fitted on the *validation* residuals, so CRPS, NLL and PIT are all defined and
   comparable with the native heads.
 
+### Generation by rollout
+
+A reconstruction model has no `generate` method, but hiding **the future** rather than a random
+subset turns filling-in into generation: seed it with the first few real points of a trajectory,
+have it fill the rest, feed its own output back, continue. UniTraj, TransferTraj and
+CLIP-Mobility are all evaluated on generation this way, under `protocol: rollout`, never mixed
+with a native generator's numbers.
+
+```yaml
+eval:
+  generation_protocols: [native, rollout]
+  rollout_seed_points: 4       # real points the model is seeded with
+  rollout_block: 8             # points committed per step before re-feeding
+  rollout_noise_m: null        # optional; see the caveat below
+```
+
+Two things make the numbers mean something:
+
+* **Comparability.** The metrics compare per-trajectory statistics against *real trajectories*,
+  so generating fixed-length windows would compare 64-point fragments with whole trips and every
+  model would look wrong for a reason unrelated to the model. The rollout reproduces each seed
+  trajectory's own length and its own timestamps, sliding the model's fixed window forward, so a
+  generated trajectory is the same kind of object as a real one.
+* **Attribution.** The seed prefix is real data and already fixes much of a trajectory's
+  statistics, so `seed_only` — the same prefix, then standing still — is reported as a baseline
+  for this protocol. A model that does not beat it has added nothing to the seed it was given.
+
+Two caveats worth carrying into a write-up. A model trained with a squared error predicts a
+conditional **mean**, not a sample, so its rollouts are smoother and shorter than real
+trajectories and the distributional metrics charge it for that; measured on synthetic data, the
+radius-of-gyration spread came out ~3× narrower than the real one. `rollout_noise_m` injects
+calibrated noise if you want to correct the marginal spread, and is off by default because the
+right scale is a modelling choice rather than something the pipeline should pick. And rolling
+forward is pure **extrapolation** — every hidden position follows the last visible one — which
+some reconstruction models handle badly; positions that run outside twice the data's extent are
+clipped and the count is logged, so "the decoder diverged" stays distinguishable from "the model
+generates poorly".
+
 ## Representation-level tasks
 
 Two tasks score the embedding itself rather than a prediction head. Both are applicable to any
@@ -198,6 +236,53 @@ space). Beating chance on `teleport` means nothing — `max_step` gets 1.0 there
 *below* 0.5 is also informative: it means the model finds the corrupted windows easier than
 normal ones, which is what happens when a retraced route is more predictable than a real one.
 
+## Checking that train and test cover the same places
+
+`mobeval info` now prints a split-overlap line, and it is worth reading before any location
+metric:
+
+```
+  overlap: 94.2% of test staypoints are in cells seen in train (48,113 train cells,
+           31,904 test cells); 86.1% of test users appear in train
+```
+
+Low overlap is not a subtle problem. A model cannot predict a cell it has never seen, and
+TrajGPT's region tokenizer will silently **snap** such a target onto its nearest known
+region — which may be a hundred kilometres away — so its distance errors are bounded from
+below by that snap distance and no amount of training will fix it. When the median snap
+exceeds 2 km the tokenizer now says so directly:
+
+```
+region tokenizer: 4,812/5,000 (96.2%) of these locations are in cells never seen in training
+and were snapped to the nearest known region - a median of 131.4 km away (p95 166.0 km).
+Location metrics for this model are bounded by that distance.
+```
+
+If you see that, check the split before trusting anything in the Location table. Widening
+`tokenizer.cell_m` enlarges each region but does not help when the test area simply is not in
+the training data.
+
+## If the job is killed (exit 137)
+
+`Killed` with no traceback is the memory limit, not a crash — the process is SIGKILLed, so
+nothing is raised in Python and nothing reaches the progress file. The job scripts now print
+what to do; the settings that actually drive peak memory are:
+
+| setting | why it matters |
+|---|---|
+| `max_eval_samples` | location scoring holds a (samples × grid cells) score matrix per chunk |
+| `grid_cell_m` | a **larger** cell means far fewer cells — halving the resolution quarters the matrix |
+| `generation_max_real_trajectories` | trajectories behind the generation reference statistics |
+| `generation_nn_max_train` / `_max_query` | size of the memorisation comparison |
+
+Two things used to dominate and no longer do. The location task scores in chunks of 512
+samples (`NextLocationTask.SCORE_CHUNK`), which is exact — every location metric is per-sample,
+and the chunked and unchunked numbers are bit-identical — and takes the peak from 18 GB to
+1.9 GB on a 450k-cell grid with 5,000 samples. The generation task used to resample *every*
+trajectory in the panel before discarding all but a few thousand, and sized its pairwise
+comparison by the full test-set count; both sides are now subsampled first, so its cost no
+longer grows with the dataset.
+
 ## Training is always on the evaluation split
 
 `train` builds the same `EvalContext` as `evaluate` and trains only on its `train` split, with early
@@ -216,10 +301,75 @@ the public UniTraj weights) must be declared with `external_pretraining: true`.
 | `clip_mobility` | recovery (autoregressive), embeddings, mode classification, next location, travel time, duration (heads on the frozen visit encoder) | next-token regression + InfoNCE between trajectory and visit views |
 | `kinematic_ref`, `weak_ref` | non-neural references | none |
 
-Model options go under `arch:` (architecture), `train:` (`epochs, batch_size, lr, weight_decay,
-patience, grad_clip, max_steps_per_epoch, device, seed`, plus `init_from` and `options:` for
-model-specific training arguments) and `adapter:` (`device, batch_size, head_train, head_hidden,
-head_class_weighted`, ...).
+Model options go under three keys:
+
+- `arch:` for the architecture.
+- `train:` for training: `epochs, batch_size, lr, weight_decay, patience, grad_clip, optimizer,
+  scheduler, restore_best, max_steps_per_epoch, device, seed`, plus `init_from` and `options:` for
+  model-specific training arguments.
+- `adapter:` for loading and inference: `device, batch_size, head_train, head_hidden,
+  head_class_weighted`, ...
+
+## Reproducing the original methodology
+
+Each published model can be retrained exactly as its authors did, via `recipe:`:
+
+```yaml
+models:
+  - {name: UniTraj-paper, type: unitraj, recipe: paper}         # the publication
+  - {name: TrajGPT-code,  type: trajgpt, recipe: code}          # the released code, as is
+```
+
+- **`paper`** follows the publication. Where the paper is silent it follows the released code.
+- **`code`** follows the released code, including where it departs from the paper.
+
+A recipe sets the architecture, the optimiser and schedule (Adam without weight decay, no gradient
+clipping, the papers' batch sizes and epochs), and each model's own sample construction:
+
+- **UniTraj:** ATR resampling of whole trajectories; the random/RDP/block/last-n masking mix;
+  exactly 100 of 200 tokens hidden.
+- **TrajGPT:** 128-visit instances at every start position, left-padded; H3 resolution-7 regions;
+  times in hours; no loss masking or GMM initialisation.
+- **TransferTraj:** the paper's single-span masking or the repository's multi-span one; a context
+  radius of 100 m (paper) or 10 m (code); raw metres; per-task fine-tuning (`options: {objective: tp | trec}`).
+
+Two kinds of difference are logged and stored in the checkpoint's provenance:
+
+- **Deliberate omissions.** Defects that would corrupt an evaluation are never reproduced: target
+  leaks, statistics computed on the test data, a training loop that stops after one batch.
+- **Your overrides.** Anything set explicitly in the config overrides the recipe and is reported.
+
+`mobeval recipes` prints every setting and every omission. The paper's data and evaluation settings
+are in `examples/configs/paper_trajgpt.yaml`, `paper_transfertraj.yaml` and
+`paper_unitraj_{pretrain,eval}.yaml`. DATASETS.md explains how to download each dataset.
+CLIP-Mobility has no publication and so no recipe.
+
+**Paper metrics in the results.** Cells whose metric is one the model's own paper reported are
+marked, in `report.md` and by `make_table.py`:
+
+- **★ in `report.md`, $^\star$ in LaTeX:** the same formula and protocol as the paper.
+- **☆ in `report.md`, $^\dagger$ in LaTeX:** the same quantity under a protocol that differs as
+  stated. For example, TrajGPT's P(±t) uses the paper's formula, but the released code's time
+  heads read the target's own times, and an honest evaluation cannot reproduce that leak.
+
+Most marks are ☆. ★ is only given where mobeval can actually run the paper's protocol: UniTraj's
+recovery and prediction error, when the test windows are 200 points at 3 s with maskable
+endpoints (`paper_unitraj_eval.yaml`).
+
+The report's "Paper metrics" section lists each one with the reason. The mark concerns the
+metric only: a number is comparable with the paper's table only on the paper's data. Several
+metrics were added so that the papers' own are available:
+
+- Acc@10/20;
+- P(±5/10/20 min), the forecast mass within t minutes of the truth, conditioned on the next visit as
+  TrajGPT evaluates it;
+- MAPE;
+- recovery of the last 5 points (`recovery/last:5`) and TRec's keep-every-8th
+  (`recovery/keep_every:8`), with a constant-velocity baseline for the former.
+
+`eval.tasks: [recovery, ...]` restricts a run to some tasks. Without a visit task
+(`next_location`, `continuous`, `generation`) no staypoints are computed, which matters on
+WorldTrace-sized data.
 
 ## Controlling how much data training sees
 
@@ -404,7 +554,11 @@ mobeval/
   metrics/, baselines.py, stats.py metrics registry and implementations, baselines, bootstrap
   results.py, report.py            result schema with sanity flags, reports
   layout.py, progress.py           per-run directories + durable mirroring, live status
-  adapters/  base.py, torch_base.py, unitraj.py, trajgpt.py, clip_mobility.py, reference.py
+  recipes.py, paper_metrics.py     original training recipes; which metrics each paper reported
+  adapters/  base.py, torch_base.py, unitraj.py, trajgpt.py, transfertraj.py, clip_mobility.py, reference.py
   nn/        common.py (training loop, checkpoints, heads), features.py (tokenizers),
-             unitraj_net.py, trajgpt_net.py, clip_net.py (networks, checkpoint-compatible)
+             unitraj_net.py, trajgpt_net.py, transfertraj_net.py, clip_net.py (networks,
+             checkpoint-compatible), unitraj_sampling.py (UniTraj's ATR resampling and masking)
+make_table.py                      LaTeX tables from leaderboard.csv (paper metrics marked)
+DATASETS.md                        where to get each paper's data
 ```

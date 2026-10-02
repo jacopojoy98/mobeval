@@ -26,7 +26,7 @@ from typing import Optional
 
 import numpy as np
 
-from ..data import TrajectoryBatch
+from ..data import make_mask, TrajectoryBatch
 from ..geo import LocalProjection
 from .base import EMBEDDING, MODE_CLASSIFICATION, RECOVERY
 from .torch_base import TorchAdapter
@@ -52,8 +52,22 @@ class TransferTrajAdapter(TorchAdapter):
         self.pooling = pooling
         self.context = dict(context or {})
         ctx = self._load_context()
-        self.net = TransferTraj(**self.arch, **ctx).to(self.device).eval()
+        self.net = TransferTraj(**self._net_arch(), **ctx).to(self.device).eval()
         self._torch = torch
+
+    def _net_arch(self) -> dict:
+        """The architecture as the network needs it: context radii in the network's own units.
+
+        `poi_dist` / `rn_dist` are SQUARED METRES in the config and the checkpoint, exactly as in
+        the original, which compares squared metre distances against them. The network, though,
+        sees coordinates divided by `coord_scale`, so the thresholds have to be divided by
+        coord_scale**2 as well. Passing them through unchanged at coord_scale=1000 turned the
+        original's 10 m radius into 10 km (and the value `mobeval context` suggests into 500 km):
+        every point then averaged essentially every POI in the city, and the context pathway
+        carried the same vector everywhere.
+        """
+        s2 = self.coord_scale ** 2
+        return {**self.arch, "poi_dist": self.arch["poi_dist"] / s2, "rn_dist": self.arch["rn_dist"] / s2}
 
     def _load_context(self) -> dict:
         """Optional POI / road-network features: .npy embeddings plus .npy (lat, lon) coordinates."""
@@ -157,16 +171,28 @@ class TransferTrajAdapter(TorchAdapter):
 
     # ------------------------------------------------------------------ pre-training
     @staticmethod
-    def _pretrain_masks(n, L, rng, span_div_ratio, span_mask_ratio, feature_mask_prob):
-        """Span masking (both modalities) plus per-point single-modality masking, as in PretrainPadder."""
+    def _pretrain_masks(n, L, rng, span_div_ratio, span_mask_ratio, feature_mask_prob, masking: str = "code"):
+        """Span masking (both modalities) plus per-point single-modality masking.
+
+        masking="code": the repository's PretrainPadder - ceil(span_div_ratio * L) random cuts, and
+        ceil(span_mask_ratio * #spans) of the resulting spans fully masked.
+        masking="paper": Sec. 4.2 of the paper - ONE span [s, e], s and e drawn uniformly, fully masked.
+        Either way each point then has its spatial or its temporal part masked (50/50) with probability
+        feature_mask_prob (the paper does not state that probability; the repository's 0.2 is used)."""
         span_hidden = np.zeros((n, L), bool)
         feat_hidden = np.zeros((n, L, 2), bool)                       # [spatial, temporal]
         for i in range(n):
-            cuts = sorted({0, L} | set(rng.choice(L, int(np.ceil(L * span_div_ratio)), replace=False).tolist()))
-            spans = list(zip(cuts[:-1], cuts[1:]))
-            for j in rng.choice(len(spans), int(np.ceil(len(spans) * span_mask_ratio)), replace=False):
-                lo, hi = spans[j]
-                span_hidden[i, lo:hi] = True
+            if masking == "paper":
+                s0, e0 = sorted(rng.integers(0, L, size=2))
+                span_hidden[i, s0:e0 + 1] = True
+            elif masking == "code":
+                cuts = sorted({0, L} | set(rng.choice(L, int(np.ceil(L * span_div_ratio)), replace=False).tolist()))
+                spans = list(zip(cuts[:-1], cuts[1:]))
+                for j in rng.choice(len(spans), int(np.ceil(len(spans) * span_mask_ratio)), replace=False):
+                    lo, hi = spans[j]
+                    span_hidden[i, lo:hi] = True
+            else:
+                raise ValueError("masking must be 'code' or 'paper'")
             pick = rng.random(L) < feature_mask_prob
             spatial = rng.random(L) < 0.5
             feat_hidden[i, :, 0] = pick & spatial
@@ -195,8 +221,17 @@ class TransferTrajAdapter(TorchAdapter):
     def pretrain(cls, ctx, train: Optional[dict] = None, out: Optional[str] = None, arch: Optional[dict] = None,
                  init_from: Optional[str] = None, coord_scale: float = 1000.0, context: Optional[dict] = None,
                  span_div_ratio: float = 0.2, span_mask_ratio: float = 0.4, feature_mask_prob: float = 0.2,
-                 **kw) -> "TransferTrajAdapter":
-        """Span-masked pre-training (the original objective) on ctx.windows['train'], early stopping on 'val'."""
+                 masking: str = "code", objective: str = "pretrain", pred_len: int = 5, keep_every: int = 8,
+                 val_feature_masking: bool = False, **kw) -> "TransferTrajAdapter":
+        """Training on ctx.windows['train'], validation on 'val'.
+
+        objective="pretrain": span-masked pre-training (`masking`: "code" = the repository's padder,
+        "paper" = the paper's single span; see _pretrain_masks).
+        objective="tp" / "trec": the paper's task-specific fine-tuning (start from a pre-trained model
+        with `init_from`): the spatial part of the last `pred_len` points is hidden (TpPadder), or of
+        every point except each `keep_every`-th and the last (TRecPadder); timestamps stay visible.
+        val_feature_masking: also apply the single-modality masking to validation batches (the original
+        has no validation at all; mobeval validates on span masks only by default)."""
         from ..nn.common import TrainConfig
         from ..nn.common import fit as fit_loop
         cfg = TrainConfig.from_dict({"lr": 1e-3, "batch_size": 32, **(train or {})})
@@ -210,11 +245,19 @@ class TransferTrajAdapter(TorchAdapter):
         tr, va = ctx.windows["train"], ctx.windows["val"]
         rng = np.random.default_rng(cfg.seed)
 
+        if objective not in ("pretrain", "tp", "trec"):
+            raise ValueError("objective must be 'pretrain', 'tp' or 'trec'")
+
         def loss_fn(idx, training):
             b = (tr if training else va).take(idx)
             seed = rng if training else np.random.default_rng(int(idx[0]))
-            hidden2 = ad._pretrain_masks(len(idx), b.length, seed, span_div_ratio, span_mask_ratio,
-                                         feature_mask_prob if training else 0.0)
+            if objective == "pretrain":
+                fm = feature_mask_prob if (training or val_feature_masking) else 0.0
+                hidden2 = ad._pretrain_masks(len(idx), b.length, seed, span_div_ratio, span_mask_ratio, fm, masking)
+            else:
+                hidden2 = np.zeros((len(idx), b.length, 2), bool)
+                kind, r = ("last", pred_len) if objective == "tp" else ("keep_every", keep_every)
+                hidden2[..., 0] = make_mask(len(idx), b.length, r, kind)
             return ad.net.loss(*ad._pretrain_batch(b, hidden2))
 
         ad.provenance = ctx.provenance(init_from=init_from)

@@ -31,6 +31,27 @@ def linear_interpolation(batch: TrajectoryBatch, mask: np.ndarray):
     return lat, lon
 
 
+def constant_velocity(batch: TrajectoryBatch, mask: np.ndarray):
+    """Interpolate interior gaps linearly in time; extrapolate trailing gaps with the velocity of the
+    last two observed points (dead reckoning). The natural floor for trajectory PREDICTION, where
+    interpolation degenerates to repeating the last point."""
+    lat, lon = linear_interpolation(batch, mask)
+    for i in range(len(batch)):
+        obs = np.where(~mask[i])[0]
+        if len(obs) < 2:
+            continue
+        a, b = obs[-2], obs[-1]
+        tail = np.arange(b + 1, batch.length)
+        tail = tail[mask[i, tail]]
+        dt = batch.t[i, b] - batch.t[i, a]
+        if not len(tail) or dt <= 0:
+            continue
+        f = (batch.t[i, tail] - batch.t[i, b]) / dt
+        lat[i, tail] = batch.lat[i, b] + f * (batch.lat[i, b] - batch.lat[i, a])
+        lon[i, tail] = batch.lon[i, b] + f * (batch.lon[i, b] - batch.lon[i, a])
+    return lat, lon
+
+
 def last_observed(batch: TrajectoryBatch, mask: np.ndarray):
     lat, lon = batch.lat.copy(), batch.lon.copy()
     for i in range(len(batch)):

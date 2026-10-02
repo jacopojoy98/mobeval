@@ -1,0 +1,35 @@
+# Stage 2 of the UniTraj reproduction: the paper's evaluation protocol - 200-point trajectories
+# resampled to 3 s, 50% random masking with the endpoints maskable, and 5-point prediction.
+#   mobeval evaluate --config examples/configs/paper_unitraj_eval.yaml
+title: UniTraj reproduction - evaluation (WorldTrace at 3 s)
+output_dir: results/paper_unitraj
+check_provenance: warn                     # the 3 s view has other windows than the 1 s training view
+
+dataset:
+  loader: worldtrace
+  path: /scratch/USER/data/WorldTrace
+  max_trajectories: 300000                 # same draw (same seed) as stage 1, so the same split
+  prepare: {min_interval_s: 3}
+
+eval:
+  tasks: [recovery, efficiency]
+  split_by: time
+  split_ratios: [0.8, 0.1, 0.1]
+  window_length: 200
+  max_gap_s: 60
+  recovery_kinds: [random]
+  recovery_ratios: [0.5]
+  recovery_keep_endpoints: false           # with window_length 200 this makes MAE/RMSE EXACT paper metrics
+  recovery_schemes: [[last, 5]]
+  eval_seeds: [0, 1, 2]
+
+models:
+  - name: UniTraj-paper                    # the checkpoint trained by paper_unitraj_pretrain.yaml
+    type: unitraj
+    adapter: {device: cuda, batch_size: 256}
+
+  - name: UniTraj-public                   # the authors' released weights, for comparison
+    type: unitraj
+    checkpoint: /scratch/USER/models/unitraj/model.pt
+    external_pretraining: true
+    adapter: {device: cuda, batch_size: 256}

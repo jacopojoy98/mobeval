@@ -56,6 +56,12 @@ eval:
   anomaly_kinds: [teleport, detour, loop]
   anomaly_rate: 0.1
   anomaly_protocols: [embedding_knn, reconstruction]
+
+  # UniTraj/TransferTraj/CLIP have no generator; rolling their reconstruction forward from a
+  # short real seed puts them on the generation axis too. Read against the `seed_only` baseline.
+  generation_protocols: [native, rollout]
+  rollout_seed_points: 4
+  rollout_block: 8
 models:
   - name: UniTraj-zeroshot
     type: unitraj

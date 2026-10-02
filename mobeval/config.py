@@ -39,7 +39,7 @@ def load_config(path) -> dict:
 # Every key a model entry may have. A misspelled key used to be silently ignored, which is the
 # worst possible outcome: `chechpoint:` simply fell back to the default checkpoint path and the
 # run looked fine while evaluating a different file than the one named in the config.
-MODEL_KEYS = {"name", "type", "checkpoint", "train", "arch", "adapter", "run_tag", "external_pretraining"}
+MODEL_KEYS = {"name", "type", "checkpoint", "train", "arch", "adapter", "run_tag", "external_pretraining", "recipe"}
 TOP_LEVEL_KEYS = {"title", "output_dir", "persist_dir", "progress_dir", "checkpoint_dir", "run_dirs",
                   "dataset", "eval", "models", "check_provenance"}
 
@@ -92,13 +92,18 @@ def eval_config(d: dict) -> EvalConfig:
 
 def load_dataset(d: dict):
     from .data import synthetic_dataset
-    from .loaders import from_csv, load_geolife
+    from . import loaders as L
     kind = d.get("loader", "csv")
-    kw = {k: v for k, v in d.items() if k not in ("loader", "path")}
-    if kind == "geolife":
-        return load_geolife(d["path"], **kw)
-    if kind == "csv":
-        return from_csv(d.get("path"), **kw)
-    if kind == "synthetic":
-        return synthetic_dataset(**kw)
-    raise ValueError(f"unknown dataset loader '{kind}'")
+    kw = {k: v for k, v in d.items() if k not in ("loader", "path", "prepare")}
+    readers = {"geolife": L.load_geolife, "worldtrace": L.load_worldtrace, "porto": L.load_porto,
+               "transfertraj_h5": L.load_transfertraj_h5}
+    if kind in readers:
+        ds = readers[kind](d["path"], **kw)
+    elif kind == "csv":
+        ds = L.from_csv(d.get("path"), **kw)
+    elif kind == "synthetic":
+        ds = synthetic_dataset(**kw)
+    else:
+        raise ValueError(f"unknown dataset loader '{kind}'; known: csv, synthetic, {', '.join(readers)}")
+    # `prepare:` applies the preprocessing steps a paper describes (see loaders.prepare)
+    return L.prepare(ds, **d["prepare"]) if d.get("prepare") else ds

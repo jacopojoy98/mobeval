@@ -117,12 +117,25 @@ linear probing of frozen embeddings, and native task heads by the adapter's `pre
 fractions such as 100 %, 10 % and 1 %. Pre-training benefit ("w/o pretrain" versus "full" in UniTE) needs
 each model's training code and plugs into the same hook.
 
-**Tasks and metrics.** Recovery: ADE, median and p90 ADE, RMSE, FDE per masked block, length-normalised DTW
-on masked points, accuracy within 100 m and 500 m, shared-grid accuracy. Next location: acc@1, acc@5,
-MRR@20, NLL, distance error, accuracy within 1 km. Travel time and duration: MAE, RMSE, CRPS, NLL (or
-pseudo-NLL for point models), coverage and PIT. Mode: accuracy, balanced accuracy, macro-F1, NLL, ECE.
-Generation: JSD and W1 for radius of gyration, jump length, stay duration and daily locations, JSD of
-visited cells, paired Spearman, copy rate. Efficiency: parameters and latency per sample.
+**Tasks and metrics.**
+
+- **Recovery:** ADE, median and p90 ADE, RMSE, FDE per masked block, length-normalised DTW on masked
+  points, accuracy within 100 m and 500 m, and shared-grid accuracy.
+  - Besides random and block masks at several ratios, two fixed schemes from the papers are run:
+    the last 5 points (trajectory prediction; scored against a constant-velocity baseline) and
+    keep-every-8th (TransferTraj's TRec).
+- **Next location:** acc@1/5/10/20, MRR@20, NLL, distance error, accuracy within 1 km.
+- **Travel time and duration:** MAE, RMSE, MAPE, CRPS, NLL (or pseudo-NLL for point models),
+  coverage and PIT. TrajGPT's P(±5/10/20 min) is also computed: the truncated and renormalised
+  forecast mass within t minutes of the truth. Each target is scored unconditionally, and also
+  given the next visit's location (and, for duration, its arrival), which is TrajGPT's
+  factorisation.
+- **Mode:** accuracy, balanced accuracy, macro-F1, NLL, ECE.
+- **Generation:** JSD and W1 for radius of gyration, jump length, stay duration and daily locations;
+  JSD of visited cells; paired Spearman; copy rate.
+- **Efficiency:** parameters and latency per sample.
+- **Paper metrics.** Metrics a model's own paper reported are marked in the report (★ same protocol,
+  ☆ a stated difference); see `mobeval/paper_metrics.py`.
 
 **Why CRPS is the cross-model bridge.** CRPS equals absolute error for a point forecast and has a closed
 form for Gaussian mixtures, so TrajGPT's probabilistic head and a point predictor are scored on the same

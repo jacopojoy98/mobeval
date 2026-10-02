@@ -40,6 +40,7 @@ class ResultRecord:
     higher_is_better: Optional[bool] = None
     family: str = ""
     flags: List[str] = field(default_factory=list)
+    paper_match: str = ""          # 'exact' | 'near' | '': is this a metric the model's paper reported?
     timestamp: float = field(default_factory=time.time)
 
     def __post_init__(self):

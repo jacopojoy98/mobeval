@@ -37,7 +37,11 @@ def _agg(df: pd.DataFrame) -> pd.DataFrame:
                 ci_high=("ci_high", "mean"), skill=("skill", "mean"), skill_ci_low=("skill_ci_low", "mean"),
                 skill_ci_high=("skill_ci_high", "mean"), n_runs=("value", "size"), n=("n", "max"),
                 baseline=("baseline", "first"), higher_is_better=("higher_is_better", "first"),
-                unit=("unit", "first")).reset_index()
+                unit=("unit", "first"), **({"paper_match": ("paper_match", "first")}
+                                            if "paper_match" in df.columns else {})).reset_index()
+    if "paper_match" not in out.columns:
+        out["paper_match"] = ""
+    out["paper_match"] = out["paper_match"].fillna("")
     return out
 
 
@@ -66,6 +70,7 @@ def wide_table(a: pd.DataFrame, show_skill: bool = True) -> pd.DataFrame:
         if show_skill and pd.notna(r.skill):
             txt += f" [{100 * r.skill:+.0f}%]" if get_spec(r.metric).skill != "difference" else f" [Δ{r.skill:+.2f}]"
         arrow = "↑" if r.higher_is_better else "↓"
+        txt += PAPER_MARK.get(r.get("paper_match", ""), "")
         cells.append((f"{r.task} · {r.metric} {arrow} ({r.unit})", r.protocol, r.model, txt))
     t = pd.DataFrame(cells, columns=["metric", "protocol", "model", "cell"])
     return t.pivot_table(index=["metric", "protocol"], columns="model", values="cell", aggfunc="first").fillna("n/a")
@@ -112,6 +117,10 @@ def pareto_front(df: pd.DataFrame) -> pd.DataFrame:
     q["pareto_optimal"] = [not dominated(i) for i in range(len(q))]
     return q.sort_values("mean_skill", ascending=False)
 
+
+# ★ = the metric the model's paper reported, computed the same way; ☆ = the same quantity under a
+# different protocol (see paper_metrics.py and the "Paper metrics" section of the report).
+PAPER_MARK = {"exact": " ★", "near": " ☆"}
 
 TITLES = {"identity": "User identification (from frozen embeddings)",
           "anomaly": "Anomaly detection (injected anomalies)"}
@@ -163,6 +172,14 @@ def markdown_report(store, ctx=None, title: str = "Mobility foundation model eva
         if fam in NOTES:
             out += [NOTES[fam], ""]
         out += [md_table(wide_table(sub, fam != "efficiency")), ""]
+    if "paper_match" in df.columns and (df.paper_match.fillna("") != "").any():
+        from .paper_metrics import describe
+        out += ["## Paper metrics", "",
+                "★ marks a cell whose metric is the one the model's authors reported, computed with the "
+                "same formula and protocol; ☆ the same quantity under a protocol that differs as noted "
+                "below. A mark is about the METRIC, not the data: the number is comparable with the "
+                "paper's only on the paper's dataset and preprocessing (`recipe: paper`).", "",
+                describe(), ""]
     flagged = df[df["flags"].map(len) > 0]
     if len(flagged):
         out += ["## Sanity flags", ""]

@@ -30,6 +30,9 @@ class EvalConfig:
     window_stride: Optional[int] = None
     max_gap_s: float = 300.0
     grid_cell_m: float = 500.0
+    # "h3" makes the shared location label space H3 cells (TrajGPT's evaluation uses resolution 7)
+    grid_backend: str = "square"
+    grid_h3_resolution: int = 7
     staypoint_dist_m: float = 200.0
     staypoint_time_s: float = 20 * 60
     staypoint_method: str = "points"            # 'points' (dwell points recorded) or 'trips' (gaps between trips)
@@ -46,18 +49,44 @@ class EvalConfig:
     # statistics
     eval_seeds: Sequence[int] = (0, 1, 2)       # repeated masks / label subsets
     n_boot: int = 500
-    # tasks
+    # tasks. None = all; otherwise a subset of tasks.TASK_NAMES. Without next_location, continuous
+    # and generation no staypoints are detected, which saves hours on large GPS collections.
+    tasks: Optional[Sequence[str]] = None
     recovery_ratios: Sequence[float] = (0.25, 0.5, 0.75)
     recovery_kinds: Sequence[str] = ("random", "block")
+    # Keep the first and last point of every window observed under random/block masking, so the
+    # interpolation baselines are defined. UniTraj's own evaluation may mask them: set false for it.
+    recovery_keep_endpoints: bool = True
+    # Fixed-shape schemes taken from the papers, run once each besides kinds x ratios:
+    # ("last", 5) = predict the final 5 points (TransferTraj, UniTraj trajectory prediction);
+    # ("keep_every", 8) = keep every 8th point and the last, recover the rest (TransferTraj TRec).
+    recovery_schemes: Sequence[Tuple[str, float]] = (("last", 5), ("keep_every", 8))
     recovery_dtw: bool = True
     continuous_targets: Sequence[str] = ("travel_time", "duration")
     continuous_reveal: Dict[str, Tuple[str, ...]] = field(default_factory=dict)  # e.g. {"duration": ("location",)}
+    # Also score travel time given the target location, and duration given location + arrival:
+    # the teacher-forced conditions of TrajGPT's own P(+-t) evaluation (see PAPER_REVEAL).
+    continuous_paper_conditioning: bool = True
     # gaps between consecutive staypoints longer than this are missing data (phone off, overnight), not travel;
     # they are excluded from the travel-time task for every model and baseline (TrajGPT uses the same 4 h rule)
     travel_time_max_h: Optional[float] = 4.0
     mode_protocols: Sequence[str] = ("native", "linear_probe")
     label_fractions: Sequence[float] = (1.0, 0.1)
     generation_max_trajectories: int = 500
+    # A reconstruction model has no `generate`, but hiding the FUTURE instead of a random subset
+    # turns filling-in into generation. The same rollout runs for every such model, so what is
+    # compared is the models and not three hand-written decoders (see mobeval.rollout).
+    generation_protocols: Sequence[str] = ("native", "rollout")
+    rollout_seed_points: int = 4                # real points the model is seeded with
+    rollout_block: int = 8                      # points committed per step before re-feeding
+    rollout_noise_m: Optional[float] = None     # optional: restore marginal spread (see rollout.py)
+    rollout_max_len: Optional[int] = 512        # cap on generated trajectory length
+    # Caps for the generation task's reference computations. These bound per-trajectory work on
+    # the FULL splits, which is what makes the task run out of memory on a large panel; they do
+    # not change what the generator is asked to produce.
+    generation_max_real_trajectories: Optional[int] = 20_000   # test trajectories behind the reference stats
+    generation_nn_max_train: int = 3_000       # train trajectories in the memorisation comparison
+    generation_nn_max_query: int = 2_000       # test trajectories compared against them
     # Protocols for the prediction tasks. 'native' uses the model's own head; 'linear_probe'
     # fits a linear head on frozen embeddings, which is the only way to put an encoder with no
     # such head (UniTraj, TransferTraj) on the same axis as a generative model.
@@ -80,12 +109,21 @@ class EvalContext:
         self.cfg = cfg
         self.dataset_name = dataset.name
         self.splits = dataset.split(cfg.split_by, cfg.split_ratios, cfg.split_seed, cfg.val_by, cfg.val_fraction)
-        self.grid = SpatialGrid.from_dataset(dataset, cfg.grid_cell_m)
         self.rng = np.random.default_rng(cfg.split_seed)
         self.windows: Dict[str, TrajectoryBatch] = {}
         self.staypoints: Dict[str, pd.DataFrame] = {}
         self.visits: Dict[str, VisitBatch] = {}
-        all_sp = self.detect_staypoints(dataset)
+        from .tasks import VISIT_TASKS
+        needs_visits = cfg.tasks is None or bool(VISIT_TASKS & set(cfg.tasks))
+        all_sp = (self.detect_staypoints(dataset) if needs_visits else
+                  pd.DataFrame(columns=["user_id", "traj_id", "lat", "lon", "t_arrive", "t_leave"]))
+        if cfg.grid_backend == "square":
+            self.grid = SpatialGrid.from_dataset(dataset, cfg.grid_cell_m)
+        elif cfg.grid_backend == "h3":
+            from .data import H3Grid
+            self.grid = H3Grid.from_dataset(dataset, cfg.grid_h3_resolution, all_sp)
+        else:
+            raise ValueError("grid_backend must be 'square' or 'h3'")
         for name, ds in self.splits.items():
             try:
                 w = make_windows(ds, cfg.window_length, cfg.window_stride, cfg.max_gap_s)
@@ -132,8 +170,10 @@ class EvalContext:
 
     def provenance(self, **extra) -> dict:
         import datetime
+        rec = getattr(self, "active_recipe", None)
         return {"train_fingerprint": self.fingerprint, "dataset": self.dataset_name,
                 "trained_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                **({"recipe": rec} if rec else {}),
                 **{k: v for k, v in extra.items() if v is not None}}
 
     def _subsample(self, n: int, m: Optional[int]) -> Optional[np.ndarray]:
@@ -177,12 +217,52 @@ class EvalContext:
         rec[0] += time.perf_counter() - t0
         rec[1] += n
 
+    def split_overlap(self) -> Optional[dict]:
+        """How much of the test set is in places and among people the training set knows.
+
+        A location model cannot predict a cell it has never seen, and a tokenizer-based model
+        will silently snap such a target onto its nearest known region - which may be a hundred
+        kilometres away. That failure looks exactly like "the model is bad" in every metric, so
+        the overlap is measured up front rather than inferred afterwards from strange numbers.
+        """
+        tr, te = self.staypoints.get("train"), self.staypoints.get("test")
+        if tr is None or te is None or not len(tr) or not len(te):
+            return None
+        tr_cells = self.grid.cell_of(tr.lat.to_numpy(), tr.lon.to_numpy())
+        te_cells = self.grid.cell_of(te.lat.to_numpy(), te.lon.to_numpy())
+        seen = np.unique(tr_cells)
+        inside = np.isin(te_cells, seen)
+        out = {"test_cells_seen_in_train": float(inside.mean()),
+               "train_cells": int(len(seen)),
+               "test_cells": int(len(np.unique(te_cells)))}
+        if not inside.all():                       # how far an unseen target would be snapped
+            from scipy.spatial import cKDTree
+            from .geo import LocalProjection
+            slat, slon = self.grid.centroid(seen)
+            proj = LocalProjection.from_points(slat, slon)
+            tree = cKDTree(np.column_stack(proj.to_xy(slat, slon)))
+            miss = ~inside
+            d = tree.query(np.column_stack(proj.to_xy(te.lat.to_numpy()[miss], te.lon.to_numpy()[miss])))[0]
+            out["median_snap_m"] = float(np.median(d))
+            out["p95_snap_m"] = float(np.percentile(d, 95))
+        users = {"train": set(tr.user_id.unique()), "test": set(te.user_id.unique())}
+        out["test_users_seen_in_train"] = (len(users["test"] & users["train"]) / len(users["test"])
+                                           if users["test"] else 0.0)
+        return out
+
     def summary(self) -> str:
-        lines = [f"dataset={self.dataset_name} split_by={self.cfg.split_by} grid={self.grid.nx}x{self.grid.ny} "
-                 f"cells @ {self.cfg.grid_cell_m:.0f} m"]
+        lines = [f"dataset={self.dataset_name} split_by={self.cfg.split_by} grid={self.grid.describe()}"]
         for s in ("train", "val", "test"):
             lines.append(f"  {s:5s}: users={self.splits[s].points.user_id.nunique():5d} points={len(self.splits[s].points):7d} "
                          f"windows={len(self.windows[s]) if s in self.windows else 0:6d} "
                          f"staypoints={len(self.staypoints[s]):6d} "
                          f"visit_seqs={len(self.visits[s]) if s in self.visits else 0:6d}")
+        ov = self.split_overlap()
+        if ov:
+            lines.append(f"  overlap: {ov['test_cells_seen_in_train']:.1%} of test staypoints are in cells seen in "
+                         f"train ({ov['train_cells']:,} train cells, {ov['test_cells']:,} test cells); "
+                         f"{ov['test_users_seen_in_train']:.1%} of test users appear in train")
+            if "median_snap_m" in ov:
+                lines.append(f"           unseen test staypoints are {ov['median_snap_m'] / 1000:.1f} km "
+                             f"(p95 {ov['p95_snap_m'] / 1000:.1f} km) from the nearest cell train has seen")
         return "\n".join(lines)

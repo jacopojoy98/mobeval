@@ -1,0 +1,26 @@
+# Stage 1 of the UniTraj reproduction: pre-training on WorldTrace at its native 1 s sampling, with
+# UniTraj's ATR resampling and four-strategy masking applied on the fly (recipe: paper).
+#   mobeval train --config examples/configs/paper_unitraj_pretrain.yaml
+# Stage 2 (paper_unitraj_eval.yaml) evaluates the checkpoint on the same split resampled to 3 s.
+title: UniTraj reproduction - pre-training on WorldTrace
+output_dir: results/paper_unitraj
+check_provenance: error
+
+dataset:
+  loader: worldtrace
+  path: /scratch/USER/data/WorldTrace      # the Hugging Face download (per-trajectory CSVs)
+  max_trajectories: 300000                 # 2.45M in full (~35 GB of CSV); the paper's 1.1M subset is not public
+
+eval:
+  tasks: [recovery]                        # no staypoints needed: skips hours of detection
+  split_by: time
+  split_ratios: [0.8, 0.1, 0.1]
+  window_length: 200
+  max_gap_s: 60
+
+models:
+  - name: UniTraj-paper
+    type: unitraj
+    recipe: paper
+    train: {device: cuda}
+    adapter: {device: cuda, batch_size: 256}

@@ -202,3 +202,133 @@ def test_training_views_can_be_thinned_without_touching_evaluation():
         assert len(thin.windows[split]) == len(plain.windows[split])
         assert np.array_equal(thin.visits[split].tgt_cell, plain.visits[split].tgt_cell)
     assert thin.fingerprint == plain.fingerprint        # same split: checkpoints stay compatible
+
+
+def _panel(n_users, lat0, lon0, day0, uid0, split):
+    rng = np.random.default_rng(uid0)
+    rows = []
+    for u in range(n_users):
+        home = (lat0 + rng.normal(0, 0.02), lon0 + rng.normal(0, 0.02))
+        for d in range(6):
+            t0 = (day0 + d) * 86400 + 8 * 3600
+            for k in range(30):
+                rows.append((f"u{uid0+u}", f"u{uid0+u}_d{d}", t0 + k * 120,
+                             home[0] + rng.normal(0, 0.004), home[1] + rng.normal(0, 0.004), split))
+    return pd.DataFrame(rows, columns=["user_id", "traj_id", "t", "lat", "lon", "split"])
+
+
+def _overlap(test_lat):
+    from mobeval.data import MobilityDataset
+    ds = MobilityDataset(pd.concat([_panel(60, 45.0, 9.0, 0, 0, "train"),
+                                    _panel(40, test_lat, 9.0, 40, 500, "test")], ignore_index=True), "demo")
+    cfg = EvalConfig(split_by="predefined", window_length=16, visit_context=3, max_eval_samples=200,
+                     staypoint_time_s=600, grid_cell_m=500.0)
+    return EvaluationPipeline(cfg).prepare(ds).split_overlap()
+
+
+def test_split_overlap_detects_disjoint_geography():
+    """A location model cannot predict a cell it never saw, and a tokenizer-based one snaps such
+    a target onto its nearest known region - which shows up as a huge, unexplained distance
+    error. The overlap has to be visible before the metrics are read."""
+    near, far = _overlap(45.0), _overlap(46.0)
+    assert near["test_cells_seen_in_train"] > far["test_cells_seen_in_train"]
+    assert far["test_cells_seen_in_train"] == 0.0
+    assert near["median_snap_m"] < 5_000, near
+    assert far["median_snap_m"] > 50_000, far
+
+
+def test_summary_reports_the_overlap():
+    from mobeval.data import MobilityDataset
+    ds = MobilityDataset(pd.concat([_panel(60, 45.0, 9.0, 0, 0, "train"),
+                                    _panel(40, 46.0, 9.0, 40, 500, "test")], ignore_index=True), "demo")
+    cfg = EvalConfig(split_by="predefined", window_length=16, visit_context=3, max_eval_samples=200,
+                     staypoint_time_s=600, grid_cell_m=500.0)
+    s = EvaluationPipeline(cfg).prepare(ds).summary()
+    assert "overlap:" in s and "km" in s
+
+
+def test_tokenizer_vocabulary_is_the_key_list_and_matches_the_network():
+    """`meta.tokenizer.keys` in a checkpoint IS the region vocabulary: one entry per occupied
+    cell. Its length plus the special-token offset must equal the model's embedding rows."""
+    from mobeval.nn.features import RegionTokenizer
+    rng = np.random.default_rng(0)
+    tok = RegionTokenizer(cell_m=1000.0).fit(rng.normal(45.0, 0.05, 5000), rng.normal(9.0, 0.05, 5000))
+    assert tok.n_regions == len(tok.keys) == len(np.unique(tok.keys))
+    back = RegionTokenizer.from_state(tok.state())
+    assert back.n_regions == tok.n_regions
+    same = tok.tokens(np.array([45.0]), np.array([9.0]))
+    assert back.tokens(np.array([45.0]), np.array([9.0])) == same
+
+
+def test_tokenizer_records_how_far_it_snapped_unseen_cells():
+    from mobeval.nn.features import RegionTokenizer
+    rng = np.random.default_rng(0)
+    tok = RegionTokenizer(cell_m=1000.0).fit(rng.normal(45.0, 0.02, 4000), rng.normal(9.0, 0.02, 4000))
+    tok.tokens(np.full(200, 45.9), np.full(200, 9.9))
+    assert tok.snapped["n"] == 200 and tok.snapped["median_m"] > 50_000
+
+
+# --------------------------------------------------------------------- memory ceilings
+def test_location_scoring_in_chunks_is_bit_identical():
+    """A dense (n_samples, n_cells) score matrix is 18 GB at a realistic grid size, and the
+    pipeline builds one per model and one per baseline. Chunking is only acceptable if it
+    changes nothing at all."""
+    from mobeval.adapters.reference import KinematicReference, WeakReference
+    from mobeval.tasks import NextLocationTask
+    cfg = EvalConfig(window_length=32, max_eval_samples=400, visit_context=5, eval_seeds=(0,),
+                     n_boot=40, grid_cell_m=200.0)
+    ctx = EvaluationPipeline(cfg).prepare(synthetic_dataset(n_users=40, n_days=12, seed=0))
+    original = NextLocationTask.SCORE_CHUNK
+    try:
+        for adapter in (KinematicReference(), WeakReference()):      # token_scores and latlon forms
+            ref = None
+            for chunk in (10 ** 9, 64, 7):                           # 10**9 = effectively unchunked
+                NextLocationTask.SCORE_CHUNK = chunk
+                ctx.cache.pop("loc_baselines", None)
+                ctx.emitted_baselines.clear()
+                vals = {(r.model, r.task, r.metric): float(r.value)
+                        for r in NextLocationTask().run(adapter, ctx)}
+                assert vals, "no records"
+                if ref is None:
+                    ref = vals
+                else:
+                    assert vals == ref, f"{adapter.name} differs at chunk={chunk}"
+    finally:
+        NextLocationTask.SCORE_CHUNK = original
+
+
+def test_nearest_train_distance_cost_does_not_grow_with_the_dataset():
+    """Regression for an OOM kill: every trajectory was resampled before all but a few thousand
+    were thrown away, and the pairwise block was sized by the query count."""
+    import tracemalloc
+    from mobeval.metrics.generative import nearest_train_distance
+
+    def panel(n_traj, pts, seed):
+        n = n_traj * pts
+        rng = np.random.default_rng(seed)
+        return pd.DataFrame({"user_id": np.repeat(np.arange(n_traj) % 50, pts),
+                             "traj_id": np.repeat(np.arange(n_traj), pts),
+                             "t": np.tile(np.arange(pts, dtype=float), n_traj),
+                             "lat": 45 + rng.normal(0, 0.05, n), "lon": 9 + rng.normal(0, 0.05, n)})
+    peaks, results = [], []
+    for scale in (1, 6):
+        tr, te = panel(2000 * scale, 20, 0), panel(500 * scale, 20, 1)
+        tracemalloc.start()
+        out = nearest_train_distance(te, tr, max_train=300, max_query=200, seed=0)
+        peaks.append(tracemalloc.get_traced_memory()[1])
+        tracemalloc.stop()
+        results.append(len(out))
+    assert results == [200, 200], "the query side must be capped"
+    assert peaks[1] < 3 * peaks[0], f"memory grew with the dataset: {peaks}"
+
+
+def test_generation_reference_statistics_are_capped():
+    from mobeval.metrics.generative import sample_trajectories
+    rng = np.random.default_rng(0)
+    pts = pd.DataFrame({"traj_id": np.repeat(np.arange(5000), 4),
+                        "lat": rng.normal(45, 0.1, 20000), "lon": rng.normal(9, 0.1, 20000)})
+    small = sample_trajectories(pts, 100, seed=0)
+    assert small.traj_id.nunique() == 100
+    assert small.groupby("traj_id").size().eq(4).all(), "whole trajectories, never partial ones"
+    assert sample_trajectories(pts, None, 0) is pts
+    assert len(sample_trajectories(pts, 99999, 0)) == len(pts)

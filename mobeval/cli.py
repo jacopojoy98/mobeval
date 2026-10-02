@@ -7,6 +7,9 @@
     python -m mobeval context  --config exp.yaml --out data/context   # POI/road features from OSM
     python -m mobeval status   [--config exp.yaml | --progress-dir DIR] [--watch 10]  # how is it going?
     python -m mobeval smoke    [--out DIR]                        # tiny synthetic end-to-end check
+    python -m mobeval recipes  [--models omnitraj]                # original training recipes
+    python -m mobeval roads    --pbf italy.osm.pbf --bbox ... --out net.npz    # OmniTraj road segments
+    python -m mobeval mapmatch --config exp.yaml --roads net.npz --out matched.csv.gz --workers 16
     python -m mobeval info     --config exp.yaml                  # dataset/split summary + fingerprint
 
 Nothing finished ever waits for the end of the job: a checkpoint is written (and copied to
@@ -246,6 +249,43 @@ SMOKE = {
 }
 
 
+def cmd_roads(args):
+    """Road segments between intersections from an OSM extract (OmniTraj's road modality)."""
+    from .roads import from_osm
+    if not args.pbf or not args.out:
+        raise SystemExit("mobeval roads --pbf FILE.osm.pbf --out roads.npz [--bbox ...] [--fmm roads.gpkg]")
+    net = from_osm(args.pbf, args.bbox)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    net.save(args.out)
+    print(f"{len(net):,} segments -> {args.out}")
+    if args.fmm:
+        net.to_fmm(args.fmm)
+
+
+def cmd_mapmatch(cfg, args):
+    """One road-segment id per GPS point of the configured dataset (after `prepare:`)."""
+    from . import mapmatch
+    from .config import load_dataset
+    ds = load_dataset(cfg["dataset"])
+    if args.fmm_export:
+        mapmatch.fmm_export(ds, args.fmm_export)
+        print(f"wrote {args.fmm_export} (+ .ids.csv) for FMM")
+        return
+    if not args.out:
+        raise SystemExit("mapmatch needs --out matched.parquet")
+    if args.fmm_import:
+        out = mapmatch.fmm_import(ds, args.fmm_import, args.fmm_network)
+    else:
+        from .roads import RoadNetwork
+        if not args.roads:
+            raise SystemExit("mapmatch needs --roads roads.npz (from `mobeval roads`) or --fmm-import")
+        out = mapmatch.match_dataset(ds, RoadNetwork.load(args.roads), args.workers, args.max_trajectories,
+                                     sigma_m=args.sigma_m, radius_m=args.radius_m)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    mapmatch.write_table(out, args.out)
+    print(f"{len(out):,} points, {float((out.seg >= 0).mean()):.1%} matched -> {args.out}")
+
+
 def cmd_recipes(types=None):
     """Print every training recipe that reproduces an original methodology, with its sources and
     what it deliberately does not reproduce (`mobeval recipes [--models unitraj trajgpt]`)."""
@@ -274,10 +314,11 @@ def cmd_recipes(types=None):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="mobeval", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["train", "evaluate", "run", "smoke", "info", "context", "status", "recipes"])
+    ap.add_argument("command", choices=["train", "evaluate", "run", "smoke", "info", "context", "status", "recipes",
+                                        "roads", "mapmatch"])
     ap.add_argument("--config")
     ap.add_argument("--models", nargs="*")
-    ap.add_argument("--out", help="override output_dir")
+    ap.add_argument("--out", help="override output_dir (roads / mapmatch: the output file)")
     ap.add_argument("--device", help="override train.device for all models (e.g. cuda, cpu)")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--progress-dir", help="where live progress is written/read (must be visible from "
@@ -288,6 +329,19 @@ def main(argv=None):
     ap.add_argument("--resume", nargs="?", const=True, metavar="RUN_ID",
                     help="continue the newest run (or the named one): keep its finished tasks and "
                          "only compute what is missing")
+    r = ap.add_argument_group("roads / mapmatch (OmniTraj's road modality)")
+    r.add_argument("--pbf", help="roads: OpenStreetMap extract (.osm.pbf)")
+    r.add_argument("--bbox", nargs=4, type=float, metavar=("LAT_MIN", "LAT_MAX", "LON_MIN", "LON_MAX"),
+                   help="roads: keep ways with a node inside this box")
+    r.add_argument("--fmm", help="roads: also write the network as an FMM GeoPackage")
+    r.add_argument("--roads", help="mapmatch: road network (.npz from `mobeval roads`)")
+    r.add_argument("--workers", type=int, default=1, help="mapmatch: parallel processes")
+    r.add_argument("--max-trajectories", type=int, help="mapmatch: match a random subset")
+    r.add_argument("--sigma-m", type=float, default=20.0, help="mapmatch: GPS noise (emission sigma), metres")
+    r.add_argument("--radius-m", type=float, default=60.0, help="mapmatch: candidate search radius, metres")
+    r.add_argument("--fmm-export", help="mapmatch: write the GPS points for FMM instead of matching")
+    r.add_argument("--fmm-import", help="mapmatch: read an FMM result (opath field) instead of matching")
+    r.add_argument("--fmm-network", help="mapmatch: the FMM GeoPackage written by `mobeval roads --fmm`")
     s = ap.add_argument_group("status")
     s.add_argument("--watch", type=float, nargs="?", const=10.0, help="refresh every N seconds (default 10)")
     s.add_argument("--events", type=int, default=0, help="also show the last N events of the newest run")
@@ -307,6 +361,8 @@ def main(argv=None):
 
     if args.command == "recipes":
         return cmd_recipes(args.models) or 0
+    if args.command == "roads":
+        return cmd_roads(args) or 0
     if args.command == "status" and not args.config:
         return cmd_status(args) or 0                # inspecting only needs the progress directory
 
@@ -325,6 +381,8 @@ def main(argv=None):
         return cmd_status(args, cfg) or 0
     if args.command == "context":
         return cmd_context(cfg, args) and 0
+    if args.command == "mapmatch":
+        return cmd_mapmatch(cfg, args) or 0
     if args.command == "info":
         from . import layout
         _, ctx = _context(cfg)

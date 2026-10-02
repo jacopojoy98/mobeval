@@ -1,0 +1,79 @@
+# OmniTraj next to the other models on ONE CITY of the vehicle panel.
+#
+# OmniTraj is a city-scale model: its 16 x 16 region grid and its coordinate normalisation assume one
+# urban area (the paper: Chengdu and Xi'an, ~9 km across), and its road vocabulary is every segment
+# of that city. So this config keeps only the trips lying entirely inside a city's bounding box
+# (the paper also "filtered out trajectories recorded outside urban areas" and trips under 20
+# points), and every model is evaluated on that same subset.
+#
+# 1. Road network and map matching (CPU job, once per city):
+#      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,PBF=/scratch/$USER/osm/italy-latest.osm.pbf,BBOX="41.80 41.99 12.37 12.62",ROADS_DIR=/scratch/$USER/roads/rome jobs/mapmatch.pbs
+# 2. Train and evaluate:
+#      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,RESULTS_DIR=$HOME/MobFM/results_rome jobs/all_in_one.pbs
+title: OmniTraj and the other models on one city (Rome)
+output_dir: results/omnitraj_city
+
+dataset:
+  loader: csv
+  train_path: data/train.csv
+  test_path: data/test.csv
+  time_col: datetime
+  user_id: uid
+  traj_id: trip_id
+  lat: lat
+  lon: lng
+  query: "QUALITY >= 2"
+  clean: {max_speed_mps: 70}
+  prepare:
+    bbox: [41.80, 41.99, 12.37, 12.62]   # Rome inside the ring road (~21 x 21 km); set your city
+    min_traj_points: 20                   # OmniTraj's filter
+
+eval:
+  split_by: predefined
+  val_by: time
+  val_fraction: 0.1
+  staypoint_method: trips
+  staypoint_time_s: 1200
+  trip_max_stay_s: 259200
+  window_length: 64
+  max_gap_s: 300
+  visit_context: 8
+  grid_cell_m: 500
+  eval_seeds: [0, 1, 2]
+  n_boot: 1000
+  max_eval_samples: 5000
+  retrieval_db_size: 20000                # the paper retrieves among 20,000 test trips
+  retrieval_queries: 1000
+
+models:
+  - name: OmniTraj                        # the released code's training
+    type: omnitraj
+    recipe: code
+    train:
+      device: cuda
+      options: {roads_file: /scratch/USER/roads/rome/matched.csv.gz}
+    adapter: {device: cuda, batch_size: 512}
+
+  - name: OmniTraj-paper                  # the paper's loss (InfoNCE on cosine similarity) and Adam
+    type: omnitraj
+    recipe: paper
+    train:
+      device: cuda
+      options: {roads_file: /scratch/USER/roads/rome/matched.csv.gz}
+    adapter: {device: cuda, batch_size: 512}
+
+  # The other models on the same city subset, for a like-for-like table
+  - name: UniTraj-zeroshot
+    type: unitraj
+    checkpoint: models/unitraj/model.pt
+    external_pretraining: true
+    adapter: {device: cuda, batch_size: 256}
+
+  - name: TransferTraj
+    type: transfertraj
+    arch: {embed_size: 64, d_model: 128, rafee_layer: 2}
+    train: {epochs: 50, batch_size: 32, lr: 1.0e-3, patience: 8, device: cuda}
+    adapter: {device: cuda, batch_size: 128}
+
+  - name: KinematicRef
+    type: kinematic_ref

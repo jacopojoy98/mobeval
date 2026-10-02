@@ -12,7 +12,7 @@ from scipy import sparse
 
 from . import baselines as B
 from . import progress
-from .adapters.base import (CONTINUOUS, EMBEDDING, GENERATION, MODE_CLASSIFICATION, NEXT_LOCATION, RECOVERY,
+from .adapters.base import (CONTINUOUS, CROSS_MODAL, EMBEDDING, GENERATION, MODE_CLASSIFICATION, NEXT_LOCATION, RECOVERY,
                             ContinuousPrediction, MobilityModelAdapter, TargetGuard)
 from .context import EvalContext
 from .paper_metrics import level_for as paper_level
@@ -796,6 +796,204 @@ class UserIdentificationTask(Task):
 
 
 # =========================================================================== #
+class RetrievalTask(Task):
+    """Trajectory retrieval from embeddings: MR, MRR, HR@k (similarity) and CR@k (conditions).
+
+    Database: `retrieval_db_size` test windows; queries: the first `retrieval_queries` of them. Every
+    query's answer is its own window, so a rank is well defined and there is exactly one hit.
+
+      odd_even      every model with embeddings. Query = the window's odd-indexed points, database =
+                    the even-indexed points of every window (the t2vec / TrajCL protocol): the two
+                    halves describe the same trip with no point in common.
+      cross_modal   models that embed other representations (OmniTraj): query = the window's topology,
+                    road segments, regions or a fusion of them; database = the GPS embeddings of the
+                    full windows. The paper's Table 2.
+      condition     OmniTraj's condition-based retrieval (Table 3): query = the SET of regions (road
+                    segments) of a window; CR@k = share of those elements present in the union of the
+                    top-k retrieved windows' elements.
+
+    Baselines, scored on the same queries and database: the Hausdorff distance between point sets
+    (the strongest heuristic in the OmniTraj paper; for cross_modal only against topology queries,
+    which are points) and random ranking.
+    """
+    name, capability = "retrieval", EMBEDDING
+
+    def applicable(self, adapter):
+        return EMBEDDING in adapter.capabilities
+
+    @staticmethod
+    def _sample(ctx):
+        key = ("retrieval_sample",)
+        if key not in ctx.cache:
+            w = ctx.windows.get("test")
+            if w is None or len(w) < 2:
+                ctx.cache[key] = None
+            else:
+                cfg = ctx.cfg
+                rng = np.random.default_rng(cfg.eval_seeds[0])
+                n = min(len(w), cfg.retrieval_db_size)
+                db = w.take(np.sort(rng.choice(len(w), n, replace=False)))
+                # queries drawn at random from the database: its first rows would be a few users only
+                q = np.sort(rng.choice(n, min(n, cfg.retrieval_queries), replace=False))
+                ctx.cache[key] = (db, q)
+        return ctx.cache[key]
+
+    @staticmethod
+    def _retag(b: TrajectoryBatch, tag: str) -> TrajectoryBatch:
+        return TrajectoryBatch(b.lat, b.lon, b.t, b.user_id, np.array([f"{t}#{tag}" for t in b.traj_id], dtype=object), b.mode)
+
+    @staticmethod
+    def _ranks(Q: np.ndarray, D: np.ndarray, truth: np.ndarray, higher_is_closer: bool = True) -> np.ndarray:
+        """Rank of the true item (1 = first); ties count against the query."""
+        ranks = np.empty(len(Q))
+        for s in range(0, len(Q), 256):
+            S = Q[s:s + 256] @ D.T if higher_is_closer else -Q[s:s + 256]
+            tv = S[np.arange(len(S)), truth[s:s + 256]]
+            ranks[s:s + 256] = 1 + (S > tv[:, None]).sum(1) + (S == tv[:, None]).sum(1) - 1
+        return ranks
+
+    @staticmethod
+    def _unit(E):
+        E = np.asarray(E, float)
+        return E / np.maximum(np.linalg.norm(E, axis=1, keepdims=True), 1e-12)
+
+    def _scores(self, ranks) -> Scores:
+        out = {"mean_rank": ranks.astype(float), "mrr": 1.0 / ranks}
+        for k in self.cfg_ks:
+            out[f"hr@{k}"] = (ranks <= k).astype(float)
+        return out, {}
+
+    @staticmethod
+    def _xy(ctx, lat, lon):
+        from .geo import LocalProjection
+        key = ("retrieval_proj",)
+        if key not in ctx.cache:
+            p = ctx.splits["train"].points
+            ctx.cache[key] = LocalProjection(float(p.lat.mean()), float(p.lon.mean()))
+        x, y = ctx.cache[key].to_xy(np.asarray(lat, float), np.asarray(lon, float))
+        return np.stack([x, y], -1).astype(np.float32)
+
+    @staticmethod
+    def _hausdorff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Symmetric Hausdorff between point set a (n, 2) and each window of b (N, L, 2)."""
+        d = np.sqrt(((a[None, :, None, :] - b[:, None, :, :]) ** 2).sum(-1))            # (N, n, L)
+        return np.maximum(d.min(2).max(1), d.min(1).max(1))
+
+    @staticmethod
+    def _hausdorff_ranks(qpts: List[np.ndarray], dpts: np.ndarray, truth: np.ndarray) -> np.ndarray:
+        """Rank of the true window by Hausdorff distance, exactly, without the full Q x N x n x L
+        tensor: H(q, j) >= max over q's points of the distance to j's bounding box, so only windows
+        whose bound is below H(q, true) need the exact distance."""
+        lo, hi = dpts.min(1), dpts.max(1)                                                 # (N, 2)
+        ranks = np.empty(len(qpts))
+        for i, a in enumerate(qpts):
+            h_true = RetrievalTask._hausdorff(a, dpts[truth[i]:truth[i] + 1])[0]
+            gap = np.maximum(np.maximum(lo[None] - a[:, None], a[:, None] - hi[None]), 0)  # (n, N, 2)
+            lb = np.sqrt((gap ** 2).sum(-1)).max(0)                                        # (N,)
+            cand = np.where(lb <= h_true)[0]
+            cand = cand[cand != truth[i]]
+            h = np.concatenate([RetrievalTask._hausdorff(a, dpts[cand[s:s + 512]]) for s in range(0, len(cand), 512)]) \
+                if len(cand) else np.array([])
+            ranks[i] = 1 + int((h <= h_true).sum())                                        # ties against the query
+        return ranks
+
+    def run(self, adapter, ctx):
+        got = self._sample(ctx)
+        if got is None:
+            ctx.skipped.append((_key(adapter), self.name, "fewer than 2 test windows"))
+            return []
+        db, q = got
+        cfg, recs, seed = ctx.cfg, [], cfg_seed(ctx)
+        self.cfg_ks = tuple(cfg.retrieval_ks)
+        truth = q.copy()
+        # every random baseline has its own fixed stream, so it is the same whichever model runs first
+        random_ranks = lambda n, k: np.random.default_rng([seed, k]).integers(1, len(db) + 1, size=n).astype(float)
+        protos = set(cfg.retrieval_protocols)
+        # ---------------------------------------------------------------- odd / even
+        if "odd_even" in protos and db.length >= 4:
+            ck = ("retrieval_base", "odd_even")
+            qb = self._retag(TrajectoryBatch(db.lat[q][:, 1::2], db.lon[q][:, 1::2], db.t[q][:, 1::2],
+                                             db.user_id[q], db.traj_id[q]), "odd")
+            dbb = self._retag(TrajectoryBatch(db.lat[:, ::2], db.lon[:, ::2], db.t[:, ::2], db.user_id, db.traj_id), "even")
+            if ck not in ctx.cache:
+                qp = [self._xy(ctx, qb.lat[i], qb.lon[i]) for i in range(len(qb))]
+                ctx.cache[ck] = {"hausdorff": self._scores(self._hausdorff_ranks(qp, self._xy(ctx, dbb.lat, dbb.lon), truth)),
+                                 "random": self._scores(random_ranks(len(q), 0))}
+
+            def _oe():
+                with ctx.timed(_key(adapter), EMBEDDING, len(qb) + len(dbb)):
+                    return self._ranks(self._unit(adapter.embed(qb)), self._unit(adapter.embed(dbb)), truth)
+            ranks = self.try_protocol(ctx, adapter, "retrieval/odd_even", "embedding", _oe)
+            if ranks is not None:
+                recs += self.emit(ctx, adapter, "retrieval/odd_even", len(q), self._scores(ranks), ctx.cache[ck],
+                                  ["hausdorff", "random"], seed, "embedding")
+        if CROSS_MODAL not in adapter.capabilities:
+            return recs
+        # ---------------------------------------------------------------- cross-modal (OmniTraj)
+        qb = db.take(q)
+        D = None
+        mods = [m for m in cfg.retrieval_modalities if m in adapter.query_modalities()]
+        if "cross_modal" in protos and mods:
+            D = self._unit(adapter.embed_database(db))
+            for m in mods:
+                ck = ("retrieval_base", "cross_modal", m)
+                if ck not in ctx.cache:
+                    base = {"random": self._scores(random_ranks(len(q), 1))}
+                    if m == "topology":
+                        from .nn.omnitraj_prep import resample, topology
+                        qp = []
+                        for i in range(len(qb)):
+                            tp = topology(resample(qb.lat[i], qb.lon[i]))
+                            qp.append(self._xy(ctx, tp[:, 1], tp[:, 0]))
+                        base["hausdorff"] = self._scores(self._hausdorff_ranks(qp, self._xy(ctx, db.lat, db.lon), truth))
+                    ctx.cache[ck] = base
+                ranks = self.try_protocol(ctx, adapter, f"retrieval/cross_modal:{m}", "native",
+                                          lambda m=m: self._ranks(self._unit(adapter.embed_query(qb, m)), D, truth))
+                if ranks is not None:
+                    recs += self.emit(ctx, adapter, f"retrieval/cross_modal:{m}", len(q), self._scores(ranks),
+                                      ctx.cache[ck], ["hausdorff", "random"], seed)
+        # ---------------------------------------------------------------- condition-based (OmniTraj)
+        if "condition" in protos:
+            D = self._unit(adapter.embed_database(db)) if D is None else D
+            for m in ("region", "road"):
+                if m not in adapter.query_modalities():
+                    continue
+
+                def _cr(m=m):
+                    elems = adapter.elements(db, m)
+                    # Eq. 14 divides by the query's size: a window with no matched segment is no query
+                    qi = np.array([i for i in q if elems[i]], int)
+                    if len(qi) < len(q):
+                        ctx.skipped.append((_key(adapter), f"retrieval/condition:{m}",
+                                            f"{len(q) - len(qi)} of {len(q)} queries have no {m} and were left out"))
+                    if not len(qi):
+                        return None
+                    Q = self._unit(adapter.embed_query(db.take(qi), m))
+                    top = np.argsort(-(Q @ D.T), axis=1, kind="stable")[:, :5]
+                    r = np.random.default_rng([seed, 2 if m == "region" else 3])
+                    rtop = np.stack([r.permutation(len(db))[:5] for _ in range(len(qi))])
+                    out = {}
+                    for name, T in (("model", top), ("random", rtop)):
+                        cr = {1: [], 5: []}
+                        for row, i in enumerate(qi):
+                            want = elems[i]
+                            for k in (1, 5):
+                                got = set().union(*[elems[j] for j in T[row, :k]])
+                                cr[k].append(len(want & got) / len(want))
+                        out[name] = ({"cr@1": np.asarray(cr[1]), "cr@5": np.asarray(cr[5])}, {})
+                    return out, len(qi)
+                res = self.try_protocol(ctx, adapter, f"retrieval/condition:{m}", "native", _cr)
+                if res is not None:
+                    res, nq = res
+                    recs += self.emit(ctx, adapter, f"retrieval/condition:{m}", nq, res["model"],
+                                      {"random": res["random"]}, ["random"], seed)
+        return recs
+
+
+def cfg_seed(ctx) -> int:
+    return int(ctx.cfg.eval_seeds[0])
+
+
 class AnomalyDetectionTask(Task):
     """Score every test window for how unusual it is, having seen only normal training data.
 
@@ -910,14 +1108,14 @@ class EfficiencyTask(Task):
 
 
 TASK_NAMES = ("recovery", "next_location", "continuous", "mode_classification", "generation",
-              "user_identification", "anomaly_detection", "efficiency")
+              "user_identification", "anomaly_detection", "retrieval", "efficiency")
 VISIT_TASKS = {"next_location", "continuous", "generation"}      # need staypoints / visit sequences
 
 
 def default_tasks(cfg) -> List[Task]:
     tasks = ([RecoveryTask(), NextLocationTask()] + [ContinuousValueTask(t) for t in cfg.continuous_targets]
              + [ModeClassificationTask(), GenerationTask(), UserIdentificationTask(),
-                AnomalyDetectionTask(), EfficiencyTask()])
+                AnomalyDetectionTask(), RetrievalTask(), EfficiencyTask()])
     if cfg.tasks is None:
         return tasks
     unknown = set(cfg.tasks) - set(TASK_NAMES)

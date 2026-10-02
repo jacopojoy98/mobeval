@@ -92,6 +92,17 @@ _SPECS = [
        "Average precision; compare against the anomaly rate, not against 0.5"),
     _S("precision@k", "anomaly", True, "fraction", "bounded", (0, 1), None, "mean",
        "Precision among the k highest-scored windows, k = number of injected anomalies"),
+    # --- trajectory retrieval -------------------------------------------------------
+    _S("mean_rank", "retrieval", False, "rank", "ratio", (1, INF), None, "mean",
+       "Mean rank of the query's own trajectory in the database (1 = always first)"),
+    _S("mrr", "retrieval", True, "fraction", "bounded", (0, 1), None, "mean", "Mean reciprocal rank"),
+    _S("hr@1", "retrieval", True, "fraction", "bounded", (0, 1), None, "mean", "Own trajectory ranked first"),
+    _S("hr@5", "retrieval", True, "fraction", "bounded", (0, 1)),
+    _S("hr@10", "retrieval", True, "fraction", "bounded", (0, 1)),
+    _S("cr@1", "retrieval", True, "fraction", "bounded", (0, 1), None, "mean",
+       "Coverage: share of the query's regions / road segments in the top-1 retrieved trajectory"),
+    _S("cr@5", "retrieval", True, "fraction", "bounded", (0, 1), None, "mean",
+       "Coverage over the union of the top-5 retrieved trajectories"),
     # --- efficiency -------------------------------------------------------------
     _S("n_parameters", "efficiency", False, "count", "none", (0, INF)),
     _S("latency_ms_per_sample", "efficiency", False, "ms", "none", (0, INF)),
@@ -101,7 +112,8 @@ REGISTRY = {s.name: s for s in _SPECS}
 # Non-redundant metrics used in cross-family summaries (ADE/median/p90/RMSE are highly
 # correlated; averaging all of them would silently up-weight recovery error).
 HEADLINE = {"ade_m", "fde_m", "dtw_m", "acc_100m", "acc@1", "acc@5", "dist_err_m", "crps_min", "mae_min",
-            "macro_f1", "balanced_accuracy", "jsd", "user_acc@1", "user_macro_f1", "roc_auc", "pr_auc"}
+            "macro_f1", "balanced_accuracy", "jsd", "user_acc@1", "user_macro_f1", "roc_auc", "pr_auc",
+            "mrr", "hr@1", "cr@1"}
 
 
 def get_spec(name: str) -> MetricSpec:

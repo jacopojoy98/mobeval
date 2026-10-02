@@ -57,6 +57,16 @@ SECTIONS = [
         ("continuous/duration|given:location+arrival", "p_within_10min", r"Stay P$\pm$10", "{:.3f}"),
         ("continuous/duration|given:location+arrival", "crps_min", "Stay CRPS", "{:.1f}"),
     ]),
+    # Retrieval: each query's answer is its own window. odd/even = the window's odd points against the
+    # even points of all windows (every embedding model); topology/region = OmniTraj's cross-modal and
+    # condition-based queries (its paper's Tables 2 and 3).
+    ("Trajectory retrieval", [
+        ("retrieval/odd_even", "hr@1", "Odd/even HR@1", "{:.3f}"),
+        ("retrieval/odd_even", "mean_rank", "Odd/even MR", "{:.2f}"),
+        ("retrieval/cross_modal:topology", "hr@1", "Topology HR@1", "{:.3f}"),
+        ("retrieval/cross_modal:topology", "mean_rank", "Topology MR", "{:.2f}"),
+        ("retrieval/condition:region", "cr@1", "Region CR@1", "{:.3f}"),
+    ]),
     ("Anomaly detection (ROC-AUC)", [
         ("anomaly/teleport", "roc_auc", "Teleport", "{:.3f}"),
         ("anomaly/detour", "roc_auc", "Detour", "{:.3f}"),
@@ -80,17 +90,19 @@ SECTIONS = [
 NO_BEST = {"copy_rate"}
 
 PRETTY = {"UniTraj-zeroshot": "UniTraj (zero-shot)", "UniTraj-finetuned": "UniTraj (fine-tuned)",
-          "CLIPMobility": "CLIP-Mobility", "TransferTraj": "TransferTraj", "TrajGPT": "TrajGPT"}
+          "CLIPMobility": "CLIP-Mobility", "TransferTraj": "TransferTraj", "TrajGPT": "TrajGPT",
+          "OmniTraj": "OmniTraj"}
 BASE_PRETTY = {"baseline:linear_interp": "Linear interpolation", "baseline:last_observed": "Last observed",
                "baseline:user_frequent": "User frequency", "baseline:markov1": "Markov-1",
                "baseline:global_popular": "Global popularity", "baseline:train_marginal": "Train marginal",
                "baseline:kinematic_knn": "Kinematic $k$-NN", "baseline:max_step": "Max step length",
                "baseline:uniform_bbox": "Uniform bbox", "baseline:seed_only": "Seed only (no generation)",
                "baseline:real_noise_floor": "Real noise floor",
-               "baseline:constant_velocity": "Constant velocity"}
+               "baseline:constant_velocity": "Constant velocity", "baseline:hausdorff": "Hausdorff distance",
+               "baseline:random": "Random ranking"}
 # Superscripts for metrics the model's paper reported (see mobeval/paper_metrics.py).
 PAPER_MARK = {"exact": r"$^{\star}$", "near": r"$^{\dagger}$"}
-PROTO = {"native": "native", "linear_probe": "probe", "embedding_knn": "emb.\\ $k$-NN",
+PROTO = {"native": "native", "linear_probe": "probe", "embedding_knn": "emb.\\ $k$-NN", "embedding": "embedding",
          "reconstruction": "recon.", "rollout": "rollout"}
 
 
@@ -129,7 +141,7 @@ def build(df: pd.DataFrame, show_ci: bool = False) -> str:
         cols = [c for c in all_cols if (c[0], c[1]) in have]
         if not cols:
             continue
-        protocols = [p for p in ("native", "linear_probe", "rollout", "embedding_knn", "reconstruction")
+        protocols = [p for p in ("native", "linear_probe", "rollout", "embedding", "embedding_knn", "reconstruction")
                      if p in set(sub.protocol.dropna())]
         rows, values = [], {}
         for model in models:

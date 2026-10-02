@@ -7,3 +7,6 @@ pyyaml>=6          # optional: YAML configs (JSON configs always work)
 torch>=2.1          # model adapters and training (the evaluation core runs without it)
 pytest>=7
 # optional: h3>=4   (H3 region tokenizer for TrajGPT, or loading original TrajGPT checkpoints)
+# optional: timm>=0.9 einops>=0.6 transformers>=4.30   (OmniTraj's original network)
+# optional: osmium>=3.6 shapely>=2 geopandas>=0.14     (road network + map matching for OmniTraj; geopandas only for FMM files)
+# optional: pyarrow   (.parquet tables; .csv / .csv.gz always work)

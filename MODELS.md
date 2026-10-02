@@ -257,6 +257,70 @@ them as skipped capabilities rather than silently scoring something different.
 encode/decode path is sound; short CPU runs on small data remain far from converged (about 1.5 km
 after 40 epochs with a 1-layer, 32-dimensional model), as expected.
 
+## OmniTraj (`type: omnitraj`)
+
+Source: github.com/Yasoz/OmniTraj (KDD 2025; no licence file, used with the authors' code as
+published). The network (four encoders, fusion layers, loss) is **vendored unmodified** in
+`mobeval/nn/omnitraj/`, so it is the original by construction. It needs `timm`, `einops` and
+`transformers`. No pretrained weights were released.
+
+**Preprocessing, reconstructed.** The repository ships no preprocessing code, only 1,000
+preprocessed Chengdu trips. `nn/omnitraj_prep.py` rebuilds each step from the paper and that
+sample, and states how well it matches:
+
+| step | source | agreement with the sample |
+|---|---|---|
+| 200 points by "cubic spline" | paper Sec. 3.2.1 | PCHIP (piecewise-cubic Hermite) over the point index, inferred. A quarter of the sample's steps are exactly 0 at stops, which arc-length parametrisation, scipy's CubicSpline (overshoot ripples) and linear-over-index all fail to produce |
+| topology = RDP, epsilon 1e-4 degrees, on the 200 resampled points | inferred | **exact for 1000/1000 trips** |
+| regions: 16 x 16 square cells, id = 1 + lon_index x 16 + lat_index | paper B.1 + fit | **99.9 %** of 200,000 cell ids |
+| roads: one map-matched segment id per original point, deduplicated in order | paper Def. 3 + sample | matcher not stated in the paper |
+| z-normalised (lon, lat); padding, BOS/EOS, truncation, augmentations | repository `utils/dataset.py` | line by line |
+
+Road and region ids are compacted to the training vocabulary: the original feeds raw ids and notes
+that segment 0 collides with padding. On a large area, only the most frequent `max_regions`
+cells keep their own id.
+
+**Paper vs code.** The released training differs from the paper's text, and the recipes follow
+each side:
+
+| | paper | code |
+|---|---|---|
+| loss | InfoNCE on cosine similarity, both directions (Eqs. 9-10) | cross-entropy against soft targets built from within-modality similarities, on unnormalised projections, averaged over directions |
+| contrast pairs | trajectory with each modality (Eq. 10) | trajectory-topology, topology-road, topology-region |
+| optimiser | Adam, lr 2e-4 (App. A) | AdamW, lr 2e-4, weight decay 1e-4 |
+
+Where the paper is silent, both recipes use the code's settings: cosine schedule over 500 epochs
+(eta_min 1e-5), batch 1536, gradient clipping 1.0, learnable temperature initialised at 1.0, and
+best model by validation loss. Both contrast the trajectory against each of the four fusions. The original augments the
+validation set as well (its dataset settings are shared); `augment_val` reproduces that.
+
+**Evaluation.** `embed()` returns the L2-normalised projection of the GPS trajectory, which is the
+retrieval space the model is trained for. Windows are spline-resampled to 200 points like trips.
+`embed_query(batch, "topology" | "road" | "region" | "region+topology" | ...)` embeds the other
+representations in the same space. For fusions it uses the repository's `get_embeddings` path:
+each modality normalised, fused, then normalised again. Training feeds the fusion layers
+unnormalised projections, so fused queries see inputs of a different scale than in training; this
+is the original's behaviour and is kept. The retrieval task (README) uses these
+for the paper's Table 2 (cross-modal retrieval: MR, MRR, HR@k) and Table 3 (condition-based
+retrieval: CR@1/5).
+
+**Scale.** OmniTraj is a city model: the Chengdu and Xi'an grids are about 9 km across. For a
+national panel, restrict the run to one city with `prepare: {bbox: ...}`
+(`examples/configs/omnitraj_city.yaml`). Two recipe values then no longer mean what they meant in
+the paper:
+- **Grid:** 16 x 16 cells over a larger city gives larger cells. Set `grid_cell_m: 571` to keep
+  the paper's cell size instead of its cell count.
+- **Normalisation:** the mean and std are fitted on the city's training trips.
+
+**Roads.** `mobeval roads` builds segments between intersections from an OpenStreetMap extract.
+`mobeval mapmatch` then assigns one segment per GPS point, using the built-in HMM matcher (Newson
+& Krumm) or FMM output (DATASETS.md). Without a `roads_file` the road encoder is left out, and
+the model and its retrieval queries use trajectory, topology and regions only. This is logged and
+stored in the checkpoint.
+
+**Not reproducible:** the paper's numbers. The Chengdu and Xi'an datasets (1.2M trips each) are no
+longer available, so every ☆ mark on OmniTraj is a comparison of method, not of data.
+
 ## Shared components
 
 **Mode-classification head.** The native head is trained on frozen embeddings and re-fitted for every
@@ -285,6 +349,9 @@ The TrajGPT duration NLL was produced by a head that could see the answer. Neith
 | TransferTraj | recovery | next location, travel time, duration, user identification, anomaly detection, generation (rollout) |
 | TrajGPT | next location, travel time, duration, generation | — (declares no embedding) |
 | CLIPMobility | recovery, next location, travel time, duration | user identification, anomaly detection, generation (rollout) |
+| OmniTraj | cross-modal and condition-based retrieval | next location, travel time, duration, user identification, anomaly detection (no decoder: no recovery or generation) |
+
+Every model with embeddings also takes part in similarity retrieval (`retrieval/odd_even`).
 
 A model is never given a head it does not have. The probe is linear, the encoder is frozen, and
 every probe result is tagged `protocol: linear_probe` in `results.jsonl` and named

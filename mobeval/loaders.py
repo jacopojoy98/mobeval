@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -218,7 +218,7 @@ def load_transfertraj_h5(path: str, context_out: Optional[str] = None) -> Mobili
 def prepare(ds: MobilityDataset, min_interval_s: Optional[float] = None, every_nth: Optional[int] = None,
             min_traj_points: Optional[int] = None, max_traj_points: Optional[int] = None,
             time_from: Optional[str] = None, time_to: Optional[str] = None,
-            min_user_trajectories: Optional[int] = None) -> MobilityDataset:
+            min_user_trajectories: Optional[int] = None, bbox: Optional[Sequence[float]] = None) -> MobilityDataset:
     """Per-dataset preprocessing steps the papers describe, applied after loading (order as listed):
 
     time_from / time_to    keep points in [time_from, time_to] (e.g. TrajGPT: GeoLife 2007-2008)
@@ -227,8 +227,15 @@ def prepare(ds: MobilityDataset, min_interval_s: Optional[float] = None, every_n
     min_interval_s         keep a point only if at least this long after the last kept one
                            (UniTraj's evaluation data at 3 s: min_interval_s: 3)
     min/max_traj_points    drop trajectories outside this length (TransferTraj: 5..120)
-    min_user_trajectories  drop users with fewer trajectories"""
+    min_user_trajectories  drop users with fewer trajectories
+    bbox                   [lat_min, lat_max, lon_min, lon_max]: keep only trajectories lying ENTIRELY
+                           inside (OmniTraj: "filtered out trajectories recorded outside urban areas").
+                           Applied first."""
     p = ds.points
+    if bbox is not None:
+        la0, la1, lo0, lo1 = bbox
+        inside = p.lat.between(la0, la1) & p.lon.between(lo0, lo1)
+        p = p[inside.groupby(p.traj_id).transform("all")]
     if time_from is not None:
         p = p[p.t >= to_unix_seconds(pd.Series([time_from])).iloc[0]]
     if time_to is not None:

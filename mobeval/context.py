@@ -102,6 +102,13 @@ class EvalConfig:
     anomaly_knn_k: int = 10
     anomaly_protocols: Sequence[str] = ("embedding_knn", "reconstruction")
     anomaly_mask_ratio: float = 0.3             # masking used by the 'reconstruction' protocol
+    # Trajectory retrieval (RetrievalTask): database of test windows, queries = its first N windows.
+    retrieval_protocols: Sequence[str] = ("odd_even", "cross_modal", "condition")
+    retrieval_db_size: int = 5000
+    retrieval_queries: int = 1000
+    retrieval_ks: Sequence[int] = (1, 5, 10)
+    retrieval_modalities: Sequence[str] = ("topology", "road", "region", "region+topology", "road+topology",
+                                           "region+road+topology")
 
 
 class EvalContext:

@@ -29,6 +29,11 @@ def _transfertraj():
     return TransferTrajAdapter
 
 
+def _omnitraj():
+    from .adapters.omnitraj import OmniTrajAdapter
+    return OmniTrajAdapter
+
+
 def _kinematic():
     from .adapters.reference import KinematicReference
     return KinematicReference
@@ -40,8 +45,9 @@ def _weak():
 
 
 MODEL_TYPES = {"unitraj": _unitraj, "trajgpt": _trajgpt, "clip_mobility": _clip, "transfertraj": _transfertraj,
-               "kinematic_ref": _kinematic, "weak_ref": _weak}
-TRAIN_METHOD = {"unitraj": "pretrain", "trajgpt": "train", "clip_mobility": "pretrain", "transfertraj": "pretrain"}
+               "omnitraj": _omnitraj, "kinematic_ref": _kinematic, "weak_ref": _weak}
+TRAIN_METHOD = {"unitraj": "pretrain", "trajgpt": "train", "clip_mobility": "pretrain", "transfertraj": "pretrain",
+                "omnitraj": "pretrain"}
 
 
 class ProvenanceError(RuntimeError):

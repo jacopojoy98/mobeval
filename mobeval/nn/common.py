@@ -32,7 +32,8 @@ class TrainConfig:
     patience: int = 8                      # early stopping on validation loss (epochs)
     grad_clip: float = 1.0                 # 0 / None: no clipping
     optimizer: str = "adamw"               # adamw | adam (L2-coupled weight decay, as torch.optim.Adam) | adafactor
-    scheduler: str = "plateau"             # plateau | step | none
+    scheduler: str = "plateau"             # plateau | step | cosine | none
+    cosine_eta_min: float = 0.0            # CosineAnnealingLR over `epochs` (scheduler: cosine)
     step_size: int = 5                     # StepLR (scheduler: step)
     step_gamma: float = 0.5
     restore_best: bool = True              # False: keep the last epoch's weights (original TransferTraj)
@@ -112,10 +113,12 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=cfg.plateau_factor, patience=pp)
     elif cfg.scheduler == "step":
         sched = torch.optim.lr_scheduler.StepLR(opt, step_size=cfg.step_size, gamma=cfg.step_gamma)
+    elif cfg.scheduler == "cosine":
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs, eta_min=cfg.cosine_eta_min)
     elif cfg.scheduler == "none":
         sched = None
     else:
-        raise ValueError("scheduler must be 'plateau', 'step' or 'none'")
+        raise ValueError("scheduler must be 'plateau', 'step', 'cosine' or 'none'")
     best, best_state, bad, history = math.inf, None, 0, []
     rep = progress.get()
     who = getattr(rep, "scope", None) or "model"

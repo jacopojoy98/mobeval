@@ -122,12 +122,19 @@ def pareto_front(df: pd.DataFrame) -> pd.DataFrame:
 # different protocol (see paper_metrics.py and the "Paper metrics" section of the report).
 PAPER_MARK = {"exact": " ★", "near": " ☆"}
 
-TITLES = {"identity": "User identification (from frozen embeddings)",
+TITLES = {"retrieval": "Trajectory retrieval (from embeddings)",
+          "identity": "User identification (from frozen embeddings)",
           "anomaly": "Anomaly detection (injected anomalies)"}
 
 # Printed under the section heading. These two families are the easiest in the whole report to
 # over-read, so the caveat travels with the numbers instead of living only in the docs.
 NOTES = {
+    "retrieval": "Each query's answer is its own window among `retrieval_db_size` test windows. "
+                 "**odd_even** (every embedding model): query = odd-indexed points, database = even-indexed "
+                 "points. **cross_modal** / **condition** (OmniTraj): query = the window's topology, road "
+                 "segments or regions. Compare against **hausdorff**, a strong non-learned baseline here: odd "
+                 "and even points of one trip are metres apart, so a model must beat plain geometry to add "
+                 "anything.",
     "identity": "Closed-set re-identification with a linear probe on frozen embeddings. Read every "
                 "model against **mean_location**, not against chance: individual mobility is largely "
                 "home and work location, so an embedding that merely records position re-identifies "
@@ -161,7 +168,7 @@ def markdown_report(store, ctx=None, title: str = "Mobility foundation model eva
     a = _agg(df)
     # Ordered so related families read together; anything new in the registry is appended
     # rather than silently dropped from the report.
-    order = ["recovery", "location", "continuous", "classification", "identity", "anomaly",
+    order = ["recovery", "location", "continuous", "classification", "retrieval", "identity", "anomaly",
              "generation", "efficiency"]
     families = order + sorted(set(a.family.dropna()) - set(order))
     for fam in families:

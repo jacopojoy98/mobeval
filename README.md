@@ -236,6 +236,24 @@ space). Beating chance on `teleport` means nothing — `max_step` gets 1.0 there
 *below* 0.5 is also informative: it means the model finds the corrupted windows easier than
 normal ones, which is what happens when a retraced route is more predictable than a real one.
 
+### Trajectory retrieval
+
+`retrieval` asks each model to find a trajectory in a database of `retrieval_db_size` test windows,
+from a query derived from that same trajectory. Scores are mean rank (MR), mean reciprocal rank
+(MRR) and HR@1/5/10. There are three protocols:
+
+- **`odd_even`** runs for every model with embeddings. The query is the window's odd-indexed
+  points, the database the even-indexed points of every window, as in t2vec and TrajCL.
+- **`cross_modal`** (OmniTraj) queries with the window's topology, road segments, regions or a
+  fusion of them, against the GPS embeddings (the OmniTraj paper's Table 2).
+- **`condition`** (OmniTraj) queries with the SET of a window's regions or road segments.
+  CR@k is the share of those elements found in the top-k retrieved windows (Table 3).
+
+The baselines are scored on the same queries: the Hausdorff distance between point sets, which is
+exact and pruned by bounding boxes so that 20,000-window databases stay tractable, and random
+ranking. On odd/even halves Hausdorff is hard to beat: a learned embedding has to add something
+beyond geometry.
+
 ## Checking that train and test cover the same places
 
 `mobeval info` now prints a split-overlap line, and it is worth reading before any location
@@ -298,6 +316,7 @@ the public UniTraj weights) must be declared with `external_pretraining: true`.
 | `unitraj` | recovery, embeddings, mode classification (head on frozen embeddings) | masked reconstruction; from scratch or `init_from` the public `model.pt` |
 | `trajgpt` | next location, travel time, duration (Gaussian mixtures), generation | region CE + travel/duration NLL on visit sequences |
 | `transfertraj` | recovery, embeddings, mode classification | span-masked pre-training (optional POI / road features) |
+| `omnitraj` | embeddings (retrieval, probes, mode classification); cross-modal and condition-based retrieval from topology / road segments / regions | contrastive alignment of trajectory, topology, road and region encoders (roads need map matching, below) |
 | `clip_mobility` | recovery (autoregressive), embeddings, mode classification, next location, travel time, duration (heads on the frozen visit encoder) | next-token regression + InfoNCE between trajectory and visit views |
 | `kinematic_ref`, `weak_ref` | non-neural references | none |
 
@@ -555,10 +574,12 @@ mobeval/
   results.py, report.py            result schema with sanity flags, reports
   layout.py, progress.py           per-run directories + durable mirroring, live status
   recipes.py, paper_metrics.py     original training recipes; which metrics each paper reported
-  adapters/  base.py, torch_base.py, unitraj.py, trajgpt.py, transfertraj.py, clip_mobility.py, reference.py
+  roads.py, mapmatch.py            OSM road segments, HMM map matching, FMM import/export (OmniTraj roads)
+  adapters/  base.py, torch_base.py, unitraj.py, trajgpt.py, transfertraj.py, omnitraj.py, clip_mobility.py, reference.py
   nn/        common.py (training loop, checkpoints, heads), features.py (tokenizers),
              unitraj_net.py, trajgpt_net.py, transfertraj_net.py, clip_net.py (networks,
-             checkpoint-compatible), unitraj_sampling.py (UniTraj's ATR resampling and masking)
+             checkpoint-compatible), unitraj_sampling.py (UniTraj's ATR resampling and masking),
+             omnitraj/ (OmniTraj's network, vendored unmodified), omnitraj_prep.py (its inputs)
 make_table.py                      LaTeX tables from leaderboard.csv (paper metrics marked)
 DATASETS.md                        where to get each paper's data
 ```

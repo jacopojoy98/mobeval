@@ -25,7 +25,10 @@ CONTINUOUS = "continuous"            # travel time / stay duration
 MODE_CLASSIFICATION = "mode_classification"
 EMBEDDING = "embedding"
 GENERATION = "generation"
-ALL_CAPABILITIES = {RECOVERY, NEXT_LOCATION, CONTINUOUS, MODE_CLASSIFICATION, EMBEDDING, GENERATION}
+# Embeds a trajectory from another of its representations (topology, road segments, regions), in the
+# same space as its GPS embedding: adapter.query_modalities() and adapter.embed_query(batch, mods).
+CROSS_MODAL = "cross_modal"
+ALL_CAPABILITIES = {RECOVERY, NEXT_LOCATION, CONTINUOUS, MODE_CLASSIFICATION, EMBEDDING, GENERATION, CROSS_MODAL}
 
 
 @dataclass

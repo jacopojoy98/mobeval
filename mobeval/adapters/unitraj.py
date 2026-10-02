@@ -193,7 +193,7 @@ class UniTrajAdapter(TorchAdapter):
         if not data["train"] or not data["val"]:
             raise ValueError(f"no {sample_unit}s with >= {min_points} points for UniTraj's original sampling")
         log.info(f"UniTraj original sampling: {len(data['train']):,} train / {len(data['val']):,} val "
-                 f"{sample_unit.replace('trajectory', 'trajectorie')}s, resample={resample}, mask mix={mask_mix or us.ORIGINAL_MIX}, "
+                 f"{'trajectories' if sample_unit == 'trajectory' else 'windows'}, resample={resample}, mask mix={mask_mix or us.ORIGINAL_MIX}, "
                  f"endpoints {'maskable' if mask_endpoints else 'kept'}, "
                  f"{'fixed' if fixed_hidden_count else 'per-window'} hidden count")
 

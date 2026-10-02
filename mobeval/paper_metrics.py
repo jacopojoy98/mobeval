@@ -14,6 +14,7 @@ by construction: where the original evaluation leaks targets or reads test data,
 evaluation cannot reproduce it, and saying "exact" would invite a comparison that does not hold.
 
 CLIP-Mobility has no publication, so it has no entries.
+OmniTraj's own evaluation is retrieval (Tables 2-3); its downstream uses are not evaluated with metrics.
 """
 from __future__ import annotations
 
@@ -88,6 +89,18 @@ PAPER_METRICS: Sequence[PaperMetric] = (
                 "the paper fine-tunes the model on origin, destination and departure time of a trip; "
                 "mobeval probes the frozen embedding of the preceding visits plus the destination",
                 protocols=("linear_probe",)),
+    # ---------------------------------------------------------------- OmniTraj
+    PaperMetric("omnitraj", r"retrieval/cross_modal:(topology|region|road|region\+topology|road\+topology|region\+road\+topology)",
+                ("mean_rank", "mrr", "hr@1", "hr@10"), "near",
+                "Trajectory retrieval MR / MRR / HR@1 / HR@10 ('OmniTraj' = topology queries; "
+                "'OmniTraj (reg)', '(road)', ... the other rows)", "OmniTraj paper, Table 2",
+                "same metrics and query/database roles, but the paper retrieves among the 20,000 whole test "
+                "trips of one city (1.1M training trips); mobeval among retrieval_db_size test windows",
+                protocols=("native",)),
+    PaperMetric("omnitraj", r"retrieval/condition:(road|region)", ("cr@1", "cr@5"), "near",
+                "Condition-based retrieval CR@1 / CR@5 (road, region)", "OmniTraj paper, Table 3 and Eq. 14",
+                "the paper's database is the 20,000 test trips; mobeval's retrieval_db_size test windows",
+                protocols=("native",)),
     # ---------------------------------------------------------------- TrajGPT
     PaperMetric("trajgpt", r"next_location", ("acc@1", "acc@5", "acc@10", "acc@20"), "near",
                 "Next-visit region Acc@k", "TrajGPT paper, next-visit prediction table",
@@ -142,7 +155,7 @@ def level_for(adapter, task: str, metric: str, protocol: str, ctx=None) -> str:
     return hit[0] if hit else ""
 
 
-def describe(model_types: Sequence[str] = ("unitraj", "trajgpt", "transfertraj")) -> str:
+def describe(model_types: Sequence[str] = ("unitraj", "trajgpt", "transfertraj", "omnitraj")) -> str:
     """Markdown list of every paper metric and what separates it from the paper's protocol."""
     lines = []
     for mt in model_types:

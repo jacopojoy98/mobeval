@@ -1,0 +1,32 @@
+#!/bin/bash
+#PBS -N mobeval_mapmatch
+#PBS -q q07daneel
+#PBS -l select=1:ncpus=32:mem=64gb
+#PBS -l walltime=48:00:00
+#PBS -j oe
+# Road network + map matching for OmniTraj's road modality (CPU only; no GPU needed).
+#   qsub -v CONFIG=$HOME/MobFM/BMdir/mobeval/examples/configs/omnitraj_city.yaml,PBF=/scratch/$USER/osm/italy-latest.osm.pbf,BBOX="41.75 42.05 12.30 12.70",ROADS_DIR=/scratch/$USER/roads jobs/mapmatch.pbs
+# Writes $ROADS_DIR/network.npz (segments between intersections) and $ROADS_DIR/matched.csv.gz (one
+# segment id per GPS point), the files the config's `roads_file` points at. ROADS_DIR must be on
+# /scratch (not the per-job directory, which is removed at the end) so training jobs can read it.
+# Download the OSM extract once on a login node, e.g.:
+#   wget -P /scratch/$USER/osm https://download.geofabrik.de/europe/italy-latest.osm.pbf
+
+cd "$PBS_O_WORKDIR"
+source jobs/env.sh
+setup_env
+stage_in
+
+: "${PBF:?pass PBF=/scratch/.../italy-latest.osm.pbf}"
+: "${ROADS_DIR:?pass ROADS_DIR=/scratch/$USER/roads}"
+mkdir -p "$ROADS_DIR"
+status=0
+if [ ! -f "$ROADS_DIR/network.npz" ]; then
+    run_mobeval roads --pbf "$PBF" ${BBOX:+--bbox $BBOX} --out "$ROADS_DIR/network.npz" -v || status=$?
+fi
+[ $status -eq 0 ] && { run_mobeval mapmatch --config "$SCRATCH/config.yaml" --roads "$ROADS_DIR/network.npz" \
+    --out "$ROADS_DIR/matched.csv.gz" --workers "${NCPUS:-8}" -v || status=$?; }
+
+explain_exit $status
+stage_out
+exit $status

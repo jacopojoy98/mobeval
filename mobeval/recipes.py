@@ -32,7 +32,7 @@ log = logging.getLogger("mobeval.recipes")
 _ADAM = {"optimizer": "adam", "weight_decay": 0.0, "grad_clip": 0.0, "drop_last": False}
 # Options that point at data files rather than change the method (e.g. TransferTraj's POI/road
 # embeddings): setting them is not an override of the recipe.
-DATA_OPTIONS = {"context"}
+DATA_OPTIONS = {"context", "roads_file"}
 
 RECIPES: Dict[str, Dict[str, dict]] = {
     # ============================================================== UniTraj
@@ -171,6 +171,56 @@ RECIPES: Dict[str, Dict[str, dict]] = {
                 "batch size and epochs: the repository only ships a smoke-test settings file (batch 16, "
                 "2 epochs); the paper's 64 and 30 are used",
                 "fixed-length windows instead of whole trips; local projection instead of UTM",
+            ],
+        },
+    },
+    # ============================================================== OmniTraj
+    "omnitraj": {
+        "code": {
+            "sources": ["github.com/Yasoz/OmniTraj main.py, utils/config.py, utils/dataset.py (commit 3ce11d6)"],
+            "arch": {},
+            "train": {"optimizer": "adamw", "lr": 2e-4, "weight_decay": 1e-4, "scheduler": "cosine",
+                      "cosine_eta_min": 1e-5, "epochs": 500, "batch_size": 1536, "grad_clip": 1.0,
+                      "patience": 10**6, "restore_best": True, "drop_last": False},
+            "options": {"loss": "code", "pairs": "code", "sample_unit": "trajectory", "min_points": 20, "grid_n": 16,
+                        "augment_val": True, "projection_dim": 512, "interpolation": "pchip"},
+            "eval": {"retrieval_db_size": 20000},
+            "dataset": "omnitraj_city",
+            "not_reproduced": [
+                "the authors' preprocessing is not public; it is reconstructed (nn/omnitraj_prep.py): RDP "
+                "topology reproduces the sample exactly, the 16x16 grid 99.9% of its cell ids; the "
+                "interpolant (PCHIP over the point index) and the map matcher are inferred, not confirmed",
+                "the Chengdu / Xi'an data (1.2M trips each) are no longer available; any city subset of other "
+                "data is a transfer of the method, not a reproduction of the numbers",
+                "road-segment and region ids are compacted to the training vocabulary (the original feeds raw "
+                "ids, where segment 0 collides with padding)",
+                "evaluation retrieves among test WINDOWS resampled to 200 points, not whole trips",
+            ],
+        },
+        "paper": {
+            "sources": ["OmniTraj paper (KDD 2025), Sec. 3.3 (Eqs. 9-10), Appendix A and B.1",
+                        "github.com/Yasoz/OmniTraj where the paper is silent"],
+            "arch": {},
+            "train": {"optimizer": "adam", "lr": 2e-4, "weight_decay": 0.0, "scheduler": "cosine",
+                      "cosine_eta_min": 1e-5, "epochs": 500, "batch_size": 1536, "grad_clip": 1.0,
+                      "patience": 10**6, "restore_best": True, "drop_last": False},
+            "options": {"loss": "paper", "pairs": "paper", "sample_unit": "trajectory", "min_points": 20,
+                        "grid_n": 16, "augment_val": True, "projection_dim": 512, "interpolation": "pchip"},
+            "eval": {"retrieval_db_size": 20000},
+            "dataset": "omnitraj_city",
+            "not_reproduced": [
+                "the authors' preprocessing is not public; it is reconstructed (nn/omnitraj_prep.py): RDP "
+                "topology reproduces the sample exactly, the 16x16 grid 99.9% of its cell ids; the "
+                "interpolant (PCHIP over the point index) and the map matcher are inferred, not confirmed",
+                "the Chengdu / Xi'an data (1.2M trips each) are no longer available; any city subset of other "
+                "data is a transfer of the method, not a reproduction of the numbers",
+                "road-segment and region ids are compacted to the training vocabulary (the original feeds raw "
+                "ids, where segment 0 collides with padding)",
+                "evaluation retrieves among test WINDOWS resampled to 200 points, not whole trips",
+                "the paper's loss is vanilla InfoNCE on cosine similarity with the trajectory contrasted "
+                "against each modality (Eq. 10), both used here; its temperature is not stated, so the "
+                "code's learnable temperature (initial value 1.0, soft for cosine logits) is kept",
+                "epochs, batch size, schedule and clipping are not in the paper; the code's values are used",
             ],
         },
     },

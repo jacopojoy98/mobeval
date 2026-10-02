@@ -11,6 +11,7 @@ preprocessing (staypoints, windows) happens inside the job, never on the login n
 | TrajGPT | GeoLife 1.3 (182 users, Beijing, 2007-2012) | microsoft.com/en-us/download/details.aspx?id=52367 | open | `loader: geolife` |
 | TransferTraj | DiDi Chengdu / Xi'an (~6 s) | outreach.didichuxing.com (GAIA) | registration | `loader: transfertraj_h5` |
 | TransferTraj | Porto taxi (15 s) | kaggle.com/competitions/pkdd-15-predict-taxi-service-trajectory-i | Kaggle account | `loader: porto` |
+| OmniTraj | DiDi Chengdu / Xi'an (1.2M trips each, map-matched) | no longer available | - | any city subset: `prepare: {bbox: ...}` |
 | CLIP-Mobility | - | no publication | - | - |
 
 ## WorldTrace (UniTraj)
@@ -89,3 +90,38 @@ model trained with `recipe:` warns about every `eval:` setting that differs from
 Some differences remain. mobeval assigns splits by trajectory or target visit, never by
 overlapping instances. It fits vocabularies and clipping on the train split only. It scores
 fixed-length windows rather than whole trips. MODELS.md lists these per model.
+
+## OmniTraj: a city subset plus a road network
+
+OmniTraj's datasets (DiDi Chengdu and Xi'an as processed by the authors: 200-point trips, topology,
+map-matched roads, 16 x 16 regions) are no longer downloadable. `examples/configs/omnitraj_city.yaml`
+runs it on one city of your own data instead. Every other model is evaluated on the same subset,
+so the table stays like-for-like.
+
+1. **OpenStreetMap extract.** On a login node:
+   `wget -P /scratch/$USER/osm https://download.geofabrik.de/europe/italy-latest.osm.pbf`
+   Geofabrik also has regional extracts (e.g. `europe/italy/centro-latest.osm.pbf`), which are
+   smaller.
+2. **Road network and map matching**, as a CPU job: `jobs/mapmatch.pbs`.
+   - `mobeval roads` cuts the drivable ways (motorway to residential, links, living streets) at
+     intersections, which is the paper's Definition 3. One-way streets keep their direction.
+   - `mobeval mapmatch` gives every GPS point of the configured dataset (after `prepare:`) a
+     segment id, with the built-in HMM matcher. Its parameters are `--sigma-m` (GPS noise,
+     default 20 m) and `--radius-m` (candidate radius, 60 m).
+   - It is pure Python, parallel over `--workers`, and takes roughly 0.1-0.5 s per trip: a city's
+     100k trips need a few hours on 32 cores.
+3. **FMM instead of the built-in matcher.** FMM (github.com/cyang-kth/fmm) is much faster, which
+   helps for many cities or full coverage:
+   - `mobeval roads ... --fmm net.gpkg` writes the network in FMM's format;
+   - `mobeval mapmatch --config c.yaml --fmm-export gps.csv` writes the points;
+   - run FMM with `--output_fields opath`;
+   - `mobeval mapmatch --config c.yaml --fmm-import out.csv --fmm-network net.gpkg --out matched.csv.gz`
+     reads the result back.
+
+   The same config must be used for export and import.
+4. Point `train.options.roads_file` at the matched table (`.csv.gz`, or `.parquet` with pyarrow).
+   The config's filters must match those used for map matching, because points are joined on
+   `(traj_id, t)`.
+
+The paper also drops trips under 20 points (`prepare: {min_traj_points: 20}`) and "trajectories
+recorded outside urban areas": `bbox` keeps only trips lying entirely inside the box.

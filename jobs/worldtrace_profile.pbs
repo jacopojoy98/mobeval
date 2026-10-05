@@ -1,8 +1,8 @@
 #!/bin/bash
-#PBS -N mobeval_all
+#PBS -N wordtrace_profile
 #PBS -q q07daneel
-#PBS -l select=1:ncpus=8:ngpus=2:mem=200gb
-#PBS -l walltime=72:00:00
+#PBS -l select=1:ncpus=8:mem=64gb
+#PBS -l walltime=10:00:00
 #PBS -j oe
 # Train every model that has no checkpoint yet, then evaluate everything, in a single job.
 #   qsub jobs/all_in_one.pbs
@@ -14,16 +14,21 @@
 #   qsub -v RESUME=latest jobs/all_in_one.pbs
 
 cd "$PBS_O_WORKDIR"
-source jobs/env.sh
-setup_env
-stage_in
-restore_checkpoints
-
 status=0
-run_mobeval run --config "$SCRATCH/config.yaml" --device cuda -v \
-    ${RESUME:+--resume "$RESUME"} || status=$?
+module load gcc/10.2.0
+module load openssl/1.1.1w
+module load python/3.13.11-pytorch
+VENV="$HOME/.venv-own"
 
-explain_exit $status
-stage_out
-echo "report: $RESULTS_DIR/latest/report.md"
-exit $status
+source $VENV/bin/activate
+mkdir /scratch/$USER/data
+mkdir /scratch/$USER/data/WorldTrace
+mkdir /scratch/$USER/wt_profile
+
+cp -r /home/jcolombini/data/WorldTrace /scratch/$USER/data
+
+python tools/worldtrace_profile.py --raw /scratch/$USER/data/WorldTrace \
+    --sample /home/$USER/data/worldtrace_sample.pkl --out /scratch/$USER/wt_profile --workers 32
+
+cp -r /scratch/$USER/wt_profile /home/$USER/data/context
+

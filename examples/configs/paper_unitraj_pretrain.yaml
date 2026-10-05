@@ -8,7 +8,8 @@ check_provenance: error
 
 dataset:
   loader: worldtrace
-  path: /home/jcolombini/data/WorldTrace/worldtrace_300k.npz   # written by jobs/worldtrace.pbs from Trajectory.zip
+  path: /scratch/USER/data/WorldTrace      # the Hugging Face download (per-trajectory CSVs)
+  max_trajectories: 300000                 # 2.45M in full (~35 GB of CSV); the paper's 1.1M subset is not public
 
 eval:
   tasks: [recovery]                        # no staypoints needed: skips hours of detection

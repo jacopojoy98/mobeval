@@ -5,10 +5,6 @@
 title: Mobility foundation models on vehicle panel data
 output_dir: /home/jcolombini/results
 progress_dir: /home/jcolombini/results/progress
-# Keep finished work outside scratch as it is produced (a checkpoint after every
-# improving epoch, results after every task), so a crash or walltime kill loses nothing.
-# Inside a PBS job these three are replaced: the job computes in /scratch and jobs/env.sh sets
-# RESULTS_DIR (default $HOME/results) as the durable and progress directory.
 persist_dir: /home/jcolombini/results
 
 dataset:
@@ -29,10 +25,11 @@ eval:
   val_fraction: 0.1
   staypoint_method: trips         # stays = gaps between consecutive trips (points only recorded while moving)
   staypoint_time_s: 1200          # a stay lasts at least 20 minutes
-  trip_max_stay_s: 259200         # gaps longer than 3 days are missing data
+  trip_max_stay_s: 86400         # gaps longer than 3 days are missing data
   window_length: 64               # points per GPS window; check sampling interval with `mobeval info`
   max_gap_s: 300                  # windows never span a sampling gap longer than this
-  visit_context: 8
+  visit_stride: 16
+  visit_context: 16
   grid_cell_m: 500
   eval_seeds: [0, 1, 2]
   n_boot: 1000
@@ -47,7 +44,10 @@ eval:
   continuous_protocols: [native, linear_probe]
   probe_top_k: 2000               # candidate cells; the log prints what share of targets they cover
   probe_max_train: 100000
-
+  
+  generation_max_real_trajectories: 20000   # test trajectories behind the reference stats
+  generation_nn_max_train: 3000
+  generation_nn_max_query: 2000
   # --- representation-level tasks --------------------------------------------
   # Read user identification against the `mean_location` baseline, not against chance.
   user_id_max_users: 100
@@ -58,11 +58,10 @@ eval:
   anomaly_rate: 0.1
   anomaly_protocols: [embedding_knn, reconstruction]
 
-  # UniTraj/TransferTraj/CLIP have no generator; rolling their reconstruction forward from a
-  # short real seed puts them on the generation axis too. Read against the `seed_only` baseline.
   generation_protocols: [native, rollout]
   rollout_seed_points: 4
   rollout_block: 8
+
 models:
   - name: UniTraj-zeroshot
     type: unitraj
@@ -71,27 +70,26 @@ models:
     adapter: {device: cuda, batch_size: 256}
   - name: UniTraj-finetuned
     type: unitraj
-    train: {init_from: /home/jcolombini/model.pt, epochs: 30, batch_size: 128, lr: 3.0e-4, patience: 5, device: cuda}
+    train: {init_from: /home/jcolombini/model.pt, epochs: 60, batch_size: 128, lr: 3.0e-4, patience: 50, device: cuda}
+    adapter: {device: cuda, batch_size: 256}
+  - name: UniTraj-fulltrain
+    type: unitraj
+    train: { epochs: 500, batch_size: 128, lr: 3.0e-4, patience: 50, device: cuda}
     adapter: {device: cuda, batch_size: 256}
   - name: TrajGPT
     type: trajgpt
-    train: {epochs: 200, batch_size: 64, lr: 1.0e-3, patience: 15, device: cuda}
+    train: {epochs: 20, batch_size: 64, lr: 1.0e-3, patience: 15, device: cuda}
     adapter: {device: cuda}
   - name: CLIPMobility
     type: clip_mobility
-    train: {epochs: 50, batch_size: 64, lr: 1.0e-4, patience: 8, device: cuda}
+    train: {epochs: 1000 , batch_size: 64, lr: 1.0e-4, patience: 50, device: cuda}
     adapter: {device: cuda}
   - name: TransferTraj
     type: transfertraj
-    # poi_dist / rn_dist: SQUARED context radius in metres. 10000 = the paper's 100 m; the original
-    # code's default (100 = 10 m) leaves almost no POI in range. The training log prints the coverage.
-    arch: {embed_size: 64, d_model: 128, rafee_layer: 2, poi_dist: 10000, rn_dist: 10000}
-    train: {epochs: 50, batch_size: 32, lr: 1.0e-3, patience: 8, device: cuda}
-    adapter:
-      device: cuda
-      batch_size: 128
-      coord_scale: 1000.0        # 1.0 reproduces the original (raw metres); see MODELS.md
-      # POI / road context from OpenStreetMap, built with `mobeval context --out /home/jcolombini/data/Context`.
-      # Remove the block to run TransferTraj without context.
-      context: {poi_embed: /home/jcolombini/data/Context/poi_embed.npy, poi_latlon: /home/jcolombini/data/Context/poi_latlon.npy,
-                road_embed: /home/jcolombini/data/Context/road_embed.npy, road_latlon: /home/jcolombini/data/Context/road_latlon.npy}
+    arch: {embed_size: 64, d_model: 128, rafee_layer: 2}
+    train: {epochs: 1000, batch_size: 64, lr: 1.0e-3, patience: 50,  device: cuda}
+    adapter: 
+        device: cuda 
+        batch_size: 64
+        coord_scale: 1000
+        context: {poi_embed: /home/jcolombini/data/Context/poi_embed.npy, poi_latlon: /home/jcolombini/data/Context/poi_latlon.npy, road_embed: /home/jcolombini/data/Context/road_embed.npy, road_latlon: /home/jcolombini/data/Context/road_latlon.npy}

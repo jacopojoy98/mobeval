@@ -1,8 +1,7 @@
 #!/usr/bin/env python
 """How was UniTraj's WorldTrace data derived from the public WorldTrace files?
 
-Two things, in one pass over the raw per-trajectory CSV files (read from inside Trajectory.zip, or
-from a folder if they were extracted):
+Two things, in one pass over the raw per-trajectory CSV files:
 
   1. a one-line profile of every raw file (length, sampling, speed, map-matching quality), so the
      raw distribution can be compared with the UniTraj repository sample (same columns, written for
@@ -12,7 +11,7 @@ from a folder if they were extracted):
      occurs in a raw file, in its matched or in its raw coordinates. The offset says whether the
      sample trajectory is a whole file or a slice of one.
 
-    python tools/worldtrace_profile.py --raw /scratch/$USER/Trajectory.zip \
+    python tools/worldtrace_profile.py --raw /scratch/$USER/data/WorldTrace \
         --sample /path/to/UniTraj/data/worldtrace_sample.pkl --out /scratch/$USER/wt_profile --workers 32
 
 Writes raw_profile.csv, sample_profile.csv and matches.csv into --out. Run it as a PBS job: the
@@ -26,13 +25,8 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-import sys
-
 import numpy as np
 import pandas as pd
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from mobeval.loaders import zip_index, zip_read  # noqa: E402
 
 R = 6_371_008.8
 SAMPLE_KEYS: dict = {}          # (timestamp, lat6, lon6) of each sample trajectory's first point -> row
@@ -66,19 +60,10 @@ def _init(keys):
     SAMPLE_KEYS = keys
 
 
-def one_file(path):
-    """`path` is a CSV file, or (zip path, member name, offset, size, method) for a file inside
-    Trajectory.zip - read in place, nothing is extracted."""
+def one_file(path: str):
     try:
-        if isinstance(path, tuple):
-            import io
-            zpath, name, off, size, method = path
-            with open(zpath, "rb") as fh:
-                df = pd.read_csv(io.BytesIO(zip_read(fh, off, size, method)))
-            path = name
-        else:
-            df = pd.read_csv(path)
-        ts = pd.to_datetime(df["time"])
+        df = pd.read_csv(path)
+        ts = pd.to_datetime(df["time"], format="ISO8601")
         t = ts.to_numpy().astype("datetime64[s]").astype(np.int64).astype(float)
         has_m = "matched_latitude" in df
         lat = df["matched_latitude" if has_m else "latitude"].to_numpy(float)
@@ -103,13 +88,12 @@ def one_file(path):
                                      "file_points": len(df)})
         return row, hits
     except Exception as e:                                           # noqa: BLE001 - one bad file must not stop the scan
-        return {"file": path if isinstance(path, str) else path[1], "error": repr(e)}, []
+        return {"file": path, "error": repr(e)}, []
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--raw", help="WorldTrace's Trajectory.zip (read in place, nothing is extracted), or a folder "
-                                  "of extracted per-trajectory CSV files")
+    ap.add_argument("--raw", help="folder with the WorldTrace per-trajectory CSV files (searched recursively)")
     ap.add_argument("--sample", help="UniTraj's data/worldtrace_sample.pkl (or a larger file in the same format)")
     ap.add_argument("--out", default="wt_profile")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
@@ -134,12 +118,9 @@ def main():
         print(f"sample: {len(rows):,} trajectories -> {out / 'sample_profile.csv'}")
 
     if a.raw:
-        if a.raw.endswith(".zip"):
-            files = [(a.raw, *m) for m in zip_index(a.raw)]
-        else:
-            files = sorted(str(p) for p in Path(a.raw).rglob("*.csv"))
+        files = sorted(str(p) for p in Path(a.raw).rglob("*.csv"))
         if a.max_files and len(files) > a.max_files:
-            files = [files[i] for i in np.sort(np.random.default_rng(a.seed).choice(len(files), a.max_files, replace=False))]
+            files = list(np.random.default_rng(a.seed).choice(files, a.max_files, replace=False))
         print(f"raw: {len(files):,} files, {a.workers} workers")
         prof, hits = [], []
         with ProcessPoolExecutor(a.workers, initializer=_init, initargs=(keys,)) as ex:

@@ -1,15 +1,11 @@
 # Shared environment for all mobeval PBS jobs. Edit this file once; the job scripts source it.
 # ---------------------------------------------------------------------------------------------
 # Where the code, the data and the results live (home or a project folder, NOT scratch)
-# The jobs are submitted from the mobeval folder (`qsub jobs/...`), so that folder is the default.
-MOBEVAL_DIR="${MOBEVAL_DIR:-${PBS_O_WORKDIR:-$PWD}}"
-# Override per job, e.g. for a paper reproduction:
-#   qsub -v CONFIG=$PWD/examples/configs/paper_trajgpt.yaml,RESULTS_DIR=$HOME/results_trajgpt jobs/all_in_one.pbs
-CONFIG="${CONFIG:-$MOBEVAL_DIR/examples/configs/vehicle_panel.yaml}"
-# The data are read from the paths in the config (dataset.path / train_path / test_path). DATA_DIR is
-# only where a RELATIVE path in the config is looked up.
-DATA_DIR="${DATA_DIR:-$HOME/data/data_by_fua_final}"
-RESULTS_DIR="${RESULTS_DIR:-$HOME/results}"   # final outputs are copied back here
+MOBEVAL_DIR="$HOME/mobeval"
+CONFIG="$MOBEVAL_DIR/examples/configs/omnitraj_city.yaml"
+DATA_DIR="$HOME/data"                 # the CSV/Parquet files referenced by the config
+RESULTS_DIR="$HOME/results/omnitraj_city"           # final outputs are copied back here
+export MOBEVAL_PROGRESS_DIR="$RESULTS_DIR/progress"
 
 # Scratch: all job I/O happens here (mandatory on this cluster; not backed up)
 SCRATCH="/scratch/$USER/mobeval/${PBS_JOBID:-manual-$$}"   # always a per-job subdirectory
@@ -26,15 +22,14 @@ export MOBEVAL_PROGRESS_DIR="$RESULTS_DIR/progress"
 #   $RESULTS_DIR/checkpoints/      one per model, shared by every run
 #   $RESULTS_DIR/runs/<run_id>/    report.md, results.jsonl, leaderboard.csv for that run
 #   $RESULTS_DIR/latest ->         the newest run
-export MOBEVAL_PERSIST_DIR="$RESULTS_DIR"
-
+export MOBEVAL_PERSIST_DIR="$RESULTS_DIR/latest"
 # Python environment. Check `module avail` on the cluster for the exact module names;
 # if there are no modules, just create the venv with the system python once:
 #   python3 -m venv ~/venvs/mobeval
-#   ~/venvs/mobeval/bin/pip install -e "$MOBEVAL_DIR[models]"
-# module load python/3.11
-# module load cuda/12.1
-VENV="$HOME/venvs/mobeval"
+module load gcc/10.2.0
+module load openssl/1.1.1w
+module load python/3.13.11-pytorch
+VENV="$HOME/.venv-own"
 
 setup_env() {
     set -euo pipefail
@@ -51,38 +46,23 @@ setup_env() {
       torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
 }
 
-# Copy the data files the config names to this job's scratch directory and rewrite the config to
-# point at the copies. Only those files are copied, not the folder around them. Data that already
-# lie under /scratch are used where they are.
+# Copy inputs to the local scratch disk and rewrite the config to point at them
 stage_in() {
-    mkdir -p "$SCRATCH/data" "$SCRATCH/results"
-    python - "$CONFIG" "$SCRATCH" "$DATA_DIR" > "$SCRATCH/config.yaml" <<'PY'
-import os, shutil, sys, yaml
-cfg = yaml.safe_load(open(sys.argv[1])); scratch, data_dir = sys.argv[2], sys.argv[3]
+    cp -r "$DATA_DIR" "$SCRATCH"
+    mkdir -p "$SCRATCH/results"
+    python - "$CONFIG" "$SCRATCH" > "$SCRATCH/config.yaml" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1])); scratch = sys.argv[2]
 cfg["output_dir"] = f"{scratch}/results"
 d = cfg["dataset"]
 for key in ("path", "train_path", "val_path", "test_path"):
-    src = d.get(key)
-    if not src:
-        continue
-    if not os.path.isabs(src):                      # relative: looked up in DATA_DIR by file name
-        src = os.path.join(data_dir, os.path.basename(src.rstrip("/")))
-    if not os.path.exists(src):
-        sys.exit(f"stage_in: dataset.{key} = {src} does not exist on {os.uname().nodename}")
-    if os.path.realpath(src).startswith("/scratch/"):
-        d[key] = src
-        print(f"stage_in: {key} used in place ({src})", file=sys.stderr)
-        continue
-    dst = os.path.join(scratch, "data", os.path.basename(src.rstrip("/")))
-    shutil.copytree(src, dst) if os.path.isdir(src) else shutil.copy2(src, dst)
-    d[key] = dst
-    print(f"stage_in: {key} {src} -> {dst}", file=sys.stderr)
+    if d.get(key):
+        d[key] = f"{scratch}/data/" + d[key].rsplit("data/", 1)[-1]
 yaml.safe_dump(cfg, sys.stdout, sort_keys=False)
 PY
 }
 
-# Final sync. mobeval already copied checkpoints and results to $MOBEVAL_PERSIST_DIR as it went,
-# so this only picks up anything left over - it is no longer the step your results depend on.
+# Copy results (including checkpoints) back; scratch can be wiped at any time
 stage_out() {
     mkdir -p "$RESULTS_DIR"
     cp -r "$SCRATCH/results/." "$RESULTS_DIR/" 2>/dev/null || true
@@ -101,8 +81,7 @@ stage_out() {
     return 0
 }
 
-# Reuse checkpoints from previous jobs so a re-submission does not retrain everything.
-# mobeval does this itself from $MOBEVAL_PERSIST_DIR; this stays for jobs that set neither.
+# Reuse checkpoints from previous jobs so a re-submission does not retrain everything
 restore_checkpoints() {
     if [ -d "$RESULTS_DIR/checkpoints" ]; then
         mkdir -p "$SCRATCH/results/checkpoints"
@@ -144,6 +123,8 @@ Whatever had finished is already in $RESULTS_DIR; re-submit with RESUME to conti
 MSG
     fi
 }
+
+
 
 # Run mobeval so that the trap above can reach it, instead of blocking the shell. Returns
 # mobeval's exit status instead of aborting under `set -e`, so the caller can still stage out.

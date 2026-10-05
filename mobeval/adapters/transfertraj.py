@@ -93,39 +93,6 @@ class TransferTrajAdapter(TorchAdapter):
                 log.info(f"{kind}: {len(e)} entries with {e.shape[1]}-d embeddings")
         return out
 
-    def context_coverage(self, batch: TrajectoryBatch, max_points: int = 20_000) -> dict:
-        """How much context the model actually sees: per kind, the share of GPS points with at least
-        one POI / road entry inside the radius, and the mean number inside it. Logged before training,
-        because a radius that is too small (the original's default is 10 m) or features built for
-        another area leave the context pathway empty without any error."""
-        out = {}
-        if not len(batch):
-            return out
-        from scipy.spatial import cKDTree
-        x, y = self.proj.to_xy(batch.lat.ravel(), batch.lon.ravel())
-        pts = np.stack([x, y], 1)
-        if len(pts) > max_points:
-            pts = pts[np.random.default_rng(0).choice(len(pts), max_points, replace=False)]
-        for kind, key in (("poi", "poi_dist"), ("road", "rn_dist")):
-            coo = self.context.get(f"{kind}_latlon")
-            if not coo or not Path(coo).exists():
-                continue
-            c = np.load(coo)
-            cx, cy = self.proj.to_xy(c[:, 0], c[:, 1])
-            radius = float(self.arch[key]) ** 0.5
-            n = cKDTree(np.stack([cx, cy], 1)).query_ball_point(pts, radius, return_length=True)
-            out[kind] = {"entries": int(len(c)), "radius_m": radius, "share_with_any": float((n > 0).mean()),
-                         "mean_neighbours": float(n.mean())}
-            msg = (f"{kind} context: {len(c):,} entries, radius {radius:.0f} m (arch.{key} = {self.arch[key]:g} m²): "
-                   f"{(n > 0).mean():.1%} of GPS points have at least one within it, {n.mean():.1f} on average")
-            if (n > 0).mean() < 0.2:
-                log.warning(msg + f". The {kind} pathway is nearly empty: raise arch.{key} (the paper uses a 100 m "
-                                  f"radius = 10000; `mobeval context` prints a value for your density) or check "
-                                  f"that the features cover this area.")
-            else:
-                log.info(msg)
-        return out
-
     # ------------------------------------------------------------------ persistence
     def save(self, path, history=None, quiet: bool = False, complete: bool = True):
         from ..nn.common import save_checkpoint
@@ -277,7 +244,6 @@ class TransferTrajAdapter(TorchAdapter):
                      context=context, device=cfg.device, **kw)
         tr, va = ctx.windows["train"], ctx.windows["val"]
         rng = np.random.default_rng(cfg.seed)
-        ad.context_coverage(tr)
 
         if objective not in ("pretrain", "tp", "trec"):
             raise ValueError("objective must be 'pretrain', 'tp' or 'trec'")

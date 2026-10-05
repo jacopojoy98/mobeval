@@ -1,7 +1,6 @@
 """Dataset loaders -> canonical MobilityDataset."""
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -9,8 +8,6 @@ import numpy as np
 import pandas as pd
 
 from .data import MobilityDataset
-
-log = logging.getLogger("mobeval.loaders")
 
 def to_unix_seconds(x) -> pd.Series:
     """Resolution-independent datetime -> unix seconds (pandas>=2 may store s/ms/us/ns)."""
@@ -86,13 +83,7 @@ def load_geolife(root: str, users=None, labelled_only: bool = False,
     to 5 classes (taxi->car, subway/railway->train); unlabelled points get mode=None.
     Implausible jumps (> max_speed_mps) are removed, following UniTraj-style filtering;
     max_speed_mps: null keeps every point, as TrajGPT's trackintel reader does."""
-    root = Path(root)
-    if (root / "Data").exists():
-        root = root / "Data"
-    elif not any((d / "Trajectory").exists() for d in root.iterdir() if d.is_dir()):
-        nested = sorted(root.glob("*/Data"))          # the zip unpacks to "Geolife Trajectories 1.3/Data"
-        if nested:
-            root = nested[0]
+    root = Path(root) / "Data" if (Path(root) / "Data").exists() else Path(root)
     frames = []
     for udir in sorted(p for p in root.iterdir() if p.is_dir()):
         if users is not None and udir.name not in set(users):
@@ -140,95 +131,19 @@ def load_geolife(root: str, users=None, labelled_only: bool = False,
 # --------------------------------------------------------------------------- #
 # Datasets of the original papers (download instructions: DATASETS.md)
 # --------------------------------------------------------------------------- #
-def zip_index(path, suffix: str = ".csv") -> list:
-    """(name, header_offset, compressed_size, compression) of every member of a zip archive ending in
-    `suffix`. Plain tuples, so they can be handed to worker processes: each worker then reads its
-    members with `zip_read` from its own file handle, without loading the archive's directory again
-    (2.45M entries for WorldTrace) and without extracting anything to disk."""
-    import zipfile
-    with zipfile.ZipFile(path) as z:
-        return [(i.filename, i.header_offset, i.compress_size, i.compress_type) for i in z.infolist()
-                if i.filename.endswith(suffix) and not i.is_dir()]
-
-
-def zip_read(fh, header_offset: int, compress_size: int, compress_type: int) -> bytes:
-    """The uncompressed bytes of one zip member, read from an open binary file handle."""
-    import struct
-    import zlib
-    fh.seek(header_offset)
-    head = fh.read(30)
-    if head[:4] != b"PK\x03\x04":
-        raise ValueError(f"no zip local header at offset {header_offset}")
-    n_name, n_extra = struct.unpack("<HH", head[26:30])
-    fh.seek(header_offset + 30 + n_name + n_extra)
-    data = fh.read(compress_size)
-    if compress_type == 0:
-        return data
-    if compress_type == 8:
-        return zlib.decompress(data, -15)
-    raise ValueError(f"unsupported zip compression method {compress_type}")
-
-
-WT_COLUMNS = ("latitude", "longitude", "matched_latitude", "matched_longitude")
-
-
-def read_worldtrace_csv(source) -> dict:
-    """One WorldTrace trajectory file (path, bytes or file object) -> arrays: t (unix seconds), raw
-    and map-matched coordinates (NaN where a column is absent)."""
-    import io
-    d = pd.read_csv(io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source)
-    out = {"t": to_unix_seconds(d["time"]).to_numpy(np.float64)}
-    for c in WT_COLUMNS:
-        out[c] = d[c].to_numpy(np.float64) if c in d else np.full(len(d), np.nan)
-    return out
-
-
 def load_worldtrace(root: str, max_trajectories: Optional[int] = None, seed: int = 0, pattern: str = "**/*.csv",
                     use_matched: bool = False) -> MobilityDataset:
     """WorldTrace (huggingface.co/datasets/OpenTrace/WorldTrace, ODbL), UniTraj's pre-training data.
 
-    `root` is one of:
-      * a subset file written by tools/worldtrace_subset.py (.npz) - the practical way: the download
-        is ONE archive (Trajectory.zip, 27 GB, 2.45M files), and the tool samples trajectories
-        straight out of it into a single file, with nothing unzipped;
-      * Trajectory.zip itself: `max_trajectories` members are read directly from the archive (single
-        process; fine for a few thousand, use the tool for more);
-      * a folder of extracted per-trajectory CSV files (columns `time`, `latitude`, `longitude`, ...);
-      * a pickle in UniTraj's own format (a DataFrame with a `time` series and a `trajectory` array
-        of (lat, lon) per row, like data/worldtrace_sample.pkl).
-    use_matched: read the map-matched coordinates (what UniTraj's released sample appears to hold)
-    instead of the raw GPS ones. There are no users: each trajectory is its own user. The paper's
-    curated subset is not public; `max_trajectories` draws a random one."""
+    `root` is either the downloaded folder of per-trajectory CSV files (columns `time`, `latitude`,
+    `longitude`, ...; 1 s sampling) or a pickle in UniTraj's own format (a DataFrame with a `time`
+    series and a `trajectory` array of (lat, lon) per row, like data/worldtrace_sample.pkl).
+    There are no users: each trajectory is its own user. The full release is 2.45M trajectories
+    (~35 GB); `max_trajectories` draws a random subset (the paper's curated 1.1M subset is not public)."""
     p = Path(root)
     rng = np.random.default_rng(seed)
-    lat_c, lon_c = ("matched_latitude", "matched_longitude") if use_matched else ("latitude", "longitude")
     frames = []
-    if p.is_file() and p.suffix == ".npz":
-        z = np.load(p, allow_pickle=False)
-        length = z["length"].astype(np.int64)
-        idx = np.arange(len(length))
-        if max_trajectories and len(idx) > max_trajectories:
-            idx = np.sort(rng.choice(idx, max_trajectories, replace=False))
-        end = np.cumsum(length)
-        rows = np.concatenate([np.arange(end[i] - length[i], end[i]) for i in idx]) if len(idx) < len(length) else slice(None)
-        names = np.array([Path(n).stem for n in z["names"]])
-        df = pd.DataFrame({"t": z["t"][rows], "lat": z[lat_c][rows], "lon": z[lon_c][rows],
-                           "traj_id": np.repeat(names[idx], length[idx])})
-        frames.append(df)
-    elif p.is_file() and p.suffix == ".zip":
-        members = zip_index(p)
-        if not members:
-            raise FileNotFoundError(f"no .csv members in {p}")
-        if max_trajectories and len(members) > max_trajectories:
-            members = [members[i] for i in np.sort(rng.choice(len(members), max_trajectories, replace=False))]
-        elif len(members) > 50_000:
-            log.warning(f"reading all {len(members):,} trajectories of {p.name} in one process; set "
-                        f"max_trajectories, or build a subset file with tools/worldtrace_subset.py")
-        with open(p, "rb") as fh:
-            for name, off, size, method in members:
-                d = read_worldtrace_csv(zip_read(fh, off, size, method))
-                frames.append(pd.DataFrame({"t": d["t"], "lat": d[lat_c], "lon": d[lon_c], "traj_id": Path(name).stem}))
-    elif p.is_file() and p.suffix in (".pkl", ".pickle"):
+    if p.is_file() and p.suffix in (".pkl", ".pickle"):
         df = pd.read_pickle(p)
         idx = np.arange(len(df))
         if max_trajectories and len(idx) > max_trajectories:
@@ -244,6 +159,7 @@ def load_worldtrace(root: str, max_trajectories: Optional[int] = None, seed: int
             raise FileNotFoundError(f"no WorldTrace CSV files matching {pattern} under {root}")
         if max_trajectories and len(files) > max_trajectories:
             files = [files[i] for i in np.sort(rng.choice(len(files), max_trajectories, replace=False))]
+        lat_c, lon_c = ("matched_latitude", "matched_longitude") if use_matched else ("latitude", "longitude")
         for f in files:
             d = pd.read_csv(f, usecols=["time", lat_c, lon_c])
             frames.append(pd.DataFrame({"t": to_unix_seconds(d["time"]), "lat": d[lat_c], "lon": d[lon_c],

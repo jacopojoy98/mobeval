@@ -2,7 +2,7 @@
 
 Each model's reproduction config (`examples/configs/paper_*.yaml`) reads the dataset its paper
 used. mobeval does not download anything. Compute nodes have no internet access, so download
-on a **login node** into `$HOME/data` (the job scripts copy what a run needs to scratch), then submit the run as a PBS job. Heavy
+on a **login node** into `/scratch/$USER/data`, then submit the run as a PBS job. Heavy
 preprocessing (staypoints, windows) happens inside the job, never on the login node.
 
 | Model | Dataset | Where | Access | Loader |
@@ -18,25 +18,16 @@ preprocessing (staypoints, windows) happens inside the job, never on the login n
 
     # on a login node
     pip install --user -U "huggingface_hub[cli]"
-    huggingface-cli download OpenTrace/WorldTrace Trajectory.zip --repo-type dataset --local-dir $HOME/data/WorldTrace
+    huggingface-cli download OpenTrace/WorldTrace --repo-type dataset --local-dir /scratch/$USER/data/WorldTrace
 
-The download is ONE archive, `Trajectory.zip` (27 GB, 2.45M per-trajectory CSV files with `time`,
-`latitude`, `longitude` and map-matched columns). **Do not unzip it**: extraction takes hours and
-leaves millions of small files. mobeval reads the files from inside the archive instead:
+The download is archives of per-trajectory CSV files (`time`, `latitude`, `longitude`, map-matched
+columns). Extract them in a PBS job, not on the login node. `load_worldtrace` reads every `*.csv`
+below `path`; it also reads UniTraj's own pickle format (`data/worldtrace_sample.pkl` in the
+repository), which is a quick way to check the setup.
 
-    qsub jobs/worldtrace.pbs                 # 300,000 random trajectories -> $HOME/data/WorldTrace/worldtrace_300k.npz
-    qsub -v N=500000 jobs/worldtrace.pbs
-
-The result is a single file (40 bytes per point, about 4.5 GB for 300,000 trajectories) that
-`loader: worldtrace` opens directly; the UniTraj configs point at it. The loader also accepts
-`Trajectory.zip` itself with `max_trajectories` (single process, fine for a few thousand), a folder
-of extracted CSV files, and UniTraj's own pickle format (`data/worldtrace_sample.pkl`).
-
-- The paper's curated training subset is not released, so the subset is a random draw.
-- `use_matched: true` reads the map-matched coordinates instead of the raw GPS ones. UniTraj's
-  released sample has 6-decimal coordinates like the matched columns, which suggests that is what
-  the authors trained on; `qsub -v MODE=profile,SAMPLE=.../worldtrace_sample.pkl jobs/worldtrace.pbs`
-  checks it against the whole archive (tools/worldtrace_profile.py).
+- The paper trained on a curated 1.1M-trajectory subset that is not released. Use
+  `max_trajectories` to draw a random subset: the full set is ~880M points, far more than one
+  job's memory.
 - WorldTrace has no users, so each trajectory is its own user. User-level tasks are meaningless on
   it, and the UniTraj configs run recovery only.
 - The paper evaluates on trajectories resampled to 3 s, while pre-training reads the 1 s data
@@ -46,7 +37,7 @@ of extracted CSV files, and UniTraj's own pickle format (`data/worldtrace_sample
 ## GeoLife (TrajGPT)
 
     wget -O geolife.zip "https://download.microsoft.com/download/F/4/8/F4894AA5-FDBC-481E-9285-D5F8C4C4F039/Geolife%20Trajectories%201.3.zip"
-    unzip geolife.zip -d $HOME/data/Geolife
+    unzip geolife.zip -d /scratch/$USER/data/geolife
 
 `path` is the folder containing `Data/`. TrajGPT's preprocessing, as set in `paper_trajgpt.yaml`:
 

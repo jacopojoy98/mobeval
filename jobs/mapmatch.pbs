@@ -5,28 +5,46 @@
 #PBS -l walltime=48:00:00
 #PBS -j oe
 # Road network + map matching for OmniTraj's road modality (CPU only; no GPU needed).
-#   qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,PBF=/scratch/$USER/osm/italy-latest.osm.pbf,BBOX="41.75 42.05 12.30 12.70",ROADS_DIR=/scratch/$USER/roads jobs/mapmatch.pbs
-# Writes $ROADS_DIR/network.npz (segments between intersections) and $ROADS_DIR/matched.csv.gz (one
-# segment id per GPS point), the files the config's `roads_file` points at. ROADS_DIR must be on
-# /scratch (not the per-job directory, which is removed at the end) so training jobs can read it.
-# Download the OSM extract once on a login node, e.g.:
-#   wget -P /scratch/$USER/osm https://download.geofabrik.de/europe/italy-latest.osm.pbf
+#   qsub jobs/mapmatch.pbs
+#   qsub -v BBOX="44.80 45.90 8.50 9.80",CITY=milan jobs/mapmatch.pbs
+# Variables (all optional, pass with -v NAME=value,...):
+#   CONFIG    the city config (default: examples/configs/omnitraj_city.yaml)
+#   PBF       the OpenStreetMap extract (default: $HOME/data/context/italy-latest.osm.pbf)
+#   BBOX      "lat_min lat_max lon_min lon_max": only roads inside it are read. Use the config's
+#             prepare.bbox; without it the whole extract is parsed, which is much slower.
+#   CITY      names the output folder (default: milan)
+#   ROADS_OUT where the results are kept (default: $HOME/data/roads/$CITY)
+# Writes network.npz (segments between intersections) and matched.csv.gz (one segment id per GPS
+# point), the file the config's `roads_file` points at. The work happens in this job's scratch
+# directory; the two files are copied to ROADS_OUT at the end.
+# Download the extract once on a login node:
+#   wget -P $HOME/data/context https://download.geofabrik.de/europe/italy-latest.osm.pbf
 
 cd "$PBS_O_WORKDIR"
+CONFIG="${CONFIG:-$PWD/examples/configs/omnitraj_city.yaml}"
 source jobs/env.sh
 setup_env
 stage_in
 
-: "${PBF:?pass PBF=/scratch/.../italy-latest.osm.pbf}"
-: "${ROADS_DIR:?pass ROADS_DIR=/scratch/$USER/roads}"
-mkdir -p "$ROADS_DIR"
+PBF="${PBF:-$HOME/data/context/italy-latest.osm.pbf}"
+CITY="${CITY:-milan}"
+ROADS_OUT="${ROADS_OUT:-$HOME/data/roads/$CITY}"
+[ -f "$PBF" ] || { echo "OSM extract not found: $PBF (pass PBF=...)"; exit 1; }
+ROADS_DIR="$SCRATCH/roads"
+mkdir -p "$ROADS_DIR" "$ROADS_OUT"
+cp "$PBF" "$SCRATCH/osm.pbf"
+[ -f "$ROADS_OUT/network.npz" ] && cp "$ROADS_OUT/network.npz" "$ROADS_DIR/"     # reuse an earlier network
+
 status=0
 if [ ! -f "$ROADS_DIR/network.npz" ]; then
-    run_mobeval roads --pbf "$PBF" ${BBOX:+--bbox $BBOX} --out "$ROADS_DIR/network.npz" -v || status=$?
+    run_mobeval roads --pbf "$SCRATCH/osm.pbf" ${BBOX:+--bbox $BBOX} --out "$ROADS_DIR/network.npz" -v || status=$?
+    [ $status -eq 0 ] && cp "$ROADS_DIR/network.npz" "$ROADS_OUT/"
 fi
 [ $status -eq 0 ] && { run_mobeval mapmatch --config "$SCRATCH/config.yaml" --roads "$ROADS_DIR/network.npz" \
     --out "$ROADS_DIR/matched.csv.gz" --workers "${NCPUS:-8}" -v || status=$?; }
+[ $status -eq 0 ] && { cp "$ROADS_DIR/matched.csv.gz" "$ROADS_OUT/"; echo "roads_file: $ROADS_OUT/matched.csv.gz"; }
 
 explain_exit $status
 stage_out
 exit $status
+

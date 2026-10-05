@@ -8,7 +8,7 @@ check_provenance: error
 
 dataset:
   loader: geolife
-  path: /home/jcolombini/data/Geolife                 # the folder that contains Data/ (or Data/ itself)
+  path: /scratch/USER/data/geolife        # folder containing Data/
   max_speed_mps: null                      # TrajGPT reads GeoLife with trackintel, no speed filter
   prepare:
     time_from: "2007-01-01 00:00:00"       # the original keeps visits in 2007-2008

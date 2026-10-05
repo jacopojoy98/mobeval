@@ -9,16 +9,14 @@
 # 1. Road network and map matching (CPU job, once per city):
 #      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,PBF=/scratch/$USER/osm/italy-latest.osm.pbf,BBOX="41.80 41.99 12.37 12.62",ROADS_DIR=/scratch/$USER/roads/rome jobs/mapmatch.pbs
 # 2. Train and evaluate:
-#      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,RESULTS_DIR=$HOME/results_rome jobs/all_in_one.pbs
-title: OmniTraj and the other models on one city (Rome)
-output_dir: /home/jcolombini/results_rome                 # its own folder: the models here are trained on one city,
-progress_dir: /home/jcolombini/results_rome/progress      # so their checkpoints must not mix with the full panel's
-persist_dir: /home/jcolombini/results_rome
+#      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,RESULTS_DIR=$HOME/MobFM/results_rome jobs/all_in_one.pbs
+title: OmniTraj and the other models on one city (Milan)
+output_dir: results/omnitraj_city
 
 dataset:
   loader: csv
-  train_path: /home/jcolombini/data/data_by_fua_final/train.csv
-  test_path: /home/jcolombini/data/data_by_fua_final/test_FVF.csv
+  train_path: /home/$USER/data/data_by_fua_final/train.csv
+  test_path: /home/$USER/data/data_by_fua_final/train.csv
   time_col: datetime
   user_id: uid
   traj_id: trip_id
@@ -27,7 +25,7 @@ dataset:
   query: "QUALITY >= 2"
   clean: {max_speed_mps: 70}
   prepare:
-    bbox: [41.80, 41.99, 12.37, 12.62]   # Rome inside the ring road (~21 x 21 km); set your city
+    bbox: [44.80, 45.90, 8.50, 9.80]   # Rome inside the ring road (~21 x 21 km); set your city
     min_traj_points: 20                   # OmniTraj's filter
 
 eval:
@@ -53,7 +51,7 @@ models:
     recipe: code
     train:
       device: cuda
-      options: {roads_file: /scratch/jcolombini/roads/rome/matched.csv.gz}
+      options: {roads_file: /scratch/jcolombini/roads/matched.csv.gz}
     adapter: {device: cuda, batch_size: 512}
 
   - name: OmniTraj-paper                  # the paper's loss (InfoNCE on cosine similarity) and Adam
@@ -61,7 +59,7 @@ models:
     recipe: paper
     train:
       device: cuda
-      options: {roads_file: /scratch/jcolombini/roads/rome/matched.csv.gz}
+      options: {roads_file: /scratch/jcolombini/roads/matched.csv.gz}
     adapter: {device: cuda, batch_size: 512}
 
   # The other models on the same city subset, for a like-for-like table
@@ -70,12 +68,39 @@ models:
     checkpoint: /home/jcolombini/model.pt
     external_pretraining: true
     adapter: {device: cuda, batch_size: 256}
+  
+  - name: UniTraj-finetuned
+    type: unitraj
+    train: {init_from: /home/jcolombini/model.pt, epochs: 60, batch_size: 128, lr: 3.0e-4, patience: 50, device: cuda}
+    adapter: {device: cuda, batch_size: 256}
+
+  - name: UniTraj-fulltrain
+    type: unitraj
+    recipe: code 
+    train: { epochs: 1000, batch_size: 256, lr: 3.0e-4, patience: 50, device: cuda}
+    adapter: {device: cuda, batch_size: 256}
+
+  - name: TrajGPT
+    type: trajgpt
+    recipe: code
+    train: {epochs: 20, batch_size: 64, lr: 1.0e-3, patience: 15, device: cuda}
+    adapter: {device: cuda}
+
+  - name: CLIPMobility
+    type: clip_mobility
+    recipe: code
+    train: {epochs: 1000 , batch_size: 64, lr: 1.0e-4, patience: 50, device: cuda}
+    adapter: {device: cuda}
 
   - name: TransferTraj
     type: transfertraj
     arch: {embed_size: 64, d_model: 128, rafee_layer: 2}
-    train: {epochs: 50, batch_size: 32, lr: 1.0e-3, patience: 8, device: cuda}
-    adapter: {device: cuda, batch_size: 128}
+    train: {epochs: 1000, batch_size: 64, lr: 1.0e-3, patience: 50,  device: cuda}
+    adapter:
+        device: cuda
+        batch_size: 64
+        coord_scale: 1000
+        context: {poi_embed: /home/jcolombini/data/Context/poi_embed.npy, poi_latlon: /home/jcolombini/data/Context/poi_latlon.npy, road_embed: /home/jcolombini/data/Context/road_embed.npy, road_latlon: /home/jcolombini/data/Context/road_latlon.npy}
 
   - name: KinematicRef
     type: kinematic_ref

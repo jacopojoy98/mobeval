@@ -82,8 +82,8 @@ repository's POI/road embeddings, not rebuilt ones.
 
 ## Porto (TransferTraj)
 
-    kaggle competitions download -c pkdd-15-predict-taxi-service-trajectory-i -p /scratch/$USER/data/porto
-    unzip /scratch/$USER/data/porto/*.zip -d /scratch/$USER/data/porto
+    kaggle competitions download -c pkdd-15-predict-taxi-service-trajectory-i -p $HOME/data/porto
+    unzip $HOME/data/porto/*.zip -d $HOME/data/porto
 
 `loader: porto`, `path: .../train.csv`. Points are every 15 s from `TIMESTAMP`, and trips flagged
 `MISSING_DATA` are dropped. The TransferTraj code has no UTM zone for Porto, so Porto could not
@@ -108,10 +108,13 @@ runs it on one city of your own data instead. Every other model is evaluated on 
 so the table stays like-for-like.
 
 1. **OpenStreetMap extract.** On a login node:
-   `wget -P /scratch/$USER/osm https://download.geofabrik.de/europe/italy-latest.osm.pbf`
+   `wget -P $HOME/data/osm https://download.geofabrik.de/europe/italy-latest.osm.pbf`
    Geofabrik also has regional extracts (e.g. `europe/italy/centro-latest.osm.pbf`), which are
    smaller.
-2. **Road network and map matching**, as a CPU job: `jobs/mapmatch.pbs`.
+2. **Road network and map matching**, as a CPU job: `jobs/mapmatch.pbs`. It computes in the job's
+   scratch directory and copies `network.npz` and `matched.csv.gz` to `ROADS_DIR`, which must be in
+   home or a project folder: on the daneel nodes `/scratch` is a local disk, so a training job on
+   another node would not find files left there.
    - `mobeval roads` cuts the drivable ways (motorway to residential, links, living streets) at
      intersections, which is the paper's Definition 3. One-way streets keep their direction.
    - `mobeval mapmatch` gives every GPS point of the configured dataset (after `prepare:`) a

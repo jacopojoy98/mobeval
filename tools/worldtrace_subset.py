@@ -6,7 +6,7 @@ millions of files behind. This reads only the sampled members from inside the ar
 single .npz that `loader: worldtrace` opens directly.
 
     python tools/worldtrace_subset.py --zip /home/$USER/data/WorldTrace/Trajectory.zip \
-        --n 300000 --out /scratch/$USER/worldtrace_300k.npz --workers 16
+        --n 300000 --out $HOME/data/WorldTrace/worldtrace_300k.npz --workers 16
 
 The file holds, concatenated over trajectories: t (unix seconds), latitude / longitude (raw GPS),
 matched_latitude / matched_longitude (map-matched), plus `length` and `names` per trajectory.

@@ -1,6 +1,6 @@
 # TransferTraj retrained with its original methodology on its original data (DiDi Chengdu, in the
 # repository's processed HDF5 layout; Xi'an and Porto work the same way - see DATASETS.md).
-#   python -c "from mobeval.loaders import load_transfertraj_h5; load_transfertraj_h5('/scratch/jcolombini/data/chengdu.h5', context_out='/scratch/jcolombini/data/chengdu_ctx')"
+#   python -c "from mobeval.loaders import load_transfertraj_h5; load_transfertraj_h5('/home/jcolombini/data/chengdu.h5', context_out='/home/jcolombini/data/chengdu_ctx')"
 #   mobeval run --config examples/configs/paper_transfertraj.yaml
 title: TransferTraj reproduction on DiDi Chengdu
 output_dir: results/paper_transfertraj
@@ -8,7 +8,7 @@ check_provenance: error
 
 dataset:
   loader: transfertraj_h5
-  path: /scratch/jcolombini/data/chengdu.h5
+  path: /home/jcolombini/data/chengdu.h5
   prepare:
     min_traj_points: 5                     # utils.traj_clip: trips of 5..120 points
     max_traj_points: 120
@@ -33,10 +33,10 @@ models:
     train:
       device: cuda
       options:
-        context: {poi_embed: /scratch/jcolombini/data/chengdu_poi_embed.npy,
-                  poi_latlon: /scratch/jcolombini/data/chengdu_ctx/poi_latlon.npy,
-                  road_embed: /scratch/jcolombini/data/chengdu_road_embed.npy,
-                  road_latlon: /scratch/jcolombini/data/chengdu_ctx/road_latlon.npy}
+        context: {poi_embed: /home/jcolombini/data/chengdu_poi_embed.npy,
+                  poi_latlon: /home/jcolombini/data/chengdu_ctx/poi_latlon.npy,
+                  road_embed: /home/jcolombini/data/chengdu_road_embed.npy,
+                  road_latlon: /home/jcolombini/data/chengdu_ctx/road_latlon.npy}
     adapter: {device: cuda}
 
   # The paper fine-tunes on each task before testing it (trained after TransferTraj-paper).
@@ -64,8 +64,8 @@ models:
     train:
       device: cuda
       options:
-        context: {poi_embed: /scratch/jcolombini/data/chengdu_poi_embed.npy,
-                  poi_latlon: /scratch/jcolombini/data/chengdu_ctx/poi_latlon.npy,
-                  road_embed: /scratch/jcolombini/data/chengdu_road_embed.npy,
-                  road_latlon: /scratch/jcolombini/data/chengdu_ctx/road_latlon.npy}
+        context: {poi_embed: /home/jcolombini/data/chengdu_poi_embed.npy,
+                  poi_latlon: /home/jcolombini/data/chengdu_ctx/poi_latlon.npy,
+                  road_embed: /home/jcolombini/data/chengdu_road_embed.npy,
+                  road_latlon: /home/jcolombini/data/chengdu_ctx/road_latlon.npy}
     adapter: {device: cuda}

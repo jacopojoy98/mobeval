@@ -52,6 +52,13 @@ class EvalConfig:
     # tasks. None = all; otherwise a subset of tasks.TASK_NAMES. Without next_location, continuous
     # and generation no staypoints are detected, which saves hours on large GPS collections.
     tasks: Optional[Sequence[str]] = None
+    # Also score the models on a sample of the TRAIN split (same size cap and seed as the test
+    # sample), written next to the test results as results_train.jsonl / leaderboard_train.csv /
+    # train_vs_test.csv and summarised in the report. It answers "did the model learn its training
+    # data at all?": a model no better than the baseline on its own training data is not fitting
+    # (optimisation or input problem); one that is good on train and poor on test is not generalising.
+    train_eval: bool = False
+    train_eval_tasks: Sequence[str] = ("recovery", "next_location", "continuous")
     recovery_ratios: Sequence[float] = (0.25, 0.5, 0.75)
     recovery_kinds: Sequence[str] = ("random", "block")
     # Keep the first and last point of every window observed under random/block masking, so the
@@ -182,6 +189,29 @@ class EvalContext:
                 "trained_at": datetime.datetime.now().isoformat(timespec="seconds"),
                 **({"recipe": rec} if rec else {}),
                 **{k: v for k, v in extra.items() if v is not None}}
+
+    def split_view(self, split: str) -> "EvalContext":
+        """This context with another split's samples in the place the tasks read as "test".
+
+        Used for `train_eval`: every task then scores exactly as it does on test, but on a capped,
+        seeded sample of `split`. Models, training views and the shared grid are the same objects;
+        caches, baselines and timings are fresh, because they belong to the samples being scored.
+        """
+        import copy
+        if split not in self.splits:
+            raise ValueError(f"no split '{split}'")
+        v = copy.copy(self)
+        v.windows, v.visits = dict(self.windows), dict(self.visits)
+        for views, cap in ((v.windows, self._cap), (v.visits, self._cap_visits)):
+            if split in views:
+                views["test"] = cap(views[split])
+            else:
+                views.pop("test", None)
+        v.cache, v.emitted_baselines = {}, set()
+        v.latency = defaultdict(lambda: defaultdict(lambda: [0.0, 0]))
+        v.skipped, v.errors = [], []
+        v.eval_split = split
+        return v
 
     def _subsample(self, n: int, m: Optional[int]) -> Optional[np.ndarray]:
         if m is None or n <= m:

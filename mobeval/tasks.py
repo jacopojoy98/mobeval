@@ -67,7 +67,10 @@ def _context_embeddings(adapter, ctx, reveal=()):
             v = ctx.visits.get(name)
             if v is None or not len(v):
                 continue
-            w = visits_as_windows(TargetGuard.hide_visits(v, reveal), tag=f"{name}:{reveal}")
+            # the view name keeps a train-sample scored "as test" (EvalContext.split_view) from
+            # sharing cache keys with the real test contexts
+            view = getattr(ctx, "eval_split", "test")
+            w = visits_as_windows(TargetGuard.hide_visits(v, reveal), tag=f"{name}@{view}:{reveal}")
             with ctx.timed(_key(adapter), EMBEDDING, len(v)):
                 out[name] = adapter.embed(w)
         ctx.cache[key] = out

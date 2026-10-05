@@ -150,6 +150,99 @@ NOTES = {
 }
 
 
+# Train-vs-test reading: a skill this close to zero is "no better than the baseline" (bootstrap noise
+# on a few thousand samples is of this order). The report table shows one metric per family.
+FIT_MIN_SKILL = 0.02
+FIT_METRICS = {"ade_m", "acc@1", "crps_min", "macro_f1", "roc_auc", "mrr", "user_acc@1"}
+
+
+def train_vs_test(test_df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """One row per (task, metric, protocol, model) scored on both splits: value and skill on the
+    train sample and on the test sample, and a reading of the pair.
+
+      not fitting       no better than the baseline on its own training data (skill <= FIT_MIN_SKILL)
+      not generalising  beats the baseline on train, but not on test - or loses over half its skill
+      consistent        similar on both
+    Skill is against the task's reference baseline on the same samples, so it is comparable across
+    splits even when the raw values are not (train and test samples differ in difficulty)."""
+    keys = ["family", "task", "metric", "protocol", "model"]
+    a, b = _agg(train_df), _agg(test_df)
+    m = a.merge(b, on=keys, suffixes=("_train", "_test"))
+    m = m[~m.model.str.startswith("baseline:")]
+    if m.empty:
+        return m
+
+    def reading(r):
+        st, se = r.skill_train, r.skill_test
+        if pd.isna(st) or pd.isna(se):
+            return ""
+        if st <= FIT_MIN_SKILL:
+            return "not fitting"
+        if se <= FIT_MIN_SKILL or se < 0.5 * st:
+            return "not generalising"
+        return "consistent"
+    m["reading"] = m.apply(reading, axis=1)
+    cols = keys + ["value_train", "value_test", "skill_train", "skill_test", "baseline_train", "unit_train",
+                   "higher_is_better_train", "n_train", "n_test", "reading"]
+    return m[cols].rename(columns={"baseline_train": "baseline", "unit_train": "unit",
+                                   "higher_is_better_train": "higher_is_better"}).reset_index(drop=True)
+
+
+def training_curves(histories: dict) -> pd.DataFrame:
+    """histories: model name -> list of {epoch, train_loss, val_loss} (a checkpoint's history).
+    One row per model: how far training went and whether either loss moved."""
+    rows = []
+    for name, h in histories.items():
+        h = [e for e in (h or []) if e.get("train_loss") is not None]
+        if not h:
+            continue
+        best = min(h, key=lambda e: e.get("val_loss", float("inf")))
+        t0, t1, v0 = h[0]["train_loss"], h[-1]["train_loss"], h[0].get("val_loss")
+        rows.append({"model": name, "epochs_run": h[-1]["epoch"], "best_epoch": best["epoch"],
+                     "train_loss_first": t0, "train_loss_last": t1,
+                     "train_loss_change": (t1 - t0) / abs(t0) if t0 else float("nan"),
+                     "val_loss_first": v0, "val_loss_best": best.get("val_loss"),
+                     "val_loss_last": h[-1].get("val_loss"),
+                     "val_loss_change": (best["val_loss"] - v0) / abs(v0) if v0 else float("nan")})
+    return pd.DataFrame(rows)
+
+
+def fit_section(cmp: pd.DataFrame, curves: Optional[pd.DataFrame] = None) -> str:
+    """Markdown for the report: headline metrics on train vs test, and the training curves."""
+    out = ["## Fit on the training data", "",
+           "The same tasks scored on a sample of the TRAIN split (`eval.train_eval`). Skill is against the "
+           "task's reference baseline on the same samples. **not fitting**: no better than the baseline on its "
+           "own training data. **not generalising**: better than the baseline on train but not on test, or "
+           "less than half the train skill left on test. One metric per task; all of them are in "
+           "train_vs_test.csv. Baselines fitted on train are also scored in-sample "
+           "here, so a train skill near zero is a strong sign that the model has not learned the task.", ""]
+    if cmp is not None and len(cmp):
+        h = cmp[cmp.metric.map(lambda m: m.split(":")[0] in FIT_METRICS)].copy()
+        h = h if len(h) else cmp.copy()
+        t = pd.DataFrame({"task": h.task, "metric": h.metric, "model": h.model, "protocol": h.protocol,
+                          "train": [_fmt(v, unit=u) for v, u in zip(h.value_train, h.unit)],
+                          "test": [_fmt(v, unit=u) for v, u in zip(h.value_test, h.unit)],
+                          "skill train": h.skill_train.map(lambda s: "" if pd.isna(s) else f"{s:+.2f}"),
+                          "skill test": h.skill_test.map(lambda s: "" if pd.isna(s) else f"{s:+.2f}"),
+                          "reading": h.reading})
+        out += [md_table(t, index=False), ""]
+        counts = h.reading[h.reading != ""].value_counts()
+        if len(counts):
+            out += ["Rows: " + ", ".join(f"{n} {k}" for k, n in counts.items()) + ".", ""]
+    if curves is not None and len(curves):
+        c = curves.copy()
+        for col in ("train_loss_change", "val_loss_change"):
+            c[col] = c[col].map(lambda v: "" if pd.isna(v) else f"{v:+.0%}")
+        for col in ("train_loss_first", "train_loss_last", "val_loss_first", "val_loss_best", "val_loss_last"):
+            c[col] = c[col].map(lambda v: "" if v is None or pd.isna(v) else f"{v:.4g}")
+        out += ["### Training curves (from the checkpoints)", "",
+                "`best_epoch` is the epoch whose weights were kept. A train loss that barely moves means the "
+                "optimisation is not working; a train loss that keeps falling while the validation loss stopped "
+                "early (best_epoch far below epochs_run) is early stopping doing its job on a model that had "
+                "started to overfit.", "", md_table(c, index=False), ""]
+    return "\n".join(out)
+
+
 def markdown_report(store, ctx=None, title: str = "Mobility foundation model evaluation") -> str:
     df = store.to_frame()
     out: List[str] = [f"# {title}", ""]

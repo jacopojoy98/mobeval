@@ -34,6 +34,8 @@ eval:
   eval_seeds: [0, 1, 2]
   n_boot: 1000
   max_eval_samples: 5000
+  train_eval: true                # also score recovery / next location / time on a train sample:
+                                  # report section "Fit on the training data", train_vs_test.csv
   travel_time_max_h: 4.0
 
 

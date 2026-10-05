@@ -332,3 +332,29 @@ def test_generation_reference_statistics_are_capped():
     assert small.groupby("traj_id").size().eq(4).all(), "whole trajectories, never partial ones"
     assert sample_trajectories(pts, None, 0) is pts
     assert len(sample_trajectories(pts, 99999, 0)) == len(pts)
+
+
+def test_split_view_scores_a_train_sample_without_touching_test():
+    from mobeval.context import EvalConfig, EvalContext
+    from mobeval.data import synthetic_dataset
+    ctx = EvalContext(synthetic_dataset(n_users=10, n_days=4), EvalConfig(window_length=16, visit_context=4,
+                                                                          max_eval_samples=30))
+    n_test, ids_test = len(ctx.windows["test"]), set(ctx.windows["test"].traj_id)
+    view = ctx.split_view("train")
+    assert len(view.windows["test"]) <= 30 and set(view.windows["test"].traj_id) <= set(ctx.windows["train"].traj_id)
+    assert len(view.visits["test"]) <= 30 and view.eval_split == "train"
+    assert view.windows["train"] is ctx.windows["train"] and view.grid is ctx.grid
+    assert len(ctx.windows["test"]) == n_test and set(ctx.windows["test"].traj_id) == ids_test
+    assert view.cache == {} and view.cache is not ctx.cache
+
+
+def test_train_vs_test_reading():
+    import pandas as pd
+    from mobeval.report import train_vs_test
+    def rows(skills):
+        return pd.DataFrame([dict(family="recovery", task="recovery/block@0.5", metric="ade_m", protocol="native",
+                                  model=m, value=100.0, ci_low=90.0, ci_high=110.0, skill=s, skill_ci_low=s, skill_ci_high=s,
+                                  n=10, baseline="linear_interp", higher_is_better=False, unit="m", paper_match="")
+                             for m, s in skills.items()])
+    out = train_vs_test(rows({"A": 0.30, "B": -0.2, "C": 0.05}), rows({"A": 0.35, "B": 0.5, "C": 0.0}))
+    assert dict(zip(out.model, out.reading)) == {"A": "consistent", "B": "not generalising", "C": "not fitting"}

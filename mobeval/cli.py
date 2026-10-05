@@ -161,12 +161,51 @@ def cmd_evaluate(cfg, names, pipe=None, ctx=None, resume=False):
                                                    "run_id": lay.run_id if lay else None,
                                                    "errors": [e[:3] for e in ctx.errors], "skipped": ctx.skipped},
                                                   indent=2, default=str))
-    for name in ("leaderboard.csv", "family_summary.csv", "report.md", "run_info.json"):
+    extra = _train_eval(cfg, names, pipe, ctx, adapters, store, out, resume, lay) if ctx.cfg.train_eval else []
+    for name in ["leaderboard.csv", "family_summary.csv", "report.md", "run_info.json"] + extra:
         layout.mirror(out / name)
     for m, t, e, _ in ctx.errors:
         log.error(f"{m} · {t}: {e}")
     log.info(f"wrote {out}/report.md ({len(store.records)} records)")
     return store, ctx
+
+
+def _train_eval(cfg, names, pipe, ctx, adapters, store, out, resume, lay) -> list:
+    """`eval.train_eval`: score the same models on a sample of the train split and compare with test."""
+    import dataclasses
+    from .registry import checkpoint_path
+    from .report import fit_section, leaderboard, train_vs_test, training_curves
+    from .results import ResultStore
+    from .runner import EvaluationPipeline
+    wanted = set(ctx.cfg.train_eval_tasks) & (set(ctx.cfg.tasks) if ctx.cfg.tasks is not None else set(ctx.cfg.train_eval_tasks))
+    if not wanted:
+        log.warning("train_eval: none of train_eval_tasks is among eval.tasks - nothing to score on train")
+        return []
+    progress.get().set_phase("scoring on the training data")
+    view = ctx.split_view("train")
+    tpipe = EvaluationPipeline(dataclasses.replace(ctx.cfg, tasks=tuple(sorted(wanted))))
+    tstore = ResultStore(out / "results_train.jsonl", resume=resume)
+    if lay is not None:
+        tstore.on_persist = lay.mirror
+    tstore = tpipe.run(adapters, view, tstore)
+    for r in tstore.records:
+        r.split = "train"
+    tstore.persist()
+    ctx.errors += [(m, f"[train] {t}", e, tb) for m, t, e, tb in view.errors]
+    leaderboard(tstore).to_csv(out / "leaderboard_train.csv", index=False)
+    cmp = train_vs_test(store.to_frame(), tstore.to_frame())
+    cmp.to_csv(out / "train_vs_test.csv", index=False)
+    histories = {}
+    for spec in _select(cfg, names):
+        side = checkpoint_path(spec, cfg["output_dir"]).with_suffix(".json")
+        try:
+            histories[spec["name"]] = json.loads(side.read_text()).get("history")
+        except (OSError, json.JSONDecodeError):
+            pass
+    with open(out / "report.md", "a") as f:
+        f.write("\n" + fit_section(cmp, training_curves(histories)) + "\n")
+    log.info(f"train_eval: {len(tstore.records)} records on the train sample -> {out}/train_vs_test.csv")
+    return ["results_train.jsonl", "leaderboard_train.csv", "train_vs_test.csv"]
 
 
 def cmd_context(cfg, args):

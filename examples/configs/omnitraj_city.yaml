@@ -6,12 +6,14 @@
 # (the paper also "filtered out trajectories recorded outside urban areas" and trips under 20
 # points), and every model is evaluated on that same subset.
 #
-# 1. Road network and map matching (CPU job, once per city):
-#      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,PBF=$HOME/data/osm/italy-latest.osm.pbf,BBOX="41.80 41.99 12.37 12.62",ROADS_DIR=$HOME/data/roads/rome jobs/mapmatch.pbs
+# 1. Road network and map matching (CPU job, once per city; BBOX = prepare.bbox below):
+#      qsub -v BBOX="44.80 45.90 8.50 9.80",CITY=milan jobs/mapmatch.pbs
 # 2. Train and evaluate:
-#      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,RESULTS_DIR=$HOME/MobFM/results_rome jobs/all_in_one.pbs
+#      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,RESULTS_DIR=$HOME/results_milan jobs/all_in_one.pbs
 title: OmniTraj and the other models on one city (Milan)
-output_dir: results/omnitraj_city
+output_dir: /home/jcolombini/results_milan                 # its own folder: the models here are trained on one city,
+progress_dir: /home/jcolombini/results_milan/progress      # so their checkpoints must not mix with the full panel's
+persist_dir: /home/jcolombini/results_milan
 
 dataset:
   loader: csv
@@ -25,7 +27,8 @@ dataset:
   query: "QUALITY >= 2"
   clean: {max_speed_mps: 70}
   prepare:
-    bbox: [44.80, 45.90, 8.50, 9.80]   # Rome inside the ring road (~21 x 21 km); set your city
+    bbox: [44.80, 45.90, 8.50, 9.80]     # Milan and its surroundings (~122 x 102 km); must equal the
+                                          # BBOX given to jobs/mapmatch.pbs
     min_traj_points: 20                   # OmniTraj's filter
 
 eval:
@@ -51,7 +54,7 @@ models:
     recipe: code
     train:
       device: cuda
-      options: {roads_file: /home/jcolombini/data/roads/rome/matched.csv.gz}
+      options: {roads_file: /home/jcolombini/data/roads/milan/matched.csv.gz}
     adapter: {device: cuda, batch_size: 512}
 
   - name: OmniTraj-paper                  # the paper's loss (InfoNCE on cosine similarity) and Adam
@@ -59,7 +62,7 @@ models:
     recipe: paper
     train:
       device: cuda
-      options: {roads_file: /home/jcolombini/data/roads/rome/matched.csv.gz}
+      options: {roads_file: /home/jcolombini/data/roads/milan/matched.csv.gz}
     adapter: {device: cuda, batch_size: 512}
 
   # The other models on the same city subset, for a like-for-like table

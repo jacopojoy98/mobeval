@@ -60,6 +60,8 @@ setup_env() {
 # there by an earlier job is on whichever node ran it. Keep inputs in home or a project folder.
 # Output locations (output_dir, persist_dir, progress_dir, checkpoint_dir, a model's checkpoint
 # or train.out) are never copied: they are where results go, not inputs.
+# A model's train.options.context / roads_file is moved to its adapter: section (see the end of the
+# script below), so a later job loads the checkpoint with its own copies of those files.
 stage_in() {
     mkdir -p "$SCRATCH/data" "$SCRATCH/results"
     python - "$CONFIG" "$SCRATCH" "$DATA_DIR" > "$SCRATCH/config.yaml" <<'PY'
@@ -111,6 +113,18 @@ def walk(node_, where):                              # every other absolute path
                 sys.exit(f"stage_in: {here} = {v} does not exist on {node}. /scratch is local to each "
                          f"daneel node; keep inputs in home or a project folder")
 walk(cfg, "")
+
+# A checkpoint records the data files its model was trained with (TransferTraj's context files,
+# OmniTraj's roads_file) by path, and that path is now this job's scratch copy, gone when the job
+# ends. A later job (evaluate.pbs after train_model.pbs, or a RESUME) must therefore be told where
+# ITS copies are: options under `adapter:` are passed both to training and to loading a checkpoint,
+# where they replace the recorded path. So these two are moved from train.options to adapter.
+for m in cfg.get("models", []):
+    opts = (m.get("train") or {}).get("options") or {}
+    for key in ("context", "roads_file"):
+        if key in opts:
+            m.setdefault("adapter", {}).setdefault(key, opts[key])
+            del opts[key]
 yaml.safe_dump(cfg, sys.stdout, sort_keys=False)
 PY
 }

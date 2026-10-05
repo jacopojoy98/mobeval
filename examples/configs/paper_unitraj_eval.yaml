@@ -7,8 +7,7 @@ check_provenance: warn                     # the 3 s view has other windows than
 
 dataset:
   loader: worldtrace
-  path: /scratch/USER/data/WorldTrace
-  max_trajectories: 300000                 # same draw (same seed) as stage 1, so the same split
+  path: /home/jcolombini/data/WorldTrace/worldtrace_300k.npz   # written by jobs/worldtrace.pbs from Trajectory.zip
   prepare: {min_interval_s: 3}
 
 eval:
@@ -30,6 +29,6 @@ models:
 
   - name: UniTraj-public                   # the authors' released weights, for comparison
     type: unitraj
-    checkpoint: /scratch/USER/models/unitraj/model.pt
+    checkpoint: /home/jcolombini/model.pt
     external_pretraining: true
     adapter: {device: cuda, batch_size: 256}

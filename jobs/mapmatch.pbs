@@ -5,7 +5,7 @@
 #PBS -l walltime=48:00:00
 #PBS -j oe
 # Road network + map matching for OmniTraj's road modality (CPU only; no GPU needed).
-#   qsub -v CONFIG=$HOME/MobFM/BMdir/mobeval/examples/configs/omnitraj_city.yaml,PBF=/scratch/$USER/osm/italy-latest.osm.pbf,BBOX="41.75 42.05 12.30 12.70",ROADS_DIR=/scratch/$USER/roads jobs/mapmatch.pbs
+#   qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,PBF=/scratch/$USER/osm/italy-latest.osm.pbf,BBOX="41.75 42.05 12.30 12.70",ROADS_DIR=/scratch/$USER/roads jobs/mapmatch.pbs
 # Writes $ROADS_DIR/network.npz (segments between intersections) and $ROADS_DIR/matched.csv.gz (one
 # segment id per GPS point), the files the config's `roads_file` points at. ROADS_DIR must be on
 # /scratch (not the per-job directory, which is removed at the end) so training jobs can read it.

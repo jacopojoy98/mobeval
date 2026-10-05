@@ -8,9 +8,6 @@ Built-in models: **UniTraj**, **TrajGPT** and the **CLIP mobility model**. See
 wrapped, what was changed and why. `CODE_GUIDE.md` walks through the code: how each model's
 training data is prepared and how each metric is computed.
 
-`python plot_results.py <run>/leaderboard.csv --out figures` draws the results (models against each
-other and against the baselines); `python make_table.py <run>/leaderboard.csv` writes the LaTeX tables.
-
 ## Install
 
 ```bash
@@ -424,7 +421,7 @@ Batch jobs are opaque: the work happens on a compute node, possibly for hours. E
 writes live progress that you can read from anywhere:
 
 ```bash
-mobeval status --progress-dir ~/results/progress      # one look
+mobeval status --progress-dir ~/MobFM/results/progress      # one look
 mobeval status --config exp.yaml --watch                    # refresh every 10 s
 mobeval status --progress-dir DIR --events 20               # plus the recent event log
 ```
@@ -473,7 +470,7 @@ qsub -v MODEL=TrajGPT jobs/train_model.pbs            # a single model
 qsub jobs/evaluate.pbs                                # evaluation only, from existing checkpoints
 qsub -v RESUME=latest jobs/all_in_one.pbs             # continue where a killed job stopped
 qstat -u $USER                                        # is it queued or running?
-python -m mobeval status --progress-dir ~/results/progress --watch   # what is it doing?
+python -m mobeval status --progress-dir ~/MobFM/results/progress --watch   # what is it doing?
 ```
 
 The scripts copy data to `/scratch/$USER` and run there, as the cluster requires.

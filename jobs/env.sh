@@ -1,12 +1,15 @@
 # Shared environment for all mobeval PBS jobs. Edit this file once; the job scripts source it.
 # ---------------------------------------------------------------------------------------------
 # Where the code, the data and the results live (home or a project folder, NOT scratch)
-MOBEVAL_DIR="${MOBEVAL_DIR:-$HOME/MobFM/BMdir/mobeval}"
+# The jobs are submitted from the mobeval folder (`qsub jobs/...`), so that folder is the default.
+MOBEVAL_DIR="${MOBEVAL_DIR:-${PBS_O_WORKDIR:-$PWD}}"
 # Override per job, e.g. for a paper reproduction:
-#   qsub -v CONFIG=$HOME/MobFM/BMdir/mobeval/examples/configs/paper_trajgpt.yaml,DATA_DIR=/scratch/$USER/data/geolife,RESULTS_DIR=$HOME/MobFM/results_trajgpt jobs/all_in_one.pbs
+#   qsub -v CONFIG=$PWD/examples/configs/paper_trajgpt.yaml,RESULTS_DIR=$HOME/results_trajgpt jobs/all_in_one.pbs
 CONFIG="${CONFIG:-$MOBEVAL_DIR/examples/configs/vehicle_panel.yaml}"
-DATA_DIR="${DATA_DIR:-$HOME/MobFM/data}"    # the data files/folder referenced by the config
-RESULTS_DIR="${RESULTS_DIR:-$HOME/MobFM/results}"   # final outputs are copied back here
+# The data are read from the paths in the config (dataset.path / train_path / test_path). DATA_DIR is
+# only where a RELATIVE path in the config is looked up.
+DATA_DIR="${DATA_DIR:-$HOME/data/data_by_fua_final}"
+RESULTS_DIR="${RESULTS_DIR:-$HOME/results}"   # final outputs are copied back here
 
 # Scratch: all job I/O happens here (mandatory on this cluster; not backed up)
 SCRATCH="/scratch/$USER/mobeval/${PBS_JOBID:-manual-$$}"   # always a per-job subdirectory
@@ -48,18 +51,32 @@ setup_env() {
       torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
 }
 
-# Copy inputs to the local scratch disk and rewrite the config to point at them
+# Copy the data files the config names to this job's scratch directory and rewrite the config to
+# point at the copies. Only those files are copied, not the folder around them. Data that already
+# lie under /scratch are used where they are.
 stage_in() {
-    cp -r "$DATA_DIR" "$SCRATCH/data"
-    mkdir -p "$SCRATCH/results"
-    python - "$CONFIG" "$SCRATCH" > "$SCRATCH/config.yaml" <<'PY'
-import sys, yaml
-cfg = yaml.safe_load(open(sys.argv[1])); scratch = sys.argv[2]
+    mkdir -p "$SCRATCH/data" "$SCRATCH/results"
+    python - "$CONFIG" "$SCRATCH" "$DATA_DIR" > "$SCRATCH/config.yaml" <<'PY'
+import os, shutil, sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1])); scratch, data_dir = sys.argv[2], sys.argv[3]
 cfg["output_dir"] = f"{scratch}/results"
 d = cfg["dataset"]
 for key in ("path", "train_path", "val_path", "test_path"):
-    if d.get(key):
-        d[key] = f"{scratch}/data/" + d[key].rsplit("/", 1)[-1]
+    src = d.get(key)
+    if not src:
+        continue
+    if not os.path.isabs(src):                      # relative: looked up in DATA_DIR by file name
+        src = os.path.join(data_dir, os.path.basename(src.rstrip("/")))
+    if not os.path.exists(src):
+        sys.exit(f"stage_in: dataset.{key} = {src} does not exist on {os.uname().nodename}")
+    if os.path.realpath(src).startswith("/scratch/"):
+        d[key] = src
+        print(f"stage_in: {key} used in place ({src})", file=sys.stderr)
+        continue
+    dst = os.path.join(scratch, "data", os.path.basename(src.rstrip("/")))
+    shutil.copytree(src, dst) if os.path.isdir(src) else shutil.copy2(src, dst)
+    d[key] = dst
+    print(f"stage_in: {key} {src} -> {dst}", file=sys.stderr)
 yaml.safe_dump(cfg, sys.stdout, sort_keys=False)
 PY
 }

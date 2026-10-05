@@ -9,14 +9,16 @@
 # 1. Road network and map matching (CPU job, once per city):
 #      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,PBF=/scratch/$USER/osm/italy-latest.osm.pbf,BBOX="41.80 41.99 12.37 12.62",ROADS_DIR=/scratch/$USER/roads/rome jobs/mapmatch.pbs
 # 2. Train and evaluate:
-#      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,RESULTS_DIR=$HOME/MobFM/results_rome jobs/all_in_one.pbs
+#      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,RESULTS_DIR=$HOME/results_rome jobs/all_in_one.pbs
 title: OmniTraj and the other models on one city (Rome)
-output_dir: results/omnitraj_city
+output_dir: /home/jcolombini/results_rome                 # its own folder: the models here are trained on one city,
+progress_dir: /home/jcolombini/results_rome/progress      # so their checkpoints must not mix with the full panel's
+persist_dir: /home/jcolombini/results_rome
 
 dataset:
   loader: csv
-  train_path: data/train.csv
-  test_path: data/test.csv
+  train_path: /home/jcolombini/data/data_by_fua_final/train.csv
+  test_path: /home/jcolombini/data/data_by_fua_final/test_FVF.csv
   time_col: datetime
   user_id: uid
   traj_id: trip_id
@@ -51,7 +53,7 @@ models:
     recipe: code
     train:
       device: cuda
-      options: {roads_file: /scratch/USER/roads/rome/matched.csv.gz}
+      options: {roads_file: /scratch/jcolombini/roads/rome/matched.csv.gz}
     adapter: {device: cuda, batch_size: 512}
 
   - name: OmniTraj-paper                  # the paper's loss (InfoNCE on cosine similarity) and Adam
@@ -59,13 +61,13 @@ models:
     recipe: paper
     train:
       device: cuda
-      options: {roads_file: /scratch/USER/roads/rome/matched.csv.gz}
+      options: {roads_file: /scratch/jcolombini/roads/rome/matched.csv.gz}
     adapter: {device: cuda, batch_size: 512}
 
   # The other models on the same city subset, for a like-for-like table
   - name: UniTraj-zeroshot
     type: unitraj
-    checkpoint: models/unitraj/model.pt
+    checkpoint: /home/jcolombini/model.pt
     external_pretraining: true
     adapter: {device: cuda, batch_size: 256}
 

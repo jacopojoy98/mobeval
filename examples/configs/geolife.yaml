@@ -10,7 +10,7 @@ check_provenance: error          # refuse checkpoints trained on a different spl
 
 dataset:
   loader: geolife
-  path: /data/geolife            # folder containing Data/
+  path: /home/jcolombini/data/Geolife   # the folder that contains Data/
 
 eval:
   split_by: time                 # chronological 8:1:1 (use "user" for unseen-user generalisation)
@@ -30,14 +30,14 @@ models:
   # WorldTrace does not contain GeoLife, so no overlap with the test split)
   - name: UniTraj-zeroshot
     type: unitraj
-    checkpoint: /models/unitraj/model.pt
+    checkpoint: /home/jcolombini/model.pt
     external_pretraining: true
     adapter: {device: cuda, batch_size: 256}
 
   # Continued pre-training of the public weights on the GeoLife train split
   - name: UniTraj-finetuned
     type: unitraj
-    train: {init_from: /models/unitraj/model.pt, epochs: 30, batch_size: 128, lr: 3.0e-4, patience: 5, device: cuda}
+    train: {init_from: /home/jcolombini/model.pt, epochs: 30, batch_size: 128, lr: 3.0e-4, patience: 5, device: cuda}
     adapter: {device: cuda, batch_size: 256}
 
   - name: TrajGPT

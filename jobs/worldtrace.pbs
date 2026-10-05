@@ -1,0 +1,45 @@
+#!/bin/bash
+#PBS -N mobeval_worldtrace
+#PBS -q q07daneel
+#PBS -l select=1:ncpus=16:mem=64gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+# WorldTrace without unzipping it (CPU only). The download is one archive, Trajectory.zip (27 GB,
+# 2.45M small CSV files); both modes read the files from INSIDE the archive.
+#
+#   qsub jobs/worldtrace.pbs                                  # MODE=subset: N random trajectories -> one .npz
+#   qsub -v N=500000 jobs/worldtrace.pbs
+#   qsub -v MODE=profile jobs/worldtrace.pbs                  # statistics of every file + search for
+#                                                             # UniTraj's sample trajectories (tools/worldtrace_profile.py)
+# Defaults: ZIP=$HOME/data/WorldTrace/Trajectory.zip, results in OUT_DIR=$HOME/data/WorldTrace.
+# The archive is copied to this job's scratch directory first and read from there; outputs are
+# written in scratch and copied to OUT_DIR at the end.
+
+cd "$PBS_O_WORKDIR"
+source jobs/env.sh
+setup_env
+
+MODE="${MODE:-subset}"
+ZIP="${ZIP:-$HOME/data/WorldTrace/Trajectory.zip}"
+OUT_DIR="${OUT_DIR:-$HOME/data/WorldTrace}"
+N="${N:-300000}"
+SAMPLE="${SAMPLE:-}"            # MODE=profile: UniTraj's data/worldtrace_sample.pkl, for the exact search
+[ -f "$ZIP" ] || { echo "Trajectory.zip not found at $ZIP - pass ZIP=..."; exit 1; }
+
+cp "$ZIP" "$SCRATCH/Trajectory.zip"
+status=0
+if [ "$MODE" = subset ]; then
+    name="worldtrace_$((N / 1000))k.npz"
+    python tools/worldtrace_subset.py --zip "$SCRATCH/Trajectory.zip" --n "$N" --seed "${SEED:-0}" \
+        --out "$SCRATCH/$name" --workers "${NCPUS:-8}" || status=$?
+    [ $status -eq 0 ] && { mkdir -p "$OUT_DIR"; cp "$SCRATCH/$name" "$OUT_DIR/$name"; echo "subset: $OUT_DIR/$name"; }
+elif [ "$MODE" = profile ]; then
+    python tools/worldtrace_profile.py --raw "$SCRATCH/Trajectory.zip" ${SAMPLE:+--sample "$SAMPLE"} \
+        --out "$SCRATCH/wt_profile" --workers "${NCPUS:-8}" || status=$?
+    [ $status -eq 0 ] && { mkdir -p "$OUT_DIR/wt_profile"; cp "$SCRATCH"/wt_profile/*.csv "$OUT_DIR/wt_profile/"; echo "profile: $OUT_DIR/wt_profile"; }
+else
+    echo "MODE must be subset or profile"; status=2
+fi
+
+case "$SCRATCH" in /scratch/"$USER"/mobeval/?*) rm -rf "$SCRATCH" 2>/dev/null || true ;; esac
+exit $status

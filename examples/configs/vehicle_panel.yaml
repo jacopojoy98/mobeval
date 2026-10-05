@@ -3,17 +3,18 @@
 # mobeval info --config examples/configs/vehicle_panel.yaml     (check sizes first)
 # mobeval run  --config examples/configs/vehicle_panel.yaml
 title: Mobility foundation models on vehicle panel data
-output_dir: results/vehicle_panel
-
+output_dir: /home/jcolombini/results
+progress_dir: /home/jcolombini/results/progress
 # Keep finished work outside scratch as it is produced (a checkpoint after every
 # improving epoch, results after every task), so a crash or walltime kill loses nothing.
-# The PBS scripts set MOBEVAL_PERSIST_DIR instead, which overrides this.
-# persist_dir: /home/jcolombini/results
+# Inside a PBS job these three are replaced: the job computes in /scratch and jobs/env.sh sets
+# RESULTS_DIR (default $HOME/results) as the durable and progress directory.
+persist_dir: /home/jcolombini/results
 
 dataset:
   loader: csv                     # .csv or .parquet
-  train_path: data/train.csv
-  test_path: data/test.csv
+  train_path: /home/jcolombini/data/data_by_fua_final/train.csv
+  test_path: /home/jcolombini/data/data_by_fua_final/test_FVF.csv
   time_col: datetime              # naive local time is kept as local clock time
   user_id: uid                    # check: `uid` or `user`, whichever identifies a person/vehicle
   traj_id: trip_id                # one trip = one trajectory (made unique per user automatically)
@@ -65,12 +66,12 @@ eval:
 models:
   - name: UniTraj-zeroshot
     type: unitraj
-    checkpoint: models/unitraj/model.pt
+    checkpoint: /home/jcolombini/model.pt
     external_pretraining: true
     adapter: {device: cuda, batch_size: 256}
   - name: UniTraj-finetuned
     type: unitraj
-    train: {init_from: models/unitraj/model.pt, epochs: 30, batch_size: 128, lr: 3.0e-4, patience: 5, device: cuda}
+    train: {init_from: /home/jcolombini/model.pt, epochs: 30, batch_size: 128, lr: 3.0e-4, patience: 5, device: cuda}
     adapter: {device: cuda, batch_size: 256}
   - name: TrajGPT
     type: trajgpt
@@ -82,16 +83,15 @@ models:
     adapter: {device: cuda}
   - name: TransferTraj
     type: transfertraj
-    arch: {embed_size: 64, d_model: 128, rafee_layer: 2}
+    # poi_dist / rn_dist: SQUARED context radius in metres. 10000 = the paper's 100 m; the original
+    # code's default (100 = 10 m) leaves almost no POI in range. The training log prints the coverage.
+    arch: {embed_size: 64, d_model: 128, rafee_layer: 2, poi_dist: 10000, rn_dist: 10000}
     train: {epochs: 50, batch_size: 32, lr: 1.0e-3, patience: 8, device: cuda}
     adapter:
       device: cuda
       batch_size: 128
       coord_scale: 1000.0        # 1.0 reproduces the original (raw metres); see MODELS.md
-      # Optional POI / road context. Build it once with:
-      #   mobeval context --config examples/configs/vehicle_panel.yaml --out data/context
-      # then paste the block it prints (keep the files on a shared filesystem, not on /scratch,
-      # so compute nodes can read them):
-      # context: {poi_embed: data/context/poi_embed.npy, poi_latlon: data/context/poi_latlon.npy,
-      #           road_embed: data/context/road_embed.npy, road_latlon: data/context/road_latlon.npy}
-      # and set arch.poi_dist / arch.rn_dist to the SQUARED radius in metres (250000 = 500 m).
+      # POI / road context from OpenStreetMap, built with `mobeval context --out /home/jcolombini/data/Context`.
+      # Remove the block to run TransferTraj without context.
+      context: {poi_embed: /home/jcolombini/data/Context/poi_embed.npy, poi_latlon: /home/jcolombini/data/Context/poi_latlon.npy,
+                road_embed: /home/jcolombini/data/Context/road_embed.npy, road_latlon: /home/jcolombini/data/Context/road_latlon.npy}

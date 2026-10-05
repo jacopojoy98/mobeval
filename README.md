@@ -473,7 +473,12 @@ qstat -u $USER                                        # is it queued or running?
 python -m mobeval status --progress-dir ~/MobFM/results/progress --watch   # what is it doing?
 ```
 
-The scripts copy data to `/scratch/$USER` and run there, as the cluster requires.
+The scripts copy their inputs to `/scratch/$USER/mobeval/<job id>` and run there, as the cluster
+requires. On the daneel nodes `/scratch` is a disk local to each node, so it only holds one job's
+working copy: keep every input (datasets, context files, road networks, OSM extracts) in home or a
+project folder. `stage_in` in `jobs/env.sh` copies the dataset paths and every other absolute input
+path in the config (a model's `context:` files, `roads_file`, ...) and rewrites the config to point at
+the copies; it stops with an error if the config points at a `/scratch` file the node does not have.
 
 ## Surviving a crash or a walltime kill
 

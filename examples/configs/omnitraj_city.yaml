@@ -7,7 +7,7 @@
 # points), and every model is evaluated on that same subset.
 #
 # 1. Road network and map matching (CPU job, once per city):
-#      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,PBF=/scratch/$USER/osm/italy-latest.osm.pbf,BBOX="41.80 41.99 12.37 12.62",ROADS_DIR=/scratch/$USER/roads/rome jobs/mapmatch.pbs
+#      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,PBF=$HOME/data/osm/italy-latest.osm.pbf,BBOX="41.80 41.99 12.37 12.62",ROADS_DIR=$HOME/data/roads/rome jobs/mapmatch.pbs
 # 2. Train and evaluate:
 #      qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,RESULTS_DIR=$HOME/MobFM/results_rome jobs/all_in_one.pbs
 title: OmniTraj and the other models on one city (Milan)
@@ -51,7 +51,7 @@ models:
     recipe: code
     train:
       device: cuda
-      options: {roads_file: /scratch/jcolombini/roads/matched.csv.gz}
+      options: {roads_file: /home/jcolombini/data/roads/rome/matched.csv.gz}
     adapter: {device: cuda, batch_size: 512}
 
   - name: OmniTraj-paper                  # the paper's loss (InfoNCE on cosine similarity) and Adam
@@ -59,7 +59,7 @@ models:
     recipe: paper
     train:
       device: cuda
-      options: {roads_file: /scratch/jcolombini/roads/matched.csv.gz}
+      options: {roads_file: /home/jcolombini/data/roads/rome/matched.csv.gz}
     adapter: {device: cuda, batch_size: 512}
 
   # The other models on the same city subset, for a like-for-like table

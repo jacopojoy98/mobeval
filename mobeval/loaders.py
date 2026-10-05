@@ -23,9 +23,45 @@ def _read_table(path):
     return pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
 
 
+def _split_overlap_report(df: pd.DataFrame, shared) -> str:
+    """Why do trajectory ids occur in several split files? Two causes look the same from the count
+    alone and need opposite fixes, so the error says which one the data show."""
+    n_by = df.groupby("split")["traj_id"].nunique()
+    sub = df[df["traj_id"].isin(shared)]
+    span = sub.groupby(["traj_id", "split"])["t"].agg(["min", "max", "size"]).reset_index()
+    a = span[span.split == "train"].set_index("traj_id")
+    b = span[span.split != "train"].drop_duplicates("traj_id").set_index("traj_id")
+    j = a.join(b, lsuffix="_tr", rsuffix="_ev", how="inner")
+    if not len(j):                                      # overlap between val and test only
+        j = span.groupby("traj_id").agg(min_tr=("min", "first"), max_tr=("max", "first"), size_tr=("size", "first"),
+                                        min_ev=("min", "last"), max_ev=("max", "last"), size_ev=("size", "last"))
+    same = (j.min_tr == j.min_ev) & (j.max_tr == j.max_ev) & (j.size_tr == j.size_ev)
+    overlap_t = (j.min_tr <= j.max_ev) & (j.min_ev <= j.max_tr)
+    dur_h = (df.groupby("traj_id")["t"].agg(lambda x: x.max() - x.min()) / 3600.0)
+    ex = j.head(3)
+    stamp = lambda v: str(pd.Timestamp(v, unit="s"))
+    examples = "; ".join(f"{i}: train {stamp(r.min_tr)}..{stamp(r.max_tr)} ({int(r.size_tr)} pts), "
+                         f"other {stamp(r.min_ev)}..{stamp(r.max_ev)} ({int(r.size_ev)} pts)" for i, r in ex.iterrows())
+    verdict = ("the SAME trips are in both files (identical time span and point count): the split files are not "
+               "disjoint - check that test_path is the held-out file, or set on_split_overlap: drop_from_eval"
+               if same.mean() > 0.9 else
+               "the ids are REUSED for different trips (their time spans do not overlap): the traj_id column "
+               "does not identify a trip on its own - map traj_id to a column that does, or set "
+               "on_split_overlap: separate" if overlap_t.mean() < 0.1 else
+               "the same trips are split BETWEEN the files (overlapping time spans, different points): the split "
+               "was made by point, not by trip - a trajectory must lie in one split")
+    return (f"{len(shared):,} trajectories (user + traj_id) occur in more than one split file, of "
+            + ", ".join(f"{n:,} in {s}" for s, n in n_by.items())
+            + f". Of the shared ones, {same.mean():.0%} have the identical time span and point count in both "
+              f"files and {overlap_t.mean():.0%} overlap in time. Diagnosis: {verdict}. "
+              f"Trajectory duration: median {dur_h.median():.2f} h, 99th percentile {dur_h.quantile(0.99):.1f} h "
+              f"(days rather than hours would mean ids are reused within a file too). Examples - {examples}")
+
+
 def from_csv(path: Optional[str] = None, name: Optional[str] = None, time_col: str = "t",
              train_path: Optional[str] = None, test_path: Optional[str] = None, val_path: Optional[str] = None,
-             query: Optional[str] = None, clean: Optional[dict] = None, keep_columns=(), **rename) -> MobilityDataset:
+             query: Optional[str] = None, clean: Optional[dict] = None, keep_columns=(),
+             on_split_overlap: str = "error", **rename) -> MobilityDataset:
     """CSV/Parquet GPS table(s) -> MobilityDataset.
 
     path                     one file (mobeval splits it), OR
@@ -37,6 +73,11 @@ def from_csv(path: Optional[str] = None, name: Optional[str] = None, time_col: s
     query                    optional pandas query applied before renaming, e.g. "QUALITY >= 2"
     clean                    optional clean_points() arguments, e.g. {max_speed_mps: 70}; {} = defaults
     keep_columns             extra original columns to keep (after renaming)
+    on_split_overlap         what to do when a trajectory id (user + traj_id) occurs in more than one
+                             split file. "error" (default) stops and reports what the overlap looks
+                             like. "drop_from_eval": the files share the same trips - they are kept in
+                             train and removed from val/test. "separate": the ids are merely reused for
+                             different trips - each split's trips get their own id.
     """
     from .data import clean_points
     files = {"all": path} if path else {k: v for k, v in (("train", train_path), ("val", val_path), ("test", test_path)) if v}
@@ -71,7 +112,20 @@ def from_csv(path: Optional[str] = None, name: Optional[str] = None, time_col: s
     if "split" in df.columns:
         per_traj = df.groupby("traj_id")["split"].nunique()
         if (per_traj > 1).any():
-            raise ValueError(f"{int((per_traj > 1).sum())} trajectories occur in more than one split file")
+            shared = per_traj.index[per_traj > 1]
+            if on_split_overlap == "error":
+                raise ValueError(_split_overlap_report(df, shared))
+            if on_split_overlap == "drop_from_eval":
+                drop = df["traj_id"].isin(shared) & df["split"].ne("train")
+                log.warning(f"{len(shared):,} trajectories occur in more than one split file: removed from "
+                            f"val/test ({int(drop.sum()):,} points), kept in train")
+                df = df[~drop]
+            elif on_split_overlap == "separate":
+                log.warning(f"{len(shared):,} trajectory ids occur in more than one split file: treated as "
+                            f"different trips (ids prefixed with the split)")
+                df["traj_id"] = df["split"].astype(str) + "/" + df["traj_id"]
+            else:
+                raise ValueError("on_split_overlap must be 'error', 'drop_from_eval' or 'separate'")
     if clean is not None:
         df = clean_points(df, **clean)
     return MobilityDataset(df, name or Path(path or train_path).stem)

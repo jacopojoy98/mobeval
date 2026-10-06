@@ -15,6 +15,7 @@ yaml = ["pyyaml>=6"]          # YAML configs (JSON configs work without it)
 reports = ["tabulate>=0.9"]  # prettier markdown tables (a plain fallback is built in)
 h3 = ["h3>=4"]
 omnitraj = ["timm>=0.9", "einops>=0.6", "transformers>=4.30", "osmium>=3.6", "shapely>=2"]
+plots = ["matplotlib>=3.7"]   # plot_results.py and the sample figures (mobeval visualize)
 test = ["pytest>=7"]
 
 [project.scripts]

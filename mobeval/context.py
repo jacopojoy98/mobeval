@@ -58,6 +58,12 @@ class EvalConfig:
     # data at all?": a model no better than the baseline on its own training data is not fitting
     # (optimisation or input problem); one that is good on train and poor on test is not generalising.
     train_eval: bool = False
+    # Sample pictures written with the results (mobeval/visualize.py): for this many test windows and
+    # seed trajectories, the real trajectory next to each model's reconstruction / generation, on a
+    # road background. visualize_roads: network.npz from `mobeval roads`, or an (N, 2) .npy of road
+    # points (the road_latlon.npy of `mobeval context`); without it the training GPS points are used.
+    visualize_samples: int = 0
+    visualize_roads: Optional[str] = None
     train_eval_tasks: Sequence[str] = ("recovery", "next_location", "continuous")
     recovery_ratios: Sequence[float] = (0.25, 0.5, 0.75)
     recovery_kinds: Sequence[str] = ("random", "block")

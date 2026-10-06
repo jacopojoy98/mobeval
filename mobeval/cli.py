@@ -162,6 +162,15 @@ def cmd_evaluate(cfg, names, pipe=None, ctx=None, resume=False):
                                                    "errors": [e[:3] for e in ctx.errors], "skipped": ctx.skipped},
                                                   indent=2, default=str))
     extra = _train_eval(cfg, names, pipe, ctx, adapters, store, out, resume, lay) if ctx.cfg.train_eval else []
+    if ctx.cfg.visualize_samples:
+        progress.get().set_phase("drawing sample figures")
+        try:                                            # pictures must never cost a finished evaluation
+            from .visualize import make_samples
+            for f in make_samples(ctx, adapters, out / "samples", ctx.cfg.visualize_samples, ctx.cfg.visualize_roads):
+                layout.mirror(f)
+        except Exception as e:                          # noqa: BLE001
+            log.error(f"sample figures failed: {e!r}")
+            ctx.errors.append(("visualize", "samples", repr(e), ""))
     for name in ["leaderboard.csv", "family_summary.csv", "report.md", "run_info.json"] + extra:
         layout.mirror(out / name)
     for m, t, e, _ in ctx.errors:
@@ -206,6 +215,19 @@ def _train_eval(cfg, names, pipe, ctx, adapters, store, out, resume, lay) -> lis
         f.write("\n" + fit_section(cmp, training_curves(histories)) + "\n")
     log.info(f"train_eval: {len(tstore.records)} records on the train sample -> {out}/train_vs_test.csv")
     return ["results_train.jsonl", "leaderboard_train.csv", "train_vs_test.csv"]
+
+
+def cmd_visualize(cfg, args):
+    """Sample figures for trained models, without re-running the evaluation."""
+    from .registry import load_model
+    from .visualize import make_samples
+    _, ctx = _context(cfg)
+    adapters = [load_model(s, ctx, cfg["output_dir"], cfg["check_provenance"]) for s in _select(cfg, args.models)]
+    out = Path(cfg["output_dir"]) / "samples"
+    files = make_samples(ctx, adapters, out, args.n or ctx.cfg.visualize_samples or 6,
+                         args.roads or ctx.cfg.visualize_roads)
+    print(f"{len(files)} files in {out}")
+    return 0
 
 
 def cmd_context(cfg, args):
@@ -354,7 +376,7 @@ def cmd_recipes(types=None):
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="mobeval", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["train", "evaluate", "run", "smoke", "info", "context", "status", "recipes",
-                                        "roads", "mapmatch"])
+                                        "roads", "mapmatch", "visualize"])
     ap.add_argument("--config")
     ap.add_argument("--models", nargs="*")
     ap.add_argument("--out", help="override output_dir (roads / mapmatch: the output file)")
@@ -373,7 +395,9 @@ def main(argv=None):
     r.add_argument("--bbox", nargs=4, type=float, metavar=("LAT_MIN", "LAT_MAX", "LON_MIN", "LON_MAX"),
                    help="roads: keep ways with a node inside this box")
     r.add_argument("--fmm", help="roads: also write the network as an FMM GeoPackage")
-    r.add_argument("--roads", help="mapmatch: road network (.npz from `mobeval roads`)")
+    r.add_argument("--roads", help="mapmatch: road network (.npz from `mobeval roads`); visualize: the road "
+                                   "background (that file, or an (N, 2) .npy of road points)")
+    ap.add_argument("--n", type=int, help="visualize: how many sample windows / seed trajectories (default 6)")
     r.add_argument("--workers", type=int, default=1, help="mapmatch: parallel processes")
     r.add_argument("--max-trajectories", type=int, help="mapmatch: match a random subset")
     r.add_argument("--sigma-m", type=float, default=20.0, help="mapmatch: GPS noise (emission sigma), metres")
@@ -422,6 +446,8 @@ def main(argv=None):
         return cmd_context(cfg, args) and 0
     if args.command == "mapmatch":
         return cmd_mapmatch(cfg, args) or 0
+    if args.command == "visualize":
+        return cmd_visualize(cfg, args)
     if args.command == "info":
         from . import layout
         _, ctx = _context(cfg)

@@ -358,3 +358,17 @@ def test_train_vs_test_reading():
                              for m, s in skills.items()])
     out = train_vs_test(rows({"A": 0.30, "B": -0.2, "C": 0.05}), rows({"A": 0.35, "B": 0.5, "C": 0.0}))
     assert dict(zip(out.model, out.reading)) == {"A": "consistent", "B": "not generalising", "C": "not fitting"}
+
+
+def test_sample_figures_are_written(tmp_path):
+    import pytest
+    pytest.importorskip("matplotlib")
+    from mobeval.adapters.reference import KinematicReference
+    from mobeval.context import EvalConfig, EvalContext
+    from mobeval.data import synthetic_dataset
+    from mobeval.visualize import make_samples
+    ctx = EvalContext(synthetic_dataset(n_users=10, n_days=4), EvalConfig(window_length=16, visit_context=4))
+    files = make_samples(ctx, [KinematicReference()], tmp_path, n=2)
+    names = {f.name for f in files}
+    assert {"recovery_block50_window1.png", "recovery_random50_window2.png", "samples.npz"} <= names
+    assert all(f.exists() and f.stat().st_size > 0 for f in files)

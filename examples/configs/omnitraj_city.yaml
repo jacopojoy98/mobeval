@@ -47,6 +47,8 @@ eval:
   max_eval_samples: 5000
   retrieval_db_size: 20000                # the paper retrieves among 20,000 test trips
   retrieval_queries: 1000
+  visualize_samples: 6                    # sample maps in <run>/samples, over the map-matching road network
+  visualize_roads: /home/jcolombini/data/roads/milan/network.npz
 
 models:
   - name: OmniTraj                        # the released code's training

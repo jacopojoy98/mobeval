@@ -68,6 +68,14 @@ stage_in() {
 import os, shutil, sys, yaml
 cfg = yaml.safe_load(open(sys.argv[1])); scratch, data_dir = sys.argv[2], sys.argv[3]
 node = os.uname().nodename
+
+def expand(n):                                       # $USER, $HOME, ~ in paths: YAML does not expand them
+    for k, v in (n.items() if isinstance(n, dict) else enumerate(n)):
+        if isinstance(v, (dict, list)):
+            expand(v)
+        elif isinstance(v, str) and ("$" in v or v.startswith("~")):
+            n[k] = os.path.expanduser(os.path.expandvars(v))
+expand(cfg)
 OUTPUT_KEYS = {"output_dir", "persist_dir", "progress_dir", "checkpoint_dir", "checkpoint", "out"}
 copied = {}                                          # realpath of a source -> its copy in scratch
 

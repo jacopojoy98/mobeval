@@ -33,7 +33,22 @@ def load_config(path) -> dict:
     for key in ("dataset", "models"):
         if key not in cfg:
             raise ValueError(f"config is missing '{key}'")
-    return apply_defaults(cfg)
+    return apply_defaults(expand_paths(cfg))
+
+
+def expand_paths(node):
+    """Expand `$VAR` / `${VAR}` and a leading `~` in every string of a config, in place.
+
+    YAML does not do this itself, so `/home/$USER/data/train.csv` would otherwise be looked up
+    literally, as a folder named "$USER". Unknown variables are left as written."""
+    import os
+    items = node.items() if isinstance(node, dict) else enumerate(node) if isinstance(node, list) else ()
+    for k, v in items:
+        if isinstance(v, (dict, list)):
+            expand_paths(v)
+        elif isinstance(v, str) and ("$" in v or v.startswith("~")):
+            node[k] = os.path.expanduser(os.path.expandvars(v))
+    return node
 
 
 # Every key a model entry may have. A misspelled key used to be silently ignored, which is the

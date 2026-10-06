@@ -18,7 +18,7 @@ persist_dir: /home/jcolombini/results_milan
 dataset:
   loader: csv
   train_path: /home/$USER/data/data_by_fua_final/train.csv
-  test_path: /home/$USER/data/data_by_fua_final/train.csv
+  test_path: /home/$USER/data/data_by_fua_final/test_FVF.csv
   time_col: datetime
   user_id: uid
   traj_id: trip_id

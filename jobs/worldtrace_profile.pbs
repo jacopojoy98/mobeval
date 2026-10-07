@@ -22,12 +22,9 @@ VENV="$HOME/.venv-own"
 
 source $VENV/bin/activate
 mkdir /scratch/$USER/data
-mkdir /scratch/$USER/data/WorldTrace
 mkdir /scratch/$USER/wt_profile
 
-cp -r /home/jcolombini/data/WorldTrace /scratch/$USER/data
-
-python tools/worldtrace_profile.py --raw /scratch/$USER/data/WorldTrace \
+python tools/worldtrace_profile.py --raw /home/$USER/data/WorldTrace \
     --sample /home/$USER/data/worldtrace_sample.pkl --out /scratch/$USER/wt_profile --workers 32
 
 cp -r /scratch/$USER/wt_profile /home/$USER/data/context

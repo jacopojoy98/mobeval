@@ -90,6 +90,37 @@ def _build_net(arch: dict, use_road: bool, projection_dim: int, loss: str, pairs
     return cls(_ns(cfg), pairs, projection_dim=projection_dim)
 
 
+# the transformer layers of each vendored encoder: the unit gradient checkpointing recomputes
+_ENCODER_LAYERS = {"trajectory": lambda e: e.blocks, "topology": lambda e: e.roformer.encoder.layer,
+                   "road": lambda e: e.roformer.encoder.layer, "region": lambda e: e.transformer.layers}
+
+
+def _checkpoint_layers(net) -> list:
+    """Gradient checkpointing on every encoder layer, applied from outside the vendored code.
+
+    Only each layer's input is kept for the backward pass, and the layer is recomputed there with
+    the same dropout draws (checkpoint restores the RNG state), so the gradients are unchanged. The
+    recipes' batch of 1536 needs about 73 GB of activations without it and about 10 GB with it
+    (measured: 49 vs 6.7 MB per trajectory), for roughly 35% longer steps. Inactive outside training
+    (no grad, or eval mode). Returns the wrapped layers; `del layer.forward` restores each one."""
+    import torch
+    from torch.utils.checkpoint import checkpoint
+
+    def wrap(layer):
+        forward = layer.forward
+
+        def run(*args, **kwargs):
+            if layer.training and torch.is_grad_enabled():
+                return checkpoint(forward, *args, use_reentrant=False, **kwargs)
+            return forward(*args, **kwargs)
+        layer.forward = run
+
+    layers = [layer for name, enc in net.encoders.items() for layer in _ENCODER_LAYERS[name](enc)]
+    for layer in layers:
+        wrap(layer)
+    return layers
+
+
 class OmniTrajAdapter(TorchAdapter):
     name = "OmniTraj"
     model_type = "omnitraj"
@@ -263,7 +294,7 @@ class OmniTrajAdapter(TorchAdapter):
                  grid_n: Optional[int] = prep.PAPER_GRID_N, grid_cell_m: Optional[float] = None,
                  max_regions: int = 20_000, max_roads: int = 200_000, augment_val: bool = True,
                  max_train_units: Optional[int] = None, loss: str = "code", pairs: str = "code",
-                 **kw) -> "OmniTrajAdapter":
+                 gradient_checkpointing: bool = True, **kw) -> "OmniTrajAdapter":
         """Contrastive training as main.py: trajectory<->topology, topology<->road, topology<->region
         (pairs="paper": the trajectory against each modality, Eq. 10), plus trajectory<->each fusion, best
         model on the validation loss. `recipe: code | paper` sets main.py's / the paper's optimisation;
@@ -271,7 +302,9 @@ class OmniTrajAdapter(TorchAdapter):
 
         sample_unit: "trajectory" (whole trips of >= min_points points, as the paper) or "window".
         grid_n / grid_cell_m: the region grid, n x n over the train area (paper: 16) or fixed-size cells.
-        augment_val: the original also augments the validation set (its dataset settings are shared)."""
+        augment_val: the original also augments the validation set (its dataset settings are shared).
+        gradient_checkpointing: recompute encoder layers in the backward pass (see _checkpoint_layers);
+        same gradients, a fraction of the memory, slower steps. Off only pays for small batches."""
         from ..nn.common import TrainConfig
         from ..nn.common import fit as fit_loop
         cfg = TrainConfig.from_dict({"lr": 2e-4, "batch_size": 256, "optimizer": "adamw", "weight_decay": 1e-4,
@@ -349,8 +382,13 @@ class OmniTrajAdapter(TorchAdapter):
 
         ad.provenance = ctx.provenance(init_from=init_from, sample_unit=sample_unit)
         ad.net.train()
+        wrapped = _checkpoint_layers(ad.net) if gradient_checkpointing else []
+        if wrapped:
+            log.info(f"OmniTraj: gradient checkpointing on {len(wrapped)} encoder layers")
         history = fit_loop(ad.net, len(units["train"]), len(units["val"]), loss_fn, cfg,
                            on_best=ad.epoch_checkpointer(out))
+        for layer in wrapped:
+            del layer.forward
         ad.net.eval()
         ad.invalidate_cache()
         if out:

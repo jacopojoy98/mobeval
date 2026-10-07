@@ -201,6 +201,28 @@ def test_omnitraj_without_roads_leaves_the_road_encoder_out(omni):
         ad.embed_query(ctx.windows["test"].take(np.arange(2)), "road")
 
 
+def test_omnitraj_gradient_checkpointing_keeps_the_gradients_and_is_removed_after_training(omni):
+    import copy
+    import torch
+    from mobeval.adapters.omnitraj import FUSIONS, _checkpoint_layers
+    ad, ctx, _ = omni
+    assert not [m for m in ad.net.modules() if "forward" in m.__dict__]   # pretrain restored every layer
+    net = copy.deepcopy(ad.net).train()
+    b = ad._tensors(ad._samples(ad._rows(ctx.windows["train"].take(np.arange(8)))))
+    b["label"] = torch.arange(8, device=ad.device)
+
+    def grads():
+        torch.manual_seed(0)                                   # dropout is on: the same draws in both runs
+        net.zero_grad(set_to_none=True)
+        net(b, FUSIONS).backward()
+        return {n: p.grad.clone() for n, p in net.named_parameters() if p.grad is not None}
+
+    plain = grads()
+    assert len(_checkpoint_layers(net)) == 4                   # TINY: one layer per encoder
+    ckpt = grads()
+    assert plain.keys() == ckpt.keys() and all(torch.allclose(plain[n], ckpt[n], atol=1e-6) for n in plain)
+
+
 # ------------------------------------------------------------------ retrieval
 def test_hausdorff_ranks_match_brute_force():
     from mobeval.tasks import RetrievalTask as R

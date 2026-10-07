@@ -33,6 +33,7 @@ _ADAM = {"optimizer": "adam", "weight_decay": 0.0, "grad_clip": 0.0, "drop_last"
 # Options that point at data files rather than change the method (e.g. TransferTraj's POI/road
 # embeddings): setting them is not an override of the recipe.
 DATA_OPTIONS = {"context", "roads_file"}
+RUNTIME_OPTIONS = {"gradient_checkpointing"}         # trade memory for speed; the same model is learned
 
 RECIPES: Dict[str, Dict[str, dict]] = {
     # ============================================================== UniTraj
@@ -264,7 +265,7 @@ def apply(spec: dict) -> Tuple[dict, dict]:
         for k, v in user.items():
             if k in preset and preset[k] != v:
                 overrides.append(f"{key}.{k}: {preset[k]!r} -> {v!r}")
-            elif k not in preset and key != "train" and k not in DATA_OPTIONS:
+            elif k not in preset and key != "train" and k not in DATA_OPTIONS | RUNTIME_OPTIONS:
                 overrides.append(f"{key}.{k}: (not in recipe) {v!r}")
     arch = {**r.get("arch", {}), **(spec.get("arch") or {})}
     opts = {**r.get("options", {}), **user_opts}

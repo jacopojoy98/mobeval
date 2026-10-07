@@ -294,6 +294,12 @@ Where the paper is silent, both recipes use the code's settings: cosine schedule
 best model by validation loss. Both contrast the trajectory against each of the four fusions. The original augments the
 validation set as well (its dataset settings are shared); `augment_val` reproduces that.
 
+**Memory.** A training step at batch 1536 holds about 73 GB of activations, more than any single
+GPU. Training therefore checkpoints every encoder layer (`gradient_checkpointing`, on by default):
+each layer is recomputed in the backward pass with the same dropout draws, so the gradients are
+identical, and the step needs about 10 GB, at roughly 35% more time. It changes nothing about
+the model or the recipe; `train: {options: {gradient_checkpointing: false}}` turns it off for small batches.
+
 **Evaluation.** `embed()` returns the L2-normalised projection of the GPS trajectory, which is the
 retrieval space the model is trained for. Windows are spline-resampled to 200 points like trips.
 `embed_query(batch, "topology" | "road" | "region" | "region+topology" | ...)` embeds the other

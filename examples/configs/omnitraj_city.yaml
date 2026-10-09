@@ -51,12 +51,16 @@ eval:
   visualize_roads: /home/jcolombini/data/roads/milan/network.npz
 
 models:
+  # Speed (does not change the method): amp runs the encoders in float16 on the V100s (the loss stays
+  # float32); gpus: 2 splits each batch over two GPUs, the loss still on the whole batch - needs
+  # ngpus=2 in the PBS request, otherwise it falls back to one GPU with a warning.
   - name: OmniTraj                        # the released code's training
     type: omnitraj
     recipe: code
     train:
       device: cuda
-      options: {roads_file: /home/jcolombini/data/roads/milan/matched.csv.gz}
+      amp: true
+      options: {roads_file: /home/jcolombini/data/roads/milan/matched.csv.gz, gpus: 1}
     adapter: {device: cuda, batch_size: 512}
 
   - name: OmniTraj-paper                  # the paper's loss (InfoNCE on cosine similarity) and Adam
@@ -64,7 +68,8 @@ models:
     recipe: paper
     train:
       device: cuda
-      options: {roads_file: /home/jcolombini/data/roads/milan/matched.csv.gz}
+      amp: true
+      options: {roads_file: /home/jcolombini/data/roads/milan/matched.csv.gz, gpus: 1}
     adapter: {device: cuda, batch_size: 512}
 
   # The other models on the same city subset, for a like-for-like table

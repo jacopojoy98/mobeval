@@ -316,3 +316,127 @@ def test_generation_survives_a_baseline_with_no_staypoints(tmp_path):
     grid = SpatialGrid(44.9, 45.1, 8.9, 9.1, 500.0)
     empty = G.trajectory_stats(pts, pd.DataFrame(columns=["user_id", "lat", "lon", "t_arrive", "t_leave"]), grid)
     assert "_cells" not in empty, "no staypoints must mean no _cells - the task has to cope with that"
+
+
+# --------------------------------------------------------------------- resuming the same run
+def _dropout_problem(seed=0):
+    torch.manual_seed(seed)
+    model = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Dropout(0.2), nn.Linear(16, 1))
+    g = torch.Generator().manual_seed(1)
+    x = torch.randn(64, 4, generator=g)
+    y = x @ torch.tensor([1.0, -2.0, 0.5, 0.0]) + 0.1 * torch.randn(64, generator=g)
+
+    def loss_fn(idx, training):
+        i = torch.as_tensor(np.asarray(idx) % 64)
+        return ((model(x[i]).squeeze(-1) - y[i]) ** 2).mean()
+
+    return model, loss_fn
+
+
+def _losses(history):
+    return [(h["epoch"], h["train_loss"], h["val_loss"]) for h in history]
+
+
+def test_a_resumed_training_continues_the_run_exactly(tmp_path):
+    """Killed after epoch 3 of 6 and resumed: epoch count, cosine schedule, optimizer moments,
+    data order and dropout carry on, so the result is the uninterrupted run's, to the bit."""
+    from mobeval.nn.common import resuming
+    cfg = TrainConfig(epochs=6, batch_size=16, lr=0.02, device="cpu", scheduler="cosine", patience=100)
+    model, loss_fn = _dropout_problem()
+    clean = fit(model, 64, 32, loss_fn, cfg, drop_last=False)
+    clean_w = {k: v.clone() for k, v in model.state_dict().items()}
+    assert [h["val_loss"] for h in clean[:3]] == sorted((h["val_loss"] for h in clean[:3]), reverse=True)  # 1-3 improve
+
+    model, loss_fn = _dropout_problem()
+    out, calls = tmp_path / "m.pt", {"n": 0}
+
+    def killed_in_epoch_4(idx, training):
+        calls["n"] += training
+        if calls["n"] > 12:                                     # 4 steps per epoch
+            raise RuntimeError("walltime")
+        return loss_fn(idx, training)
+
+    with pytest.raises(RuntimeError, match="walltime"):
+        fit(model, 64, 32, killed_in_epoch_4, cfg, drop_last=False,
+            on_best=lambda h: save_checkpoint(out, model, "test", {}, history=h, quiet=True, complete=False))
+    ck = load_checkpoint(out)
+    assert ck["history"][-1]["epoch"] == 3 and ck["train_state"]["epoch"] == 3
+
+    model, loss_fn = _dropout_problem(seed=99)                  # fresh process: other initial weights...
+    model.load_state_dict(ck["state_dict"])                     # ...replaced by the checkpoint's (init_from)
+    with resuming(out):
+        resumed = fit(model, 64, 32, loss_fn, cfg, drop_last=False)
+    assert _losses(resumed) == _losses(clean)
+    assert all(torch.equal(clean_w[k], v) for k, v in model.state_dict().items())
+
+
+def test_a_checkpoint_without_train_state_still_continues_epochs_and_schedule(tmp_path, monkeypatch):
+    """Checkpoints written before the train state was saved (or with save_train_state: false):
+    the optimizer starts afresh, but the epoch count and the learning-rate schedule carry on."""
+    import mobeval.nn.common as C
+    opts, lrs = [], []
+    real = C.make_optimizer
+    monkeypatch.setattr(C, "make_optimizer", lambda p, cfg: opts.append(real(p, cfg)) or opts[-1])
+    cfg = TrainConfig(epochs=6, batch_size=16, lr=0.02, device="cpu", scheduler="cosine", patience=100,
+                      save_train_state=False)
+    model, loss_fn = _dropout_problem()
+    fit(model, 64, 32, loss_fn, cfg, drop_last=False, on_epoch=lambda h: lrs.append(opts[-1].param_groups[0]["lr"]))
+    clean_lrs, lrs[:] = list(lrs), []
+
+    model, loss_fn = _dropout_problem()
+    out = tmp_path / "m.pt"
+
+    def keep_epoch_3(h):                                        # as if the job had been killed in epoch 4
+        if len(h) == 3:
+            save_checkpoint(out, model, "test", {}, history=h, quiet=True, complete=False)
+
+    fit(model, 64, 32, loss_fn, cfg, drop_last=False, on_best=keep_epoch_3)
+    assert "train_state" not in load_checkpoint(out)
+    model.load_state_dict(load_checkpoint(out)["state_dict"])
+    lrs[:] = []
+    with C.resuming(out):
+        resumed = fit(model, 64, 32, loss_fn, cfg, drop_last=False,
+                      on_epoch=lambda h: lrs.append(opts[-1].param_groups[0]["lr"]))
+    assert [h["epoch"] for h in resumed] == [1, 2, 3, 4, 5, 6]
+    assert lrs == clean_lrs[3:]                                 # epochs 4-6 at the schedule's learning rates
+
+
+def test_train_model_resumes_only_when_continuing_its_own_checkpoint(tmp_path, monkeypatch):
+    """`--resume` continues the run; `init_from` alone (fine-tuning) starts a new one."""
+    from types import SimpleNamespace
+    import mobeval.nn.common as C
+    from mobeval import registry
+    seen = []
+
+    class Fake:
+        @classmethod
+        def pretrain(cls, ctx, train=None, out=None, init_from=None, **kw):
+            seen.append((init_from, C._RESUME_FROM, "resume" in (train or {})))
+
+    monkeypatch.setitem(registry.MODEL_TYPES, "omnitraj", lambda: Fake)
+    ctx = SimpleNamespace(cfg=None)
+    ck = str(tmp_path / "checkpoints" / "O.pt")
+    registry.train_model({"name": "O", "type": "omnitraj", "train": {"init_from": ck, "resume": True}}, ctx, tmp_path)
+    registry.train_model({"name": "O", "type": "omnitraj", "train": {"init_from": ck}}, ctx, tmp_path)
+    assert seen == [(ck, ck, False), (ck, None, False)] and C._RESUME_FROM is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="mixed precision is for CUDA GPUs")
+def test_mixed_precision_training_on_gpu_learns_like_float32():
+    out = {}
+    for amp in (False, True):
+        model, loss_fn = _dropout_problem()
+        model.cuda()
+        x, y = torch.randn(64, 4, device="cuda"), torch.randn(64, device="cuda")
+
+        def loss_fn(idx, training):
+            i = torch.as_tensor(np.asarray(idx) % 64, device="cuda")
+            return ((model(x[i]).squeeze(-1) - y[i]) ** 2).mean()
+
+        torch.manual_seed(0)
+        x.copy_(torch.randn(64, 4)); y.copy_(x[:, 0] - 2 * x[:, 1])
+        fit(model, 64, 32, loss_fn, TrainConfig(epochs=4, batch_size=16, lr=0.02, device="cuda", amp=amp),
+            drop_last=False)
+        out[amp] = {k: v.cpu() for k, v in model.state_dict().items()}
+    assert all(v.dtype == torch.float32 for v in out[True].values())          # weights stay float32
+    assert all(torch.allclose(out[True][k], out[False][k], atol=0.05) for k in out[False])

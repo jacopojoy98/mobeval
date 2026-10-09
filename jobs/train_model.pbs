@@ -10,8 +10,15 @@
 #
 # The checkpoint is copied to $RESULTS_DIR/checkpoints/ after every epoch that improves, so if
 # this job dies or runs out of walltime the best model so far is already there. To carry on from
-# it instead of starting over:
+# it instead of starting over (same epoch count, learning-rate schedule and optimizer state):
 #   qsub -v MODEL=TrajGPT,RESUME=1 jobs/train_model.pbs
+#
+# Two models of one config can train side by side, one job each (at most 2 running jobs per user):
+#   qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,RESULTS_DIR=$HOME/results_milan,MODEL=OmniTraj,RESUME=1 jobs/train_model.pbs
+#   qsub -v CONFIG=$PWD/examples/configs/omnitraj_city.yaml,RESULTS_DIR=$HOME/results_milan,MODEL=OmniTraj-paper,RESUME=1 jobs/train_model.pbs
+# OmniTraj can also split each batch over two GPUs (train: options: {gpus: 2} in the config); ask
+# PBS for them on the command line, which overrides the #PBS line above:
+#   qsub -l select=1:ncpus=8:ngpus=2:mem=32gb -v ...,MODEL=OmniTraj jobs/train_model.pbs
 
 cd "$PBS_O_WORKDIR"
 source jobs/env.sh

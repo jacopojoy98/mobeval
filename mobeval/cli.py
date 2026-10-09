@@ -122,7 +122,9 @@ def cmd_train(cfg, names, ctx=None, only_missing=False):
         if not train_it:
             continue
         if continue_from:
-            spec = {**spec, "train": {**spec["train"], "init_from": continue_from}}
+            # resume: True - the same run carries on (epoch count, schedule, optimizer), rather than
+            # a new training that merely starts from those weights
+            spec = {**spec, "train": {**spec["train"], "init_from": continue_from, "resume": True}}
         t0 = time.time()
         trained_any = True
         train_model(spec, ctx, cfg["output_dir"])

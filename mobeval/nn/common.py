@@ -2,12 +2,14 @@
 early-stopping fit loop, checkpoint I/O and small task heads for frozen encoders."""
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import logging
 import math
 import os
 import time
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional
@@ -44,6 +46,10 @@ class TrainConfig:
     device: str = "auto"
     seed: int = 0
     log_every: int = 50
+    amp: bool = False                      # mixed precision on CUDA GPUs: float16 with loss scaling before
+                                           # Ampere (V100), bfloat16 from Ampere on; weights stay float32
+    save_train_state: bool = True          # interim checkpoints also hold optimizer, schedule and data
+                                           # order, so a resumed job continues the run exactly
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "TrainConfig":
@@ -95,16 +101,85 @@ def make_optimizer(params, cfg: TrainConfig):
     raise ValueError("optimizer must be 'adamw', 'adam' or 'adafactor'")
 
 
+# Set while `fit` runs: the optimiser/schedule state written into interim checkpoints.
+_LIVE_STATE: Optional[Callable[[], dict]] = None
+# Set by `resuming(path)`: the next `fit` continues the run stored in that checkpoint.
+_RESUME_FROM: Optional[str] = None
+
+
+@contextlib.contextmanager
+def resuming(path):
+    """Within this block, the (first) `fit` continues the interrupted run whose interim checkpoint
+    is `path`: epoch count, learning-rate schedule, early-stopping state and history carry on,
+    and the optimizer state and data order too when the checkpoint holds them. The weights
+    themselves are loaded by the adapter (init_from), as before."""
+    global _RESUME_FROM
+    _RESUME_FROM = str(path) if path else None
+    try:
+        yield
+    finally:
+        _RESUME_FROM = None
+
+
+def _amp_context(cfg: TrainConfig, model: nn.Module):
+    """(autocast context factory, GradScaler or None) for `cfg.amp`, or (None, None)."""
+    if not cfg.amp:
+        return None, None
+    try:
+        dev = next(model.parameters()).device
+    except StopIteration:
+        return None, None
+    if dev.type != "cuda":
+        log.info(f"amp: mixed precision is for GPUs; training on {dev.type} in float32")
+        return None, None
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability(dev)[0] >= 8 else torch.float16
+    scaler = None
+    if dtype == torch.float16:
+        try:
+            scaler = torch.amp.GradScaler("cuda")
+        except (AttributeError, TypeError):                         # torch < 2.3
+            scaler = torch.cuda.amp.GradScaler()
+    log.info(f"mixed precision: {str(dtype).replace('torch.', '')} on {dev}"
+             + (" with loss scaling" if scaler is not None else ""))
+    return (lambda: torch.autocast(dev.type, dtype=dtype)), scaler
+
+
+def _replay(history: List[dict], sched) -> tuple:
+    """Best validation loss and epochs-without-improvement after `history`, stepping `sched` through
+    it exactly as the original run did (so the learning rate is where that run left it)."""
+    best, bad = math.inf, 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)                # "scheduler.step() before optimizer.step()"
+        for h in history:
+            vl = float(h["val_loss"])
+            if isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                sched.step(vl)
+            elif sched is not None:
+                sched.step()
+            if vl < best - 1e-6:
+                best, bad = vl, 0
+            else:
+                bad += 1
+    return best, bad
+
+
 def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarray, bool], torch.Tensor],
         cfg: TrainConfig, params: Optional[Iterable] = None, drop_last: bool = True,
-        on_best: Optional[Callable[[List[dict]], None]] = None) -> List[dict]:
+        on_best: Optional[Callable[[List[dict]], None]] = None,
+        on_epoch: Optional[Callable[[List[dict]], None]] = None) -> List[dict]:
     """Generic loop. `loss_fn(indices, train)` builds the batch for those sample indices
     and returns a scalar loss. Restores the best validation state at the end.
 
     `on_best(history)` is called every time validation improves, with the model's weights
     already at that best state. Adapters pass a checkpoint saver, so a run that is killed
     at epoch 40 of 100 still leaves the best-so-far model on disk instead of nothing.
+    `on_epoch(history)` is called after every epoch (before `on_best`); it may add fields to
+    history[-1], which are then saved with the checkpoint.
+
+    Inside `resuming(path)` the loop continues the run stored in that checkpoint instead of
+    starting at epoch 1 (see `resuming`).
     """
+    global _LIVE_STATE, _RESUME_FROM
     set_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
     opt = make_optimizer(params if params is not None else model.parameters(), cfg)
@@ -119,72 +194,136 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
         sched = None
     else:
         raise ValueError("scheduler must be 'plateau', 'step', 'cosine' or 'none'")
-    best, best_state, bad, history = math.inf, None, 0, []
+    autocast, scaler = _amp_context(cfg, model)
+    amp = autocast if autocast is not None else contextlib.nullcontext
+    best, best_state, bad, history, start = math.inf, None, 0, [], 1
+    resume_from, _RESUME_FROM = _RESUME_FROM, None                 # only the first fit of a resumed training
+    if resume_from:
+        ck = torch.load(resume_from, map_location="cpu", weights_only=False)
+        history = [dict(h) for h in (ck.get("history") or [])]
+        state = ck.get("train_state") or {}
+        if history:
+            start = int(history[-1]["epoch"]) + 1
+            best, bad = _replay(history, sched)
+            how = "learning-rate schedule replayed"
+            if state.get("epoch") == history[-1]["epoch"]:
+                if state.get("optimizer") is not None:
+                    lrs = [g["lr"] for g in opt.param_groups]
+                    try:
+                        opt.load_state_dict(state["optimizer"])
+                        how += ", optimizer state restored"
+                    except (ValueError, KeyError, RuntimeError) as e:   # e.g. another optimizer in the config
+                        how += f", optimizer starts afresh ({e})"
+                    for g, lr in zip(opt.param_groups, lrs):        # the schedule of THIS config (epochs may
+                        g["lr"] = lr                                 # have changed) decides the learning rate
+                if scaler is not None and state.get("scaler"):
+                    scaler.load_state_dict(state["scaler"])
+                if state.get("rng") is not None:
+                    rng.bit_generator.state = state["rng"]
+                    how += ", data order continued"
+                if state.get("torch_rng") is not None:                  # dropout continues its stream too
+                    torch.set_rng_state(state["torch_rng"])
+                if state.get("cuda_rng") is not None and torch.cuda.is_available():
+                    try:
+                        torch.cuda.set_rng_state_all(state["cuda_rng"])
+                    except (RuntimeError, IndexError):                  # another number of GPUs
+                        pass
+            else:
+                rng = np.random.default_rng([cfg.seed, start])
+                how += ("; the optimizer starts afresh (its moments were not saved in this checkpoint, "
+                        "written by an older mobeval) - they re-adapt within a few hundred steps")
+            best_state = copy.deepcopy(model.state_dict())          # the weights loaded ARE the best so far
+            log.info(f"continuing the interrupted training at epoch {start} of {cfg.epochs} "
+                     f"(best val {best:.4f}; {how})")
     rep = progress.get()
     who = getattr(rep, "scope", None) or "model"
-    rep.model(who, state="training", detail=f"epoch 0/{cfg.epochs}")
-    for epoch in range(1, cfg.epochs + 1):
-        model.train()
-        t0, tr_losses = time.time(), []
-        for step, idx in enumerate(minibatches(n_train, cfg.batch_size, True, rng,
-                                               drop_last and cfg.drop_last and n_train > cfg.batch_size)):
-            if cfg.max_steps_per_epoch and step >= cfg.max_steps_per_epoch:
-                break
-            loss = loss_fn(idx, True)
-            if not torch.isfinite(loss):
-                raise FloatingPointError(
-                    f"non-finite training loss at epoch {epoch}, step {step}. Common causes: extreme or invalid input "
-                    f"values (clean the GPS data, see mobeval.data.clean_points), or a learning rate that is too high "
-                    f"(current {opt.param_groups[0]['lr']:.2e}).")
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if cfg.grad_clip:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            opt.step()
-            tr_losses.append(loss.item())
-            if cfg.log_every and step % cfg.log_every == 0:
-                log.debug(f"epoch {epoch} step {step} loss {loss.item():.4f}")
-        model.eval()
-        with torch.no_grad():
-            va = [loss_fn(idx, False).item() for idx in minibatches(n_val, cfg.batch_size, False)] if n_val else []
-        tr, vl = float(np.mean(tr_losses)), (float(np.mean(va)) if va else float(np.mean(tr_losses)))
-        if not np.isfinite(vl):
-            bad_batches = int(np.sum(~np.isfinite(va))) if va else 0
-            raise FloatingPointError(
-                f"non-finite validation loss at epoch {epoch} ({bad_batches}/{len(va)} batches). Early stopping "
-                "cannot work with NaN; check the validation inputs for NaN/inf or extreme values.")
-        history.append({"epoch": epoch, "train_loss": tr, "val_loss": vl, "seconds": time.time() - t0})
-        log.info(f"epoch {epoch:3d}  train {tr:.4f}  val {vl:.4f}  ({time.time() - t0:.0f}s)")
-        improved = vl < best - 1e-6
-        rep.model(who, state="training", epoch=epoch, epochs=cfg.epochs, train_loss=tr, val_loss=vl,
-                  best_val=min(best, vl), detail=f"epoch {epoch}/{cfg.epochs}  val {vl:.4g}"
-                                                 f"  best {min(best, vl):.4g}")
-        rep.event("epoch", model=who, epoch=epoch, epochs=cfg.epochs, train_loss=float(f"{tr:.6g}"),
-                  val_loss=float(f"{vl:.6g}"), improved=improved, seconds=round(time.time() - t0, 1))
-        if isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            sched.step(vl)
-        elif sched is not None:
-            sched.step()
-        if vl < best - 1e-6:
-            best, bad, best_state = vl, 0, copy.deepcopy(model.state_dict())
-            if on_best is not None:
-                # The live weights ARE the best weights at this instant, so the saver can just
-                # write model.state_dict(). Never let a failed save abort a good training run.
-                try:
-                    on_best(history)
-                except Exception as e:                                  # noqa: BLE001
-                    log.warning(f"could not save the epoch-{epoch} checkpoint: {e!r}")
-                    rep.event("checkpoint_failed", model=who, epoch=epoch, error=repr(e))
+    rep.model(who, state="training", detail=f"epoch {start - 1}/{cfg.epochs}")
+    epoch = start - 1
+
+    def train_state():
+        return {"epoch": epoch, "epochs": cfg.epochs, "best": best, "bad": bad, "optimizer": opt.state_dict(),
+                "scaler": scaler.state_dict() if scaler is not None else None, "rng": rng.bit_generator.state,
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
+
+    _LIVE_STATE = train_state if cfg.save_train_state else None
+    try:
+        for epoch in range(start, cfg.epochs + 1):
+            model.train()
+            t0, tr_losses = time.time(), []
+            for step, idx in enumerate(minibatches(n_train, cfg.batch_size, True, rng,
+                                                   drop_last and cfg.drop_last and n_train > cfg.batch_size)):
+                if cfg.max_steps_per_epoch and step >= cfg.max_steps_per_epoch:
+                    break
+                with amp():
+                    loss = loss_fn(idx, True)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        f"non-finite training loss at epoch {epoch}, step {step}. Common causes: extreme or invalid input "
+                        f"values (clean the GPS data, see mobeval.data.clean_points), or a learning rate that is too high "
+                        f"(current {opt.param_groups[0]['lr']:.2e})"
+                        + (". Mixed precision is on (amp): try again without it." if autocast is not None else "."))
+                opt.zero_grad(set_to_none=True)
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    if cfg.grad_clip:
+                        scaler.unscale_(opt)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                    scaler.step(opt)
+                    scaler.update()
                 else:
-                    rep.event("checkpoint", model=who, epoch=epoch, val_loss=float(f"{vl:.6g}"),
-                              message=f"{who}: saved checkpoint at epoch {epoch} (val {vl:.4g})")
-        else:
-            bad += 1
-            if bad >= cfg.patience:
-                log.info(f"early stopping at epoch {epoch} (best val {best:.4f})")
-                rep.event("early_stop", model=who, epoch=epoch, best_val=best,
-                          message=f"{who}: early stop at epoch {epoch} (best val {best:.4g})")
-                break
+                    loss.backward()
+                    if cfg.grad_clip:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                    opt.step()
+                tr_losses.append(loss.item())
+                if cfg.log_every and step % cfg.log_every == 0:
+                    log.debug(f"epoch {epoch} step {step} loss {loss.item():.4f}")
+            model.eval()
+            with torch.no_grad(), amp():
+                va = [loss_fn(idx, False).item() for idx in minibatches(n_val, cfg.batch_size, False)] if n_val else []
+            tr, vl = float(np.mean(tr_losses)), (float(np.mean(va)) if va else float(np.mean(tr_losses)))
+            if not np.isfinite(vl):
+                bad_batches = int(np.sum(~np.isfinite(va))) if va else 0
+                raise FloatingPointError(
+                    f"non-finite validation loss at epoch {epoch} ({bad_batches}/{len(va)} batches). Early stopping "
+                    "cannot work with NaN; check the validation inputs for NaN/inf or extreme values.")
+            history.append({"epoch": epoch, "train_loss": tr, "val_loss": vl, "seconds": time.time() - t0})
+            if on_epoch is not None:
+                on_epoch(history)
+            log.info(f"epoch {epoch:3d}  train {tr:.4f}  val {vl:.4f}  ({time.time() - t0:.0f}s)")
+            improved = vl < best - 1e-6
+            rep.model(who, state="training", epoch=epoch, epochs=cfg.epochs, train_loss=tr, val_loss=vl,
+                      best_val=min(best, vl), detail=f"epoch {epoch}/{cfg.epochs}  val {vl:.4g}"
+                                                     f"  best {min(best, vl):.4g}")
+            rep.event("epoch", model=who, epoch=epoch, epochs=cfg.epochs, train_loss=float(f"{tr:.6g}"),
+                      val_loss=float(f"{vl:.6g}"), improved=improved, seconds=round(time.time() - t0, 1))
+            if isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                sched.step(vl)
+            elif sched is not None:
+                sched.step()
+            if vl < best - 1e-6:
+                best, bad, best_state = vl, 0, copy.deepcopy(model.state_dict())
+                if on_best is not None:
+                    # The live weights ARE the best weights at this instant, so the saver can just
+                    # write model.state_dict(). Never let a failed save abort a good training run.
+                    try:
+                        on_best(history)
+                    except Exception as e:                                  # noqa: BLE001
+                        log.warning(f"could not save the epoch-{epoch} checkpoint: {e!r}")
+                        rep.event("checkpoint_failed", model=who, epoch=epoch, error=repr(e))
+                    else:
+                        rep.event("checkpoint", model=who, epoch=epoch, val_loss=float(f"{vl:.6g}"),
+                                  message=f"{who}: saved checkpoint at epoch {epoch} (val {vl:.4g})")
+            else:
+                bad += 1
+                if bad >= cfg.patience:
+                    log.info(f"early stopping at epoch {epoch} (best val {best:.4f})")
+                    rep.event("early_stop", model=who, epoch=epoch, best_val=best,
+                              message=f"{who}: early stop at epoch {epoch} (best val {best:.4g})")
+                    break
+    finally:
+        _LIVE_STATE = None
     if best_state is not None and cfg.restore_best:
         model.load_state_dict(best_state)
     model.eval()
@@ -208,6 +347,13 @@ def save_checkpoint(path, model: nn.Module, model_type: str, config: dict, meta:
     # to continue from these weights instead of accepting a half-trained model as final.
     blob = {"format": CHECKPOINT_FORMAT, "model_type": model_type, "config": config, "complete": complete,
             "meta": meta or {}, "history": history or [], "state_dict": model.state_dict()}
+    if not complete and _LIVE_STATE is not None:
+        # An interim checkpoint written from inside `fit`: keep what a resumed job needs to carry
+        # on exactly (optimizer moments, data order). Final checkpoints do not carry it.
+        try:
+            blob["train_state"] = _LIVE_STATE()
+        except Exception as e:                                      # noqa: BLE001
+            log.debug(f"train state not saved: {e!r}")
     sidecar = {"model_type": model_type, "config": config, "complete": complete,
                "meta": meta or {}, "history": history or []}
     tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")

@@ -552,7 +552,10 @@ A resumed run reuses the *same* run directory and:
 
 * skips models whose checkpoint is marked complete;
 * **continues** a model whose checkpoint is marked incomplete, from its best epoch — an
-  interrupted model is never silently accepted as trained;
+  interrupted model is never silently accepted as trained. It is the same run carrying on: the
+  epoch count, the learning-rate schedule and the early-stopping state continue from that epoch, and
+  so do the optimizer state and the data order (interim checkpoints hold them; checkpoints written
+  before this version restart only the optimizer's moments);
 * keeps every evaluation task that already has results and computes only what is missing.
 
 It works even when scratch is empty, which is the normal case for the next job: checkpoints and the

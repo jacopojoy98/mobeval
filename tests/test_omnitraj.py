@@ -150,6 +150,55 @@ def test_fmm_roundtrip(tmp_path):
     assert len(m) == len(ds.points) and set(m.seg) == {1}
 
 
+def test_prepared_units_give_exactly_the_batches_of_build_sample():
+    """The once-per-run cache must not change a single input: same arrays, same augmentations."""
+    d = pd.read_pickle(SAMPLE)
+    rng0 = np.random.default_rng(0)
+    units, roads = [], []
+    for r in d.itertuples():
+        tr, rr = np.asarray(r.trajectory, float), np.asarray(r.roads)
+        for k in range(5):
+            sel = np.sort(rng0.choice(len(tr), int(rng0.integers(20, 120)), replace=False))
+            units.append((f"{r.Index}_{k}", tr[sel, 1], tr[sel, 0], sel.astype(float)))
+            roads.append(rr[sel * len(rr) // len(tr)])
+    g = prep.RegionGrid(30.65172, 104.03534, 0.005137, 0.006, 16, 16)
+    v = prep.RoadVocab.fit(roads[:100])
+    norm = {"mean": [104.07596303, 30.68085491], "std": [2.15106194e-02, 1.89193207e-02]}
+    serial = prep.prepare_units(units, roads, g, v, norm, workers=1)
+    forked = prep.prepare_units(units, roads, g, v, norm, workers=2, chunk=50)      # the process pool
+    idx = rng0.permutation(len(units))[:64]
+    for aug in (True, False):
+        r = np.random.default_rng(7)
+        want = prep.collate([prep.build_sample(units[i][1], units[i][2], roads[i], g, v, norm, r, aug) for i in idx])
+        for got in (serial.batch(idx, np.random.default_rng(7), aug), forked.batch(idx, np.random.default_rng(7), aug)):
+            assert set(got) == set(want)
+            assert all(got[k].dtype == want[k].dtype and np.array_equal(got[k], want[k]) for k in want)
+    before = [x.copy() for x in serial.road]
+    serial.batch(np.arange(len(units)), np.random.default_rng(1), True)
+    assert all(np.array_equal(a, b) for a, b in zip(before, serial.road))      # augmenting never edits the cache
+
+
+def _stuck(rows):
+    import time
+    time.sleep(60)
+
+
+def test_prepare_units_falls_back_to_one_process_when_a_worker_hangs(monkeypatch, caplog):
+    """A hung worker must not stall a training job until its walltime: it is stopped, and the
+    preprocessing is redone in the main process."""
+    import time
+    rng = np.random.default_rng(0)
+    units = [(i, 45.4 + rng.random(30) * 0.01, 9.1 + rng.random(30) * 0.01, np.arange(30.0)) for i in range(40)]
+    g = prep.RegionGrid.fit(np.concatenate([u[1] for u in units]), np.concatenate([u[2] for u in units]))
+    norm = {"mean": [9.1, 45.4], "std": [0.01, 0.01]}
+    want = prep.prepare_units(units, None, g, None, norm, workers=1)
+    monkeypatch.setattr(prep, "_base_list", _stuck)
+    t0 = time.time()
+    got = prep.prepare_units(units, None, g, None, norm, workers=2, chunk=10, chunk_timeout_s=0.5)
+    assert time.time() - t0 < 20 and "doing it in one process" in caplog.text
+    assert np.array_equal(got.trajectory, want.trajectory)
+
+
 # ------------------------------------------------------------------ adapter
 TINY = {"trajectory": {"embed_dim": 32, "depth": 1, "num_heads": 2},
         "topology": {"embed_dim": 32, "num_layers": 1, "num_heads": 2},
@@ -292,3 +341,93 @@ def test_parallel_segments_keep_the_shorter_route():
     detour = np.array([a[0], [41.9 + 100 / 111195, a[0][1]], [41.9 + 100 / 111195, a[1][1]], a[1]])
     G, _ = HMMMatcher(RoadNetwork.from_polylines([a, detour]))._subgraph(np.zeros((2, 2)), 5000)
     assert np.allclose(sorted(G.data), [100, 100], atol=0.5)
+
+
+# ------------------------------------------------------------------ training speed (same results)
+def _batch(ad, ctx, n=12):
+    import torch
+    w = ctx.windows["train"].take(np.arange(n))
+    b = ad._tensors(ad._samples(ad._rows(w)))
+    b["label"] = torch.arange(n)
+    return b
+
+
+def test_omnitraj_on_several_gpus_still_contrasts_the_whole_batch(omni):
+    """parallelize() splits the encoders' work; the loss must still see every trip as a negative
+    of every other - unlike DataParallel over the whole model, which computes it per GPU."""
+    import torch
+    from mobeval.adapters.omnitraj import FUSIONS
+    ad, ctx, _ = omni
+    net, keys = ad.net.eval(), set(ad.net.state_dict())
+    b, fus = _batch(ad, ctx), FUSIONS
+    with torch.no_grad():
+        whole = net(b, fus)
+        per_half = (net({k: v[:6] for k, v in b.items()}, fus) + net({k: v[6:] for k, v in b.items()}, fus)) / 2
+        net.parallelize([0, 1])                     # no GPU here: DataParallel passes straight through
+        assert set(net.state_dict()) == keys        # checkpoints unchanged
+        assert torch.allclose(net(b, fus), whole, atol=1e-6)
+        enc = net._dp.module                        # what each GPU runs; emulate a two-way split
+        halves = [enc({k: v[:6] for k, v in b.items()}), enc({k: v[6:] for k, v in b.items()})]
+        object.__setattr__(net, "_dp", lambda batch: {m: torch.cat([h[m] for h in halves]) for m in halves[0]})
+        split = net(b, fus)
+        net.parallelize(None)
+    assert torch.allclose(split, whole, atol=1e-5)
+    assert not torch.allclose(per_half, whole, atol=1e-3)
+
+
+def test_omnitraj_loss_stays_float32_under_mixed_precision(omni):
+    import torch
+    ad, _, _ = omni
+    z1, z2 = torch.randn(8, 16), torch.randn(8, 16)
+    exact = ad.net.compute_contrastive_loss(z1, z2)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        mixed = ad.net.compute_contrastive_loss(z1.bfloat16(), z2.bfloat16())
+    assert mixed.dtype == torch.float32 and torch.allclose(mixed, exact, rtol=0.05, atol=0.05)
+
+
+def test_omnitraj_speed_options_fall_back_cleanly_without_gpus(omni):
+    import json
+    from mobeval.adapters.omnitraj import OmniTrajAdapter
+    _, ctx, d = omni
+    ad = OmniTrajAdapter.pretrain(ctx, train={"epochs": 2, "batch_size": 16, "device": "cpu", "amp": True},
+                                  out=str(d / "amp.pt"), arch=TINY, projection_dim=16, min_points=10,
+                                  roads_file=str(d / "roads.csv"), gpus=2, prep_workers=1)
+    side = json.loads((d / "amp.json").read_text())
+    h = side["history"]
+    assert len(h) == 2 and all(np.isfinite(x["val_loss"]) and "batch_seconds" in x for x in h)
+    assert side["meta"]["provenance"]["compute"] == {"amp": False, "gpus": 1,       # no GPU here: float32, one device
+                                                     "gradient_checkpointing": True}
+    assert ad.net._dp is None
+
+
+def test_gradient_checkpointing_keeps_gradients_and_survives_replication(omni):
+    """Checkpointed layers give the same gradients, keep the checkpoint format, and - being a class,
+    not a wrapper stored on the instance - a DataParallel replica runs its OWN weights."""
+    import torch
+    from mobeval.adapters.omnitraj import FUSIONS, _checkpoint_layers
+    ad, ctx, _ = omni
+    net, b = ad.net, _batch(ad, ctx)
+    keys = set(net.state_dict())
+
+    def grads():
+        net.zero_grad(set_to_none=True)
+        torch.manual_seed(3)
+        net(b, FUSIONS).backward()
+        return {k: p.grad.clone() for k, p in net.named_parameters() if p.grad is not None}
+
+    net.train()
+    try:
+        plain = grads()
+        layers = _checkpoint_layers(net)
+        assert layers and set(net.state_dict()) == keys
+        ckpt = grads()
+        for layer in layers:
+            r = layer._replicate_for_data_parallel()            # what DataParallel does on every step
+            assert type(r) is type(layer) and r.forward.__self__ is r
+        for layer in layers:
+            del layer.forward
+        assert not any(type(layer).__module__ == "mobeval.adapters.omnitraj" for layer in layers)   # originals back
+    finally:
+        net.eval()
+    assert set(plain) == set(ckpt)
+    assert all(torch.allclose(plain[k], ckpt[k], atol=1e-6) for k in plain)

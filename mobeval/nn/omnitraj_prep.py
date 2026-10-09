@@ -26,16 +26,31 @@ either stated in the paper or recovered from that sample, and says which and how
 
 The dataset class itself (padding, truncation, BOS/EOS, augmentations) is in the repository and is
 reproduced line by line in `build_sample`, with Python's global `random` replaced by a generator.
+
+For training, `prepare_units` computes the deterministic part of every sample once (resampling,
+topology, region and road ids, in parallel over the job's CPUs) and `PreparedUnits.batch` adds only
+what changes from step to step (augmentations, padding). That is how the original is organised -
+preprocessed trips on disk, augmented by the dataset class - and it gives the same batches as
+`build_sample` for the same random generator.
 """
 from __future__ import annotations
 
+import contextlib
+import importlib.machinery
+import logging
 import math
+import multiprocessing as mp
+import os
+import sys
+import types
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
 from .unitraj_sampling import rdp_keypoints
+
+log = logging.getLogger("mobeval.nn.omnitraj_prep")
 
 TRAJ_LEN, TOPOL_LEN, MAX_ROAD_LEN, MAX_REGION_LEN = 200, 128, 128, 64
 TOPOLOGY_EPS = 1e-4
@@ -233,28 +248,163 @@ def augment_region(seq: np.ndarray, rng: np.random.Generator, p_shuffle: float =
     return seq
 
 
+def base_sample(lat, lon, grid: RegionGrid, norm: Dict[str, Sequence[float]], topology_eps: float = TOPOLOGY_EPS,
+                interpolation: str = "pchip"):
+    """The part of a sample that does not depend on the random generator: the normalised 200-point
+    trajectory, the normalised topology (not padded) and the deduplicated region ids."""
+    traj = resample(lat, lon, TRAJ_LEN, interpolation)
+    mean, std = np.asarray(norm["mean"], float), np.asarray(norm["std"], float)
+    topo = ((topology(traj, topology_eps) - mean) / std).astype(np.float32)
+    reg = _dedup(grid.ids(traj[:, 1], traj[:, 0]))
+    return ((traj - mean) / std).astype(np.float32), topo, reg
+
+
+def road_tokens(roads: Optional[np.ndarray], vocab: RoadVocab) -> np.ndarray:
+    """Deduplicated road tokens of one trip, from one segment id per original point (-1 = unmatched)."""
+    return _dedup(vocab.encode(roads if roads is not None else np.array([], np.int64)))
+
+
+def finish_sample(topo: np.ndarray, reg: np.ndarray, road: Optional[np.ndarray], num_roads: Optional[int],
+                  rng: Optional[np.random.Generator], augment: bool, trajectory: Optional[np.ndarray] = None) -> dict:
+    """Augmentations (region first, then road, as the original draws them) and padding. The inputs
+    are not modified, so they can be cached and reused every epoch."""
+    out = {} if trajectory is None else {"trajectory": trajectory}
+    out["topology"], out["topology_attention_mask"] = _pad_or_truncate(topo, TOPOL_LEN)
+    if augment:
+        reg = augment_region(reg, rng)
+    out["region"], out["region_attention_mask"] = _pad_or_truncate(reg, MAX_REGION_LEN, 0)
+    if road is not None:
+        r = road
+        if augment:
+            r = augment_road(r, rng, num_roads - 3)
+        r = np.concatenate([[num_roads - 1], r, [num_roads - 2]]).astype(np.int64)
+        out["road"], out["road_attention_mask"] = _pad_or_truncate(r, MAX_ROAD_LEN, 0)
+    return out
+
+
 def build_sample(lat, lon, roads: Optional[np.ndarray], grid: RegionGrid, vocab: Optional[RoadVocab],
                  norm: Dict[str, Sequence[float]], rng: Optional[np.random.Generator], augment: bool,
                  topology_eps: float = TOPOLOGY_EPS, interpolation: str = "pchip") -> dict:
     """One training/evaluation example, as TrajectoryDataset.__getitem__ returns it, from raw points.
     `roads` holds one map-matched segment id per ORIGINAL point (-1 = unmatched), or None."""
-    traj = resample(lat, lon, TRAJ_LEN, interpolation)
-    mean, std = np.asarray(norm["mean"], float), np.asarray(norm["std"], float)
-    topo = topology(traj, topology_eps)
-    topo_n, topo_m = _pad_or_truncate(((topo - mean) / std).astype(np.float32), TOPOL_LEN)
-    out = {"trajectory": ((traj - mean) / std).astype(np.float32), "topology": topo_n,
-           "topology_attention_mask": topo_m}
-    reg = _dedup(grid.ids(traj[:, 1], traj[:, 0]))
-    if augment:
-        reg = augment_region(reg, rng)
-    out["region"], out["region_attention_mask"] = _pad_or_truncate(reg, MAX_REGION_LEN, 0)
+    traj, topo, reg = base_sample(lat, lon, grid, norm, topology_eps, interpolation)
+    road = road_tokens(roads, vocab) if vocab is not None else None
+    return finish_sample(topo, reg, road, vocab.num_roads if vocab is not None else None, rng, augment, traj)
+
+
+class PreparedUnits:
+    """`base_sample` (and the road tokens) of every training unit, computed once.
+
+    `batch(idx, rng, augment)` returns exactly `collate([build_sample(...) for i in idx])` for the
+    same generator state, but only augments and pads: the resampling, the topology and the id
+    lookups - nearly all of the CPU time of a step - are not redone every epoch."""
+
+    def __init__(self, trajectory: np.ndarray, topology: List[np.ndarray], region: List[np.ndarray],
+                 road: Optional[List[np.ndarray]], num_roads: Optional[int]):
+        self.trajectory = trajectory          # (N, 200, 2) float32, normalised
+        self.topology = topology              # N x (k, 2) float32, normalised, not padded
+        self.region = region                  # N x deduplicated cell ids
+        self.road = road                      # N x deduplicated road tokens, or None (no road encoder)
+        self.num_roads = num_roads
+
+    def __len__(self) -> int:
+        return len(self.topology)
+
+    @property
+    def nbytes(self) -> int:
+        parts = [self.topology, self.region] + ([self.road] if self.road is not None else [])
+        return int(self.trajectory.nbytes + sum(a.nbytes for p in parts for a in p))
+
+    def batch(self, idx, rng: Optional[np.random.Generator], augment: bool) -> Dict[str, np.ndarray]:
+        idx = np.asarray(idx)
+        out = collate([finish_sample(self.topology[i], self.region[i], None if self.road is None else self.road[i],
+                                     self.num_roads, rng, augment) for i in idx])
+        out["trajectory"] = self.trajectory[idx]
+        return out
+
+
+def available_cpus() -> int:
+    """CPUs this job may use: PBS's NCPUS (or Slurm's), else the process's CPU affinity."""
+    for var in ("NCPUS", "SLURM_CPUS_PER_TASK"):
+        v = os.environ.get(var, "")
+        if v.isdigit() and int(v) > 0:
+            return int(v)
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:                                  # not on Linux
+        return os.cpu_count() or 1
+
+
+_WORK = None                                                # (grid, norm, eps, interpolation) in each worker
+
+
+def _init_worker(grid, norm, eps, interp):
+    global _WORK
+    _WORK = (grid, norm, eps, interp)
+
+
+def _base_list(rows):
+    grid, norm, eps, interp = _WORK
+    return [base_sample(lat, lon, grid, norm, eps, interp) for lat, lon in rows]
+
+
+@contextlib.contextmanager
+def _caller_script_hidden():
+    """multiprocessing imports the caller's __main__ in every spawned or forkserver child; a script
+    without an `if __name__ == "__main__":` guard would then run again in each worker. The workers
+    need only this module, so while they start, __main__ is a stand-in they skip."""
+    main = sys.modules.get("__main__")
+    stand_in = types.ModuleType("__main__")
+    stand_in.__spec__ = importlib.machinery.ModuleSpec("__main__", None)
+    sys.modules["__main__"] = stand_in
+    try:
+        yield
+    finally:
+        sys.modules["__main__"] = main
+
+
+def prepare_units(units: Sequence[tuple], roads: Optional[Sequence[np.ndarray]], grid: RegionGrid,
+                  vocab: Optional[RoadVocab], norm: Dict[str, Sequence[float]], topology_eps: float = TOPOLOGY_EPS,
+                  interpolation: str = "pchip", workers: Optional[int] = None, chunk: int = 1000,
+                  chunk_timeout_s: float = 600.0) -> PreparedUnits:
+    """PreparedUnits for `units` = [(traj_id, lat, lon, t), ...]; `roads` = one segment-id array per
+    unit (or None without roads). The resampling and topology run in `workers` processes (default:
+    the job's CPUs), forked from a fresh single-threaded server ("forkserver") rather than from this
+    process: the training process has CUDA, torch and progress threads, and a child forked from it can
+    inherit one of their locks held and wait on it forever. The workers load only this module, never
+    the calling script. A chunk takes seconds; if one fails or takes longer than `chunk_timeout_s`, the
+    workers are stopped and the work is done in this process instead."""
+    n = len(units)
+    workers = max(1, int(workers or available_cpus()))
+    bases = None
+    if workers > 1 and n >= 2 * chunk:
+        pool = None
+        try:
+            ctx = mp.get_context("forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn")
+            if ctx.get_start_method() == "forkserver":
+                ctx.set_forkserver_preload([__name__])
+            with _caller_script_hidden():
+                pool = ctx.Pool(min(workers, (n + chunk - 1) // chunk), initializer=_init_worker,
+                                initargs=(grid, norm, topology_eps, interpolation))
+            parts = pool.imap(_base_list, ([(u[1], u[2]) for u in units[s:s + chunk]] for s in range(0, n, chunk)))
+            bases = []
+            for _ in range(0, n, chunk):
+                bases += parts.next(timeout=chunk_timeout_s)
+            pool.close()
+            pool.join()
+        except Exception as e:                              # noqa: BLE001 - fall back, never fail training
+            log.warning(f"parallel preprocessing failed ({e!r}); doing it in one process")
+            if pool is not None:
+                pool.terminate()
+            bases = None
+    if bases is None:
+        bases = [base_sample(u[1], u[2], grid, norm, topology_eps, interpolation) for u in units]
+    traj = np.stack([b[0] for b in bases]) if bases else np.zeros((0, TRAJ_LEN, 2), np.float32)
+    road = None
     if vocab is not None:
-        r = _dedup(vocab.encode(roads if roads is not None else np.array([], np.int64)))
-        if augment:
-            r = augment_road(r, rng, vocab.num_roads - 3)
-        r = np.concatenate([[vocab.num_roads - 1], r, [vocab.num_roads - 2]]).astype(np.int64)
-        out["road"], out["road_attention_mask"] = _pad_or_truncate(r, MAX_ROAD_LEN, 0)
-    return out
+        road = [road_tokens(r, vocab) for r in (roads if roads is not None else [None] * n)]
+    return PreparedUnits(traj, [b[1] for b in bases], [b[2] for b in bases], road,
+                         vocab.num_roads if vocab is not None else None)
 
 
 def collate(samples: List[dict]) -> Dict[str, np.ndarray]:

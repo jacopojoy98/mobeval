@@ -140,7 +140,10 @@ PY
 # Copy results (including checkpoints) back; scratch can be wiped at any time
 stage_out() {
     mkdir -p "$RESULTS_DIR"
-    cp -r "$SCRATCH/results/." "$RESULTS_DIR/" 2>/dev/null || true
+    # -u: never put back an older file over a newer one. Two jobs may share RESULTS_DIR (e.g. the two
+    # OmniTraj variants trained side by side): each restored the other's checkpoint at its start, and
+    # a plain copy here would overwrite the other job's newer checkpoint with that stale copy.
+    cp -r -u "$SCRATCH/results/." "$RESULTS_DIR/" 2>/dev/null || true
     echo "results copied to $RESULTS_DIR"
     # Delete ONLY this job's own subdirectory - never /scratch/$USER itself, which the cluster owns
     # and which holds other jobs' data. A failure here must not fail the job: the results are safe,
@@ -160,7 +163,9 @@ stage_out() {
 restore_checkpoints() {
     if [ -d "$RESULTS_DIR/checkpoints" ]; then
         mkdir -p "$SCRATCH/results/checkpoints"
-        cp -r "$RESULTS_DIR/checkpoints/." "$SCRATCH/results/checkpoints/"
+        # -p keeps the modification times, so mobeval's own restore (from $MOBEVAL_PERSIST_DIR, where
+        # every improving epoch is copied at once) can tell which of the two copies is newer
+        cp -r -p "$RESULTS_DIR/checkpoints/." "$SCRATCH/results/checkpoints/"
         echo "restored checkpoints: $(ls "$SCRATCH/results/checkpoints" | tr '\n' ' ')"
     fi
 }

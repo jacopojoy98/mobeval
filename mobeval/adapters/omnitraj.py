@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import time
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -62,37 +63,130 @@ def _ns(d):
     return SimpleNamespace(**{k: _ns(v) if isinstance(v, dict) else v for k, v in d.items()})
 
 
-def _build_net(arch: dict, use_road: bool, projection_dim: int, loss: str, pairs: str = "code"):
+_NET_CLASSES = None
+
+
+def _net_classes():
+    """The original OmniModel with three additions that leave what it computes unchanged:
+
+      - the contrastive loss always runs in float32, so mixed precision (train.amp) only lowers
+        the precision of the encoders - the similarity logits stay exact;
+      - `parallelize(device_ids)`: the four encoders run data-parallel over several GPUs, and their
+        outputs are gathered before the loss, which therefore still contrasts every trip with the
+        whole batch (plain DataParallel/DDP would compute it per GPU, on half the negatives);
+      - the paper's loss as a subclass (PaperLossOmniModel)."""
+    global _NET_CLASSES
+    if _NET_CLASSES is not None:
+        return _NET_CLASSES
     import torch
     import torch.nn.functional as F
+    from torch import nn
     from ..nn.omnitraj.omni_semantic import OmniModel
+
+    class _EncodeAll(nn.Module):
+        """What DataParallel replicates: every modality's projection for a slice of the batch."""
+
+        def __init__(self, net, modalities):
+            super().__init__()
+            self.net, self.modalities = net, list(modalities)
+
+        def forward(self, batch):
+            return {m: self.net.encode_modality(m, batch[m], batch.get(f"{m}_attention_mask"), normalize=False)
+                    for m in self.modalities}
+
+    class MobevalOmniModel(OmniModel):
+        _dp = None                     # DataParallel over _EncodeAll; kept out of the module tree
+        _pre = None                    # projections computed by it for the batch being processed
+
+        def parallelize(self, device_ids):
+            dp = None
+            if device_ids and len(device_ids) > 1:
+                mods = sorted(set(sum(self.contrast_pairs, ())))
+                dp = nn.DataParallel(_EncodeAll(self, mods), device_ids=list(device_ids))
+            object.__setattr__(self, "_dp", dp)          # not registered: state_dict and .to() unchanged
+
+        def forward(self, batch, fusion_modality=None):
+            if self._dp is None:
+                return super().forward(batch, fusion_modality)
+            object.__setattr__(self, "_pre", self._dp(batch))
+            try:
+                return super().forward(batch, fusion_modality)       # the original loss, on the whole batch
+            finally:
+                object.__setattr__(self, "_pre", None)
+
+        def encode_modality(self, modality, x, attention_mask=None, normalize=False):
+            pre = self._pre
+            if pre is not None and not normalize and modality in pre:
+                return pre[modality]
+            return super().encode_modality(modality, x, attention_mask, normalize)
+
+        def compute_contrastive_loss(self, z1, z2):
+            if z1.device.type in ("cuda", "cpu"):
+                with torch.autocast(z1.device.type, enabled=False):
+                    return self._contrastive(z1.float(), z2.float())
+            return self._contrastive(z1, z2)
+
+        def _contrastive(self, z1, z2):
+            return OmniModel.compute_contrastive_loss(self, z1, z2)
+
+    class PaperLossOmniModel(MobevalOmniModel):
+        """The loss as the paper states it (Eqs. 9-10): InfoNCE on COSINE similarity with temperature tau,
+        both directions summed. The released code instead uses soft targets from within-modality
+        similarities, on unnormalised projections (compute_contrastive_loss in omni_semantic.py)."""
+
+        def _contrastive(self, z1, z2):
+            z1, z2 = F.normalize(z1, dim=-1), F.normalize(z2, dim=-1)
+            logits = z1 @ z2.T / self.temperature.clamp(min=1e-2)
+            y = torch.arange(len(z1), device=z1.device)
+            return F.cross_entropy(logits, y, reduction="none") + F.cross_entropy(logits.T, y, reduction="none")
+
+    _NET_CLASSES = {"code": MobevalOmniModel, "paper": PaperLossOmniModel}
+    return _NET_CLASSES
+
+
+def _build_net(arch: dict, use_road: bool, projection_dim: int, loss: str, pairs: str = "code"):
     cfg = copy.deepcopy(arch)
     cfg["enabled_encoders"] = ["trajectory", "topology", "road", "region"] if use_road else ["trajectory", "topology", "region"]
     cfg["freeze_encoders"] = []
     if pairs not in ("code", "paper"):
         raise ValueError("pairs must be 'code' or 'paper'")
     pairs = [p for p in (CONTRAST_PAIRS if pairs == "code" else PAPER_PAIRS) if use_road or "road" not in p]
-
-    class PaperLossOmniModel(OmniModel):
-        """The loss as the paper states it (Eqs. 9-10): InfoNCE on COSINE similarity with temperature tau,
-        both directions summed. The released code instead uses soft targets from within-modality
-        similarities, on unnormalised projections (compute_contrastive_loss in omni_semantic.py)."""
-
-        def compute_contrastive_loss(self, z1, z2):
-            z1, z2 = F.normalize(z1, dim=-1), F.normalize(z2, dim=-1)
-            logits = z1 @ z2.T / self.temperature.clamp(min=1e-2)
-            y = torch.arange(len(z1), device=z1.device)
-            return F.cross_entropy(logits, y, reduction="none") + F.cross_entropy(logits.T, y, reduction="none")
-
-    cls = PaperLossOmniModel if loss == "paper" else OmniModel
     if loss not in ("code", "paper"):
         raise ValueError("loss must be 'code' or 'paper'")
-    return cls(_ns(cfg), pairs, projection_dim=projection_dim)
+    return _net_classes()[loss](_ns(cfg), pairs, projection_dim=projection_dim)
 
 
 # the transformer layers of each vendored encoder: the unit gradient checkpointing recomputes
 _ENCODER_LAYERS = {"trajectory": lambda e: e.blocks, "topology": lambda e: e.roformer.encoder.layer,
                    "road": lambda e: e.roformer.encoder.layer, "region": lambda e: e.transformer.layers}
+
+
+_CHECKPOINTED = {}
+
+
+def _checkpointed_class(cls):
+    """`cls` whose forward recomputes itself in the backward pass. It is a CLASS change, not a
+    wrapper stored on the instance: DataParallel's replicas copy an instance's attributes, so a
+    stored wrapper would make every replica run the ORIGINAL layer (on the first GPU's weights)."""
+    if cls not in _CHECKPOINTED:
+        import torch
+        from torch.utils.checkpoint import checkpoint
+
+        class Checkpointed(cls):
+            def forward(self, *args, **kwargs):
+                if self.training and torch.is_grad_enabled():
+                    return checkpoint(super().forward, *args, use_reentrant=False, **kwargs)
+                return super().forward(*args, **kwargs)
+
+            def __delattr__(self, name):
+                if name == "forward":                   # `del layer.forward` undoes the checkpointing
+                    object.__setattr__(self, "__class__", cls)
+                else:
+                    super().__delattr__(name)
+
+        Checkpointed.__name__ = Checkpointed.__qualname__ = cls.__name__
+        _CHECKPOINTED[cls] = Checkpointed
+    return _CHECKPOINTED[cls]
 
 
 def _checkpoint_layers(net) -> list:
@@ -102,22 +196,11 @@ def _checkpoint_layers(net) -> list:
     the same dropout draws (checkpoint restores the RNG state), so the gradients are unchanged. The
     recipes' batch of 1536 needs about 73 GB of activations without it and about 10 GB with it
     (measured: 49 vs 6.7 MB per trajectory), for roughly 35% longer steps. Inactive outside training
-    (no grad, or eval mode). Returns the wrapped layers; `del layer.forward` restores each one."""
-    import torch
-    from torch.utils.checkpoint import checkpoint
-
-    def wrap(layer):
-        forward = layer.forward
-
-        def run(*args, **kwargs):
-            if layer.training and torch.is_grad_enabled():
-                return checkpoint(forward, *args, use_reentrant=False, **kwargs)
-            return forward(*args, **kwargs)
-        layer.forward = run
-
+    (no grad, or eval mode). Returns the wrapped layers; `del layer.forward` restores each one.
+    Parameters, state_dict and checkpoints are those of the original layers."""
     layers = [layer for name, enc in net.encoders.items() for layer in _ENCODER_LAYERS[name](enc)]
     for layer in layers:
-        wrap(layer)
+        layer.__class__ = _checkpointed_class(type(layer))
     return layers
 
 
@@ -294,7 +377,8 @@ class OmniTrajAdapter(TorchAdapter):
                  grid_n: Optional[int] = prep.PAPER_GRID_N, grid_cell_m: Optional[float] = None,
                  max_regions: int = 20_000, max_roads: int = 200_000, augment_val: bool = True,
                  max_train_units: Optional[int] = None, loss: str = "code", pairs: str = "code",
-                 gradient_checkpointing: bool = True, **kw) -> "OmniTrajAdapter":
+                 gradient_checkpointing: bool = True, gpus: int = 1, prep_workers: Optional[int] = None,
+                 **kw) -> "OmniTrajAdapter":
         """Contrastive training as main.py: trajectory<->topology, topology<->road, topology<->region
         (pairs="paper": the trajectory against each modality, Eq. 10), plus trajectory<->each fusion, best
         model on the validation loss. `recipe: code | paper` sets main.py's / the paper's optimisation;
@@ -304,7 +388,12 @@ class OmniTrajAdapter(TorchAdapter):
         grid_n / grid_cell_m: the region grid, n x n over the train area (paper: 16) or fixed-size cells.
         augment_val: the original also augments the validation set (its dataset settings are shared).
         gradient_checkpointing: recompute encoder layers in the backward pass (see _checkpoint_layers);
-        same gradients, a fraction of the memory, slower steps. Off only pays for small batches."""
+        same gradients, a fraction of the memory, slower steps. Off only pays for small batches.
+
+        Speed (none of these changes what is computed): the resampling, topology and id lookups of
+        every unit are done once, over `prep_workers` processes (default: the job's CPUs), and each
+        step only augments and pads; `gpus: 2` splits the encoders over two GPUs with the loss still
+        on the whole batch; `train: {amp: true}` runs the encoders in mixed precision."""
         from ..nn.common import TrainConfig
         from ..nn.common import fit as fit_loop
         cfg = TrainConfig.from_dict({"lr": 2e-4, "batch_size": 256, "optimizer": "adamw", "weight_decay": 1e-4,
@@ -366,29 +455,75 @@ class OmniTrajAdapter(TorchAdapter):
                             "region only). Run `mobeval roads` and `mobeval mapmatch` for the full model.")
             ad = cls(norm=norm, grid=grid.state(), road_vocab=None if vocab is None else vocab.state(),
                      loss=loss, pairs=pairs, roads_file=roads_file, device=cfg.device, **kw)
+            if roads_file:
+                ad._roads = tmp._roads                          # the map-matching table, already read
         log.info(f"OmniTraj: {len(units['train']):,} train / {len(units['val']):,} val {'trajectories' if sample_unit == 'trajectory' else 'windows'}, "
                  f"{ad.grid.num_grids} regions ({ad.grid.nx}x{ad.grid.ny}"
                  f"{', compacted' if ad.grid.vocab is not None else ''}), "
                  f"{'no roads' if not ad.use_road else f'{ad.vocab.num_roads} road tokens'}, loss {ad.loss}")
         fusions = [f for f in FUSIONS if ad.use_road or "road" not in f]
 
+        # ---- the deterministic part of every sample, once (the original preprocesses offline too)
+        t_prep = time.time()
+        cache = {}
+        for s in ("train", "val"):
+            segs = [ad._segments(tid, np.asarray(t, float)) for tid, _, _, t in units[s]] if ad.use_road else None
+            cache[s] = prep.prepare_units(units[s], segs, ad.grid, ad.vocab, ad.norm, ad.topology_eps,
+                                          ad.interpolation, workers=prep_workers)
+        log.info(f"OmniTraj: inputs of {len(cache['train']) + len(cache['val']):,} units prepared in "
+                 f"{time.time() - t_prep:.0f}s ({prep.available_cpus() if not prep_workers else prep_workers} "
+                 f"processes, {(cache['train'].nbytes + cache['val'].nbytes) / 1e9:.2f} GB); each step now only "
+                 "augments and pads")
+        clock = {"batch": 0.0, "epochs": 0}
+
         def loss_fn(idx, training):
-            src = units["train" if training else "val"]
+            t = time.perf_counter()
             g = rng if training else np.random.default_rng(int(idx[0]))
-            b = ad._tensors(ad._samples([src[i] for i in idx], g, training or augment_val))
+            b = ad._tensors(cache["train" if training else "val"].batch(idx, g, training or augment_val))
             b["label"] = ad._torch.as_tensor(idx, device=ad.device)
+            clock["batch"] += time.perf_counter() - t
             loss = ad.net(b, fusions)
             return loss.mean() if loss.dim() > 0 else loss
+
+        def on_epoch(history):
+            h = history[-1]
+            h["batch_seconds"] = round(clock["batch"], 1)
+            clock["batch"] = 0.0
+            clock["epochs"] += 1
+            if clock["epochs"] == 1 or h["epoch"] % 25 == 0:          # first epoch of this job, then every 25th
+                log.info(f"OmniTraj epoch {h['epoch']}: {h['seconds']:.0f}s, of which {h['batch_seconds']:.0f}s "
+                         f"building batches on the CPU; the rest is the network on {ad.device}")
 
         ad.provenance = ctx.provenance(init_from=init_from, sample_unit=sample_unit)
         ad.net.train()
         wrapped = _checkpoint_layers(ad.net) if gradient_checkpointing else []
         if wrapped:
             log.info(f"OmniTraj: gradient checkpointing on {len(wrapped)} encoder layers")
-        history = fit_loop(ad.net, len(units["train"]), len(units["val"]), loss_fn, cfg,
-                           on_best=ad.epoch_checkpointer(out))
-        for layer in wrapped:
-            del layer.forward
+
+        # ---- several GPUs: the encoders split each batch, the loss sees all of it
+        gpus = int(gpus or 1)
+        if gpus > 1:
+            T = ad._torch
+            n_dev = T.cuda.device_count() if T.cuda.is_available() else 0
+            if ad.device.type != "cuda" or n_dev < 2:
+                log.warning(f"OmniTraj: gpus={gpus} asked, but {n_dev} CUDA device(s) visible to this job "
+                            f"(device {ad.device}): training on one. On PBS, ask for them: ngpus={gpus}.")
+            else:
+                first = ad.device.index if ad.device.index is not None else T.cuda.current_device()
+                ids = [first] + [i for i in range(n_dev) if i != first][:gpus - 1]
+                ad.net.parallelize(ids)
+                log.info(f"OmniTraj: encoders data-parallel over GPUs {ids}; the contrastive loss is computed on "
+                         f"the whole batch of {cfg.batch_size} on GPU {ids[0]}")
+        ad.provenance["compute"] = {"amp": bool(cfg.amp) and ad.device.type == "cuda",
+                                    "gpus": len(ad.net._dp.device_ids) if ad.net._dp is not None else 1,
+                                    "gradient_checkpointing": bool(wrapped)}
+        try:
+            history = fit_loop(ad.net, len(units["train"]), len(units["val"]), loss_fn, cfg,
+                               on_best=ad.epoch_checkpointer(out), on_epoch=on_epoch)
+        finally:
+            ad.net.parallelize(None)
+            for layer in wrapped:
+                del layer.forward
         ad.net.eval()
         ad.invalidate_cache()
         if out:

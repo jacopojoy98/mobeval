@@ -327,6 +327,26 @@ stored in the checkpoint.
 **Not reproducible:** the paper's numbers. The Chengdu and Xi'an datasets (1.2M trips each) are no
 longer available, so every ☆ mark on OmniTraj is a comparison of method, not of data.
 
+**Training speed.** 500 epochs over a city's trips is long, and three things shorten it without
+changing what is computed:
+- *Preprocessing once.* Resampling, topology (RDP), region and road ids depend only on the trip, so
+  they are computed once before training, in parallel over the job's CPUs (`prep_workers`, default
+  `$NCPUS`); each step then only augments and pads. The batches are identical to rebuilding every
+  sample each step (tested), and this is how the original is organised: preprocessed trips on disk,
+  augmented by the dataset class. Before, rebuilding the samples took about 3 ms per trip per epoch
+  on one CPU core, which left the GPU idle most of the time.
+- *Mixed precision* (`train: {amp: true}`): the encoders run in float16 on a V100 (bfloat16 on A100
+  and newer) with loss scaling; the weights and the contrastive loss stay float32. The paper trained
+  on an A100, whose PyTorch 1.8 defaults already ran matrix products in TF32. Recorded in the
+  checkpoint's provenance (`compute`).
+- *Two GPUs* (`train: {options: {gpus: 2}}`, and `ngpus=2` in the PBS request): the four encoders
+  split each batch, and their outputs are gathered before the loss, which therefore still contrasts
+  every trip with all 1,535 others. DataParallel or DDP over the whole model would compute the loss
+  per GPU, halving the negatives - a different objective for a contrastive model.
+
+Each run logs, for the first epoch and every 25th, how many seconds went into building batches and
+how many into the network (`batch_seconds` in the checkpoint history).
+
 ## Shared components
 
 **Mode-classification head.** The native head is trained on frozen embeddings and re-fitted for every

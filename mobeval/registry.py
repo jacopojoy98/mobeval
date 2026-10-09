@@ -1,6 +1,7 @@
 """Model registry: build, train and load adapters from plain dictionaries (config files)."""
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from pathlib import Path
@@ -83,6 +84,7 @@ def train_model(spec: dict, ctx, output_dir) -> Path:
     if "arch" in spec:
         kwargs["arch"] = spec["arch"]
     init_from = tr.pop("init_from", None)
+    continuing = bool(tr.pop("resume", False)) and bool(init_from)
     if isinstance(init_from, str) and init_from.startswith("model:"):
         # another model of this config, e.g. a fine-tuning run starting from the pre-trained model:
         # resolved to wherever that model's checkpoint lives in THIS run (also inside a PBS job,
@@ -102,8 +104,13 @@ def train_model(spec: dict, ctx, output_dir) -> Path:
     rep.event("train_start", model=spec["name"], model_type=mtype, epochs=tr.get("epochs"),
               message=f"training {spec['name']} ({mtype})")
     ctx.active_recipe = recipe_record or None          # stored in the checkpoint's provenance
+    if continuing:
+        from .nn.common import resuming
+        carry_on = resuming(init_from)
+    else:
+        carry_on = contextlib.nullcontext()
     try:
-        with rep.scoped(spec["name"]):
+        with rep.scoped(spec["name"]), carry_on:
             getattr(cls, TRAIN_METHOD[mtype])(ctx, train=tr, out=str(out), **kwargs, **spec.get("adapter", {}))
     except progress.Interrupted:
         # Not a failure: the best epoch reached is already saved (and mirrored), and a resumed

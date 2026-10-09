@@ -33,7 +33,10 @@ _ADAM = {"optimizer": "adam", "weight_decay": 0.0, "grad_clip": 0.0, "drop_last"
 # Options that point at data files rather than change the method (e.g. TransferTraj's POI/road
 # embeddings): setting them is not an override of the recipe.
 DATA_OPTIONS = {"context", "roads_file"}
-RUNTIME_OPTIONS = {"gradient_checkpointing"}         # trade memory for speed; the same model is learned
+# Options that change how fast training runs or how much memory it needs, not what is learned
+# (OmniTraj: gradient checkpointing, preprocessing workers, encoders split over several GPUs with
+# the loss still on the whole batch).
+RUNTIME_OPTIONS = {"gradient_checkpointing", "prep_workers", "gpus"}
 
 RECIPES: Dict[str, Dict[str, dict]] = {
     # ============================================================== UniTraj

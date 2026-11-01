@@ -50,6 +50,9 @@ class TrainConfig:
                                            # Ampere (V100), bfloat16 from Ampere on; weights stay float32
     save_train_state: bool = True          # interim checkpoints also hold optimizer, schedule and data
                                            # order, so a resumed job continues the run exactly
+    train_eval_samples: int = 2048         # recorded runs (see fit's log_to): every epoch, also the loss on
+                                           # this many training samples (whole batches) measured like the
+                                           # validation loss - eval mode, fixed batches. 0: off
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "TrainConfig":
@@ -144,6 +147,168 @@ def _amp_context(cfg: TrainConfig, model: nn.Module):
     return (lambda: torch.autocast(dev.type, dtype=dtype)), scaler
 
 
+# ------------------------------------------------------------------ what fit records per epoch
+# Set while `fit` evaluates one batch: the named terms of that batch's loss (see report_loss_parts).
+_PARTS: Optional[dict] = None
+# True while `fit` computes a loss only to monitor it (validation, or the training sample in eval mode).
+_EVALUATING = False
+
+
+def report_loss_parts(**parts):
+    """Called from inside a loss function: the named terms its loss is made of, as scalars (tensors
+    are detached; None or empty ones are skipped). `fit` averages each term over the epoch's
+    training batches, validation batches and training sample, and records them next to the total
+    as `train_loss:<name>`, `val_loss:<name>`, `train_eval_loss:<name>`, so a curve shows which
+    part is learning and which is not. Report each term as it enters the loss, before any weight.
+    Outside `fit` this does nothing, and it never changes the loss."""
+    if _PARTS is None:
+        return
+    for name, v in parts.items():
+        if v is None:
+            continue
+        if torch.is_tensor(v):
+            if v.numel() == 0:
+                continue
+            v = v.detach().float().mean()
+        _PARTS[str(name)] = v
+
+
+def evaluating() -> bool:
+    """True while `fit` computes a loss to monitor it: the validation loss, and the training loss
+    measured the same way (TrainConfig.train_eval_samples). A loss function that draws random masks,
+    orders or augmentations from its own generator during training should then build the batch
+    deterministically, as for validation, whichever split it reads:
+
+        stochastic = training and not evaluating()
+
+    Otherwise the extra pass would use up draws of the training stream and change the training."""
+    return _EVALUATING
+
+
+@contextlib.contextmanager
+def _monitoring():
+    global _EVALUATING
+    prev, _EVALUATING = _EVALUATING, True
+    try:
+        yield
+    finally:
+        _EVALUATING = prev
+
+
+@contextlib.contextmanager
+def _collect_parts(sink: list):
+    global _PARTS
+    prev, _PARTS = _PARTS, {}
+    try:
+        yield
+    finally:
+        if _PARTS:
+            sink.append(_PARTS)
+        _PARTS = prev
+
+
+@contextlib.contextmanager
+def _rng_preserved():
+    """Global random states (python, numpy, torch, CUDA) as they were before the block."""
+    import random
+    py, npg, cpu = random.getstate(), np.random.get_state(), torch.get_rng_state()
+    cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() and torch.cuda.is_initialized() else None
+    try:
+        yield
+    finally:
+        random.setstate(py)
+        np.random.set_state(npg)
+        torch.set_rng_state(cpu)
+        if cuda is not None:
+            torch.cuda.set_rng_state_all(cuda)
+
+
+def _mean_parts(rows: List[dict]) -> Dict[str, float]:
+    """Per term: the mean over the batches that reported it (one device sync per term)."""
+    out = {}
+    for name in dict.fromkeys(k for r in rows for k in r):
+        vals = [r[name] for r in rows if name in r]
+        tens = [v for v in vals if torch.is_tensor(v)]
+        total = sum(float(v) for v in vals if not torch.is_tensor(v))
+        if tens:
+            total += float(torch.stack([t.to(tens[0].device) for t in tens]).sum())
+        out[name] = total / len(vals)
+    return out
+
+
+def _grad_norm(parameters) -> Optional[torch.Tensor]:
+    """Total 2-norm of the gradients, as clip_grad_norm_ reports it (read only)."""
+    grads = [p.grad.detach() for p in parameters if p.grad is not None]
+    if not grads:
+        return None
+    dev = grads[0].device
+    return torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(g, dtype=torch.float32).to(dev)
+                                                 for g in grads]))
+
+
+def _train_eval_batches(n_train: int, batch_size: int, n_samples: int, seed: int) -> List[np.ndarray]:
+    """Fixed batches of training samples for the train-eval loss, composed like the validation
+    batches: consecutive samples in split order, whole batches, the batches themselves spread at
+    random over the split. Composition matters for contrastive losses, whose value depends on the
+    other samples in the batch (neighbours in split order are often the same user's trips)."""
+    if not n_samples or n_train <= 0:
+        return []
+    bs = max(1, int(batch_size))
+    if n_train <= bs:
+        return [np.arange(n_train)]
+    chunks = n_train // bs
+    k = min(chunks, math.ceil(n_samples / bs))
+    pick = np.sort(np.random.default_rng([int(seed), 0x7E]).choice(chunks, k, replace=False))
+    return [np.arange(c * bs, (c + 1) * bs) for c in pick]
+
+
+def loss_log_path(checkpoint) -> Path:
+    """<checkpoint stem>.losses.csv next to the checkpoint (a .csv path is used as it is)."""
+    p = Path(checkpoint)
+    return p if p.suffix == ".csv" else p.with_name(p.stem + ".losses.csv")
+
+
+LOSS_LOG_FIRST = ["epoch", "train_loss", "train_eval_loss", "val_loss", "best_val_loss", "improved",
+                  "lr", "grad_norm", "grad_norm_max", "seconds"]
+
+
+def loss_log_columns(history: List[dict]) -> List[str]:
+    keys = list(dict.fromkeys(k for h in history for k in h))
+    first = [k for k in LOSS_LOG_FIRST if k in keys]
+    parts = list(dict.fromkeys(k.split(":", 1)[1] for k in keys if ":" in k))
+    split_order = ("train_loss", "train_eval_loss", "val_loss")
+    part_cols = [f"{s}:{p}" for p in parts for s in split_order if f"{s}:{p}" in keys]
+    return first + part_cols + [k for k in keys if k not in first and k not in part_cols]
+
+
+def write_loss_log(path, history: List[dict]):
+    """The whole history as a CSV, one row per epoch; written atomically, then mirrored to
+    durable storage like the checkpoint. Rewritten every epoch, so it is current while a job runs."""
+    import csv
+    from .. import layout
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cols = loss_log_columns(history)
+
+    def cell(v):
+        if v is None:
+            return ""
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, (float, np.floating)):
+            return "" if not np.isfinite(v) else f"{float(v):.6g}"
+        return v
+
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    with open(tmp, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for h in history:
+            w.writerow([cell(h.get(c)) for c in cols])
+    os.replace(tmp, path)
+    layout.mirror(path)
+
+
 def _replay(history: List[dict], sched) -> tuple:
     """Best validation loss and epochs-without-improvement after `history`, stepping `sched` through
     it exactly as the original run did (so the learning rate is where that run left it)."""
@@ -166,7 +331,7 @@ def _replay(history: List[dict], sched) -> tuple:
 def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarray, bool], torch.Tensor],
         cfg: TrainConfig, params: Optional[Iterable] = None, drop_last: bool = True,
         on_best: Optional[Callable[[List[dict]], None]] = None,
-        on_epoch: Optional[Callable[[List[dict]], None]] = None) -> List[dict]:
+        on_epoch: Optional[Callable[[List[dict]], None]] = None, log_to=None) -> List[dict]:
     """Generic loop. `loss_fn(indices, train)` builds the batch for those sample indices
     and returns a scalar loss. Restores the best validation state at the end.
 
@@ -175,6 +340,15 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
     at epoch 40 of 100 still leaves the best-so-far model on disk instead of nothing.
     `on_epoch(history)` is called after every epoch (before `on_best`); it may add fields to
     history[-1], which are then saved with the checkpoint.
+
+    Every epoch's history entry holds the mean training loss (over the epoch's steps, in train
+    mode), the validation loss, the learning rate, the gradient norm before clipping (mean and
+    max over the steps) and the terms the loss function reports (`report_loss_parts`).
+    `log_to` (the checkpoint path) records the run: the history is written to
+    <checkpoint>.losses.csv after every epoch (`loss_log_path`), and the loss on a fixed sample
+    of the training data is measured the way the validation loss is (`train_eval_loss`, see
+    TrainConfig.train_eval_samples and `evaluating`) - the number to compare with the
+    validation loss. That extra pass leaves the training itself unchanged.
 
     Inside `resuming(path)` the loop continues the run stored in that checkpoint instead of
     starting at epoch 1 (see `resuming`).
@@ -235,6 +409,14 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
             best_state = copy.deepcopy(model.state_dict())          # the weights loaded ARE the best so far
             log.info(f"continuing the interrupted training at epoch {start} of {cfg.epochs} "
                      f"(best val {best:.4f}; {how})")
+    log_path = loss_log_path(log_to) if log_to else None
+    te_batches = (_train_eval_batches(n_train, cfg.batch_size, cfg.train_eval_samples, cfg.seed)
+                  if log_path is not None else [])
+    log_failed = False
+    if log_path is not None:
+        log.info(f"training log: {log_path} (every epoch"
+                 + (f"; training loss also measured like validation on {sum(map(len, te_batches)):,} samples)"
+                    if te_batches else ")"))
     rep = progress.get()
     who = getattr(rep, "scope", None) or "model"
     rep.model(who, state="training", detail=f"epoch {start - 1}/{cfg.epochs}")
@@ -250,12 +432,13 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
     try:
         for epoch in range(start, cfg.epochs + 1):
             model.train()
-            t0, tr_losses = time.time(), []
+            t0, tr_losses, tr_parts, norms = time.time(), [], [], []
+            lr = opt.param_groups[0].get("lr")                             # this epoch's (the schedule steps after it)
             for step, idx in enumerate(minibatches(n_train, cfg.batch_size, True, rng,
                                                    drop_last and cfg.drop_last and n_train > cfg.batch_size)):
                 if cfg.max_steps_per_epoch and step >= cfg.max_steps_per_epoch:
                     break
-                with amp():
+                with amp(), _collect_parts(tr_parts):
                     loss = loss_fn(idx, True)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(
@@ -266,38 +449,73 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
                 opt.zero_grad(set_to_none=True)
                 if scaler is not None:
                     scaler.scale(loss).backward()
-                    if cfg.grad_clip:
-                        scaler.unscale_(opt)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                    scaler.unscale_(opt)                 # what scaler.step would do anyway; the norm is then real
+                    gn = (torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip) if cfg.grad_clip
+                          else _grad_norm(model.parameters()))
                     scaler.step(opt)
                     scaler.update()
                 else:
                     loss.backward()
-                    if cfg.grad_clip:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                    gn = (torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip) if cfg.grad_clip
+                          else _grad_norm(model.parameters()))
                     opt.step()
+                if gn is not None:
+                    norms.append(gn.detach())
                 tr_losses.append(loss.item())
                 if cfg.log_every and step % cfg.log_every == 0:
                     log.debug(f"epoch {epoch} step {step} loss {loss.item():.4f}")
             model.eval()
-            with torch.no_grad(), amp():
-                va = [loss_fn(idx, False).item() for idx in minibatches(n_val, cfg.batch_size, False)] if n_val else []
+            va, va_parts, te, te_parts = [], [], [], []
+            with torch.no_grad(), amp(), _monitoring():
+                for idx in (minibatches(n_val, cfg.batch_size, False) if n_val else []):
+                    with _collect_parts(va_parts):
+                        va.append(loss_fn(idx, False).item())
+                if te_batches:
+                    # the same batches every epoch, built as validation batches are; the random
+                    # states are put back, so the training that follows is the one without this pass
+                    with _rng_preserved():
+                        for idx in te_batches:
+                            with _collect_parts(te_parts):
+                                te.append(loss_fn(idx, True).item())
             tr, vl = float(np.mean(tr_losses)), (float(np.mean(va)) if va else float(np.mean(tr_losses)))
             if not np.isfinite(vl):
                 bad_batches = int(np.sum(~np.isfinite(va))) if va else 0
                 raise FloatingPointError(
                     f"non-finite validation loss at epoch {epoch} ({bad_batches}/{len(va)} batches). Early stopping "
                     "cannot work with NaN; check the validation inputs for NaN/inf or extreme values.")
-            history.append({"epoch": epoch, "train_loss": tr, "val_loss": vl, "seconds": time.time() - t0})
+            improved = vl < best - 1e-6
+            entry = {"epoch": epoch, "train_loss": tr, "val_loss": vl, "seconds": time.time() - t0}
+            if te:
+                entry["train_eval_loss"] = float(np.mean(te))
+            entry.update(best_val_loss=min(best, vl), improved=bool(improved))
+            if lr is not None:
+                entry["lr"] = float(lr)
+            if norms:
+                g = torch.stack([n.to(norms[0].device).float() for n in norms])
+                g = g[torch.isfinite(g)]                    # loss-scaling overflow steps are skipped anyway
+                if g.numel():
+                    entry.update(grad_norm=float(g.mean()), grad_norm_max=float(g.max()))
+            for split, rows in (("train_loss", tr_parts), ("train_eval_loss", te_parts), ("val_loss", va_parts)):
+                for name, v in _mean_parts(rows).items():
+                    entry[f"{split}:{name}"] = v
+            history.append(entry)
             if on_epoch is not None:
                 on_epoch(history)
-            log.info(f"epoch {epoch:3d}  train {tr:.4f}  val {vl:.4f}  ({time.time() - t0:.0f}s)")
-            improved = vl < best - 1e-6
+            if log_path is not None:
+                try:
+                    write_loss_log(log_path, history)
+                except Exception as e:                                  # noqa: BLE001
+                    if not log_failed:                                  # never let the log stop a training
+                        log.warning(f"could not write the loss log {log_path}: {e!r}")
+                    log_failed = True
+            te_text = f"  train(eval) {entry['train_eval_loss']:.4f}" if "train_eval_loss" in entry else ""
+            log.info(f"epoch {epoch:3d}  train {tr:.4f}{te_text}  val {vl:.4f}  ({time.time() - t0:.0f}s)")
             rep.model(who, state="training", epoch=epoch, epochs=cfg.epochs, train_loss=tr, val_loss=vl,
                       best_val=min(best, vl), detail=f"epoch {epoch}/{cfg.epochs}  val {vl:.4g}"
                                                      f"  best {min(best, vl):.4g}")
+            extra = {k: float(f"{entry[k]:.6g}") for k in ("train_eval_loss", "lr", "grad_norm") if k in entry}
             rep.event("epoch", model=who, epoch=epoch, epochs=cfg.epochs, train_loss=float(f"{tr:.6g}"),
-                      val_loss=float(f"{vl:.6g}"), improved=improved, seconds=round(time.time() - t0, 1))
+                      val_loss=float(f"{vl:.6g}"), improved=improved, seconds=round(time.time() - t0, 1), **extra)
             if isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 sched.step(vl)
             elif sched is not None:

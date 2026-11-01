@@ -67,13 +67,15 @@ _NET_CLASSES = None
 
 
 def _net_classes():
-    """The original OmniModel with three additions that leave what it computes unchanged:
+    """The original OmniModel with four additions that leave what it computes unchanged:
 
       - the contrastive loss always runs in float32, so mixed precision (train.amp) only lowers
         the precision of the encoders - the similarity logits stay exact;
       - `parallelize(device_ids)`: the four encoders run data-parallel over several GPUs, and their
         outputs are gathered before the loss, which therefore still contrasts every trip with the
         whole batch (plain DataParallel/DDP would compute it per GPU, on half the negatives);
+      - each contrasted pair's loss is reported to the training log (report_loss_parts), named
+        "<modality>-<modality>" (fusions: "trajectory-topology_road", ...);
       - the paper's loss as a subclass (PaperLossOmniModel)."""
     global _NET_CLASSES
     if _NET_CLASSES is not None:
@@ -81,6 +83,7 @@ def _net_classes():
     import torch
     import torch.nn.functional as F
     from torch import nn
+    from ..nn.common import report_loss_parts
     from ..nn.omnitraj.omni_semantic import OmniModel
 
     class _EncodeAll(nn.Module):
@@ -97,6 +100,7 @@ def _net_classes():
     class MobevalOmniModel(OmniModel):
         _dp = None                     # DataParallel over _EncodeAll; kept out of the module tree
         _pre = None                    # projections computed by it for the batch being processed
+        _pairs = None                  # each contrasted pair's loss in the forward being run
 
         def parallelize(self, device_ids):
             dp = None
@@ -106,13 +110,20 @@ def _net_classes():
             object.__setattr__(self, "_dp", dp)          # not registered: state_dict and .to() unchanged
 
         def forward(self, batch, fusion_modality=None):
-            if self._dp is None:
-                return super().forward(batch, fusion_modality)
-            object.__setattr__(self, "_pre", self._dp(batch))
+            object.__setattr__(self, "_pairs", [])
             try:
-                return super().forward(batch, fusion_modality)       # the original loss, on the whole batch
+                if self._dp is not None:
+                    object.__setattr__(self, "_pre", self._dp(batch))
+                loss = super().forward(batch, fusion_modality)       # the original loss, on the whole batch
+                pairs = self._pairs
             finally:
                 object.__setattr__(self, "_pre", None)
+                object.__setattr__(self, "_pairs", None)
+            # OmniModel.forward contrasts contrast_pairs, then the trajectory with each fusion, in order
+            names = [f"{a}-{b}" for a, b in self.contrast_pairs] + [f"trajectory-{f}" for f in (fusion_modality or [])]
+            if len(names) == len(pairs):
+                report_loss_parts(**dict(zip(names, pairs)))
+            return loss
 
         def encode_modality(self, modality, x, attention_mask=None, normalize=False):
             pre = self._pre
@@ -123,8 +134,12 @@ def _net_classes():
         def compute_contrastive_loss(self, z1, z2):
             if z1.device.type in ("cuda", "cpu"):
                 with torch.autocast(z1.device.type, enabled=False):
-                    return self._contrastive(z1.float(), z2.float())
-            return self._contrastive(z1, z2)
+                    out = self._contrastive(z1.float(), z2.float())
+            else:
+                out = self._contrastive(z1, z2)
+            if self._pairs is not None:
+                self._pairs.append(out.detach().mean())
+            return out
 
         def _contrastive(self, z1, z2):
             return OmniModel.compute_contrastive_loss(self, z1, z2)
@@ -394,7 +409,7 @@ class OmniTrajAdapter(TorchAdapter):
         every unit are done once, over `prep_workers` processes (default: the job's CPUs), and each
         step only augments and pads; `gpus: 2` splits the encoders over two GPUs with the loss still
         on the whole batch; `train: {amp: true}` runs the encoders in mixed precision."""
-        from ..nn.common import TrainConfig
+        from ..nn.common import TrainConfig, evaluating
         from ..nn.common import fit as fit_loop
         cfg = TrainConfig.from_dict({"lr": 2e-4, "batch_size": 256, "optimizer": "adamw", "weight_decay": 1e-4,
                                      "scheduler": "cosine", "cosine_eta_min": 1e-5, "grad_clip": 1.0,
@@ -478,8 +493,11 @@ class OmniTrajAdapter(TorchAdapter):
 
         def loss_fn(idx, training):
             t = time.perf_counter()
-            g = rng if training else np.random.default_rng(int(idx[0]))
-            b = ad._tensors(cache["train" if training else "val"].batch(idx, g, training or augment_val))
+            # monitoring passes (validation, and the training sample measured like it) augment with
+            # fixed draws, as the validation batches always have
+            stochastic = training and not evaluating()
+            g = rng if stochastic else np.random.default_rng(int(idx[0]))
+            b = ad._tensors(cache["train" if training else "val"].batch(idx, g, stochastic or augment_val))
             b["label"] = ad._torch.as_tensor(idx, device=ad.device)
             clock["batch"] += time.perf_counter() - t
             loss = ad.net(b, fusions)
@@ -519,7 +537,7 @@ class OmniTrajAdapter(TorchAdapter):
                                     "gradient_checkpointing": bool(wrapped)}
         try:
             history = fit_loop(ad.net, len(units["train"]), len(units["val"]), loss_fn, cfg,
-                               on_best=ad.epoch_checkpointer(out), on_epoch=on_epoch)
+                               on_best=ad.epoch_checkpointer(out), on_epoch=on_epoch, log_to=out)
         finally:
             ad.net.parallelize(None)
             for layer in wrapped:

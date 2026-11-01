@@ -49,6 +49,8 @@ eval:
   retrieval_queries: 1000
   visualize_samples: 6                    # sample maps in <run>/samples, over the map-matching road network
   visualize_roads: /home/jcolombini/data/roads/milan/network.npz
+  train_eval: true
+  train_eval_tasks: [recovery, next_location, continuous, retrieval]
 
 models:
   # Speed (does not change the method): amp runs the encoders in float16 on the V100s (the loss stays
@@ -93,12 +95,11 @@ models:
   - name: TrajGPT
     type: trajgpt
     recipe: code
-    train: {epochs: 20, batch_size: 64, lr: 1.0e-3, patience: 15, device: cuda}
+    train: {epochs: 60, batch_size: 64, lr: 1.0e-3, patience: 15, device: cuda}
     adapter: {device: cuda}
 
   - name: CLIPMobility
     type: clip_mobility
-    recipe: code
     train: {epochs: 1000 , batch_size: 64, lr: 1.0e-4, patience: 50, device: cuda}
     adapter: {device: cuda}
 

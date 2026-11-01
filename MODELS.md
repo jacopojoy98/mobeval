@@ -358,7 +358,9 @@ accuracy for balanced accuracy (on synthetic data: accuracy 0.65 vs 0.83, balanc
 **Training loop** (`nn/common.py`): AdamW, plateau learning-rate schedule, gradient clipping, early
 stopping on validation loss with restoration of the best weights, and checkpoints that store the
 architecture, model-specific metadata (normalisation, vocabulary, scales), the training history and the
-split fingerprint.
+split fingerprint. Every epoch is also written to `<checkpoint>.losses.csv`: training and validation
+loss, the training loss measured like the validation loss, each term of the loss
+(`report_loss_parts`), learning rate and gradient norm (README, "The training log").
 
 ## What this means for the earlier results
 

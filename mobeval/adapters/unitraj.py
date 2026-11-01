@@ -126,7 +126,7 @@ class UniTrajAdapter(TorchAdapter):
         offset_from ("first" | "first_visible"), loss_norm ("original" | "masked_mean") and rdp_epsilon.
         Use `recipe: paper` / `recipe: code` in the config rather than setting these by hand."""
         import torch
-        from ..nn.common import TrainConfig
+        from ..nn.common import TrainConfig, evaluating
         from ..nn.common import fit as fit_loop
         cfg = TrainConfig.from_dict({"lr": 1e-3, "batch_size": 128, **(train or {})})
         kw.pop("device", None)                     # the training device (train.device) is used for the adapter too
@@ -157,10 +157,13 @@ class UniTrajAdapter(TorchAdapter):
 
         def loss_fn(idx, training):
             b = (tr if training else va).take(idx)
-            m = masks(len(idx)) if training else make_mask(len(idx), L, mask_ratio, "random", int(idx[0]))
+            # monitoring passes (validation, and the training sample measured like it) use fixed masks
+            # and token order, and draw nothing from the training stream
+            stochastic = training and not evaluating()
+            m = masks(len(idx)) if stochastic else make_mask(len(idx), L, mask_ratio, "random", int(idx[0]))
             x_true, iv, _, _, _, _ = ad._encode(b.lat, b.lon, b.t, np.zeros_like(m))
             x_in, _, hid, _, _, _ = ad._encode(b.lat, b.lon, b.t, m)
-            pred, _ = ad.net(x_in, iv, hid, rng)
+            pred, _ = ad.net(x_in, iv, hid, rng if stochastic else np.random.default_rng(int(idx[0])))
             target_mask = torch.zeros(hid.shape, dtype=torch.bool, device=ad.device)
             target_mask[:, :L] = torch.as_tensor(m, device=ad.device)
             err = ((pred - x_true) ** 2).sum(1)                   # [B, Lm], normalised units
@@ -168,7 +171,7 @@ class UniTrajAdapter(TorchAdapter):
 
         ad.provenance = ctx.provenance(init_from=init_from)
         ad.net.train()
-        history = fit_loop(ad.net, len(tr), len(va), loss_fn, cfg, on_best=ad.epoch_checkpointer(out))
+        history = fit_loop(ad.net, len(tr), len(va), loss_fn, cfg, on_best=ad.epoch_checkpointer(out), log_to=out)
         ad.invalidate_cache()
         if out:
             ad.save(out, history)
@@ -180,6 +183,7 @@ class UniTrajAdapter(TorchAdapter):
                            min_points, max_points):
         import torch
         from ..nn import unitraj_sampling as us
+        from ..nn.common import evaluating
         from ..nn.common import fit as fit_loop
         Lm = ad.arch["trajectory_length"]
         if sample_unit == "trajectory":
@@ -199,7 +203,7 @@ class UniTrajAdapter(TorchAdapter):
 
         def loss_fn(idx, training):
             src = data["train" if training else "val"]
-            g = rng if training else np.random.default_rng(int(idx[0]))      # stable validation masks
+            g = rng if training and not evaluating() else np.random.default_rng(int(idx[0]))   # stable monitoring masks
             x, x_true, iv, hid, tgt = us.build_batch([src[i] for i in idx], g, Lm, ad.norm, mask_ratio, mask_mix,
                                                      resample, mask_endpoints, fixed_hidden_count, offset_from,
                                                      rdp_epsilon)
@@ -214,7 +218,7 @@ class UniTrajAdapter(TorchAdapter):
         ad.provenance = ctx.provenance(init_from=init_from)
         ad.net.train()
         history = fit_loop(ad.net, len(data["train"]), len(data["val"]), loss_fn, cfg,
-                           on_best=ad.epoch_checkpointer(out))
+                           on_best=ad.epoch_checkpointer(out), log_to=out)
         ad.invalidate_cache()
         if out:
             ad.save(out, history)

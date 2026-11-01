@@ -189,8 +189,11 @@ def train_vs_test(test_df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame
 
 
 def training_curves(histories: dict) -> pd.DataFrame:
-    """histories: model name -> list of {epoch, train_loss, val_loss} (a checkpoint's history).
-    One row per model: how far training went and whether either loss moved."""
+    """histories: model name -> list of {epoch, train_loss, val_loss, ...} (a checkpoint's history).
+    One row per model: how far training went and whether either loss moved. With the training loss
+    measured like the validation loss (`train_eval_loss`, recorded runs), also the gap between the
+    two at the best epoch: (val - train_eval) / train_eval, the part of the validation loss that the
+    training data does not have."""
     rows = []
     for name, h in histories.items():
         h = [e for e in (h or []) if e.get("train_loss") is not None]
@@ -198,12 +201,17 @@ def training_curves(histories: dict) -> pd.DataFrame:
             continue
         best = min(h, key=lambda e: e.get("val_loss", float("inf")))
         t0, t1, v0 = h[0]["train_loss"], h[-1]["train_loss"], h[0].get("val_loss")
-        rows.append({"model": name, "epochs_run": h[-1]["epoch"], "best_epoch": best["epoch"],
-                     "train_loss_first": t0, "train_loss_last": t1,
-                     "train_loss_change": (t1 - t0) / abs(t0) if t0 else float("nan"),
-                     "val_loss_first": v0, "val_loss_best": best.get("val_loss"),
-                     "val_loss_last": h[-1].get("val_loss"),
-                     "val_loss_change": (best["val_loss"] - v0) / abs(v0) if v0 else float("nan")})
+        row = {"model": name, "epochs_run": h[-1]["epoch"], "best_epoch": best["epoch"],
+               "train_loss_first": t0, "train_loss_last": t1,
+               "train_loss_change": (t1 - t0) / abs(t0) if t0 else float("nan"),
+               "val_loss_first": v0, "val_loss_best": best.get("val_loss"),
+               "val_loss_last": h[-1].get("val_loss"),
+               "val_loss_change": (best["val_loss"] - v0) / abs(v0) if v0 else float("nan")}
+        te = best.get("train_eval_loss")
+        if te is not None:
+            row["train_eval_loss_best"] = te
+            row["gap_at_best"] = (best["val_loss"] - te) / abs(te) if te else float("nan")
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -231,15 +239,23 @@ def fit_section(cmp: pd.DataFrame, curves: Optional[pd.DataFrame] = None) -> str
             out += ["Rows: " + ", ".join(f"{n} {k}" for k, n in counts.items()) + ".", ""]
     if curves is not None and len(curves):
         c = curves.copy()
-        for col in ("train_loss_change", "val_loss_change"):
-            c[col] = c[col].map(lambda v: "" if pd.isna(v) else f"{v:+.0%}")
-        for col in ("train_loss_first", "train_loss_last", "val_loss_first", "val_loss_best", "val_loss_last"):
-            c[col] = c[col].map(lambda v: "" if v is None or pd.isna(v) else f"{v:.4g}")
+        for col in ("train_loss_change", "val_loss_change", "gap_at_best"):
+            if col in c:
+                c[col] = c[col].map(lambda v: "" if pd.isna(v) else f"{v:+.0%}")
+        for col in ("train_loss_first", "train_loss_last", "val_loss_first", "val_loss_best", "val_loss_last",
+                    "train_eval_loss_best"):
+            if col in c:
+                c[col] = c[col].map(lambda v: "" if v is None or pd.isna(v) else f"{v:.4g}")
         out += ["### Training curves (from the checkpoints)", "",
                 "`best_epoch` is the epoch whose weights were kept. A train loss that barely moves means the "
                 "optimisation is not working; a train loss that keeps falling while the validation loss stopped "
                 "early (best_epoch far below epochs_run) is early stopping doing its job on a model that had "
-                "started to overfit.", "", md_table(c, index=False), ""]
+                "started to overfit. `train_eval_loss_best` is the loss on a fixed sample of the training data "
+                "measured like the validation loss (eval mode, same batch layout) at the best epoch, and "
+                "`gap_at_best` how much higher the validation loss is: near 0, the model does as well on "
+                "unseen trips as on its training trips; a large gap is overfitting (or a validation period "
+                "that differs from the training one). Every epoch, with each term of the loss, the learning "
+                "rate and the gradient norm, is in `<checkpoint>.losses.csv`.", "", md_table(c, index=False), ""]
     return "\n".join(out)
 
 

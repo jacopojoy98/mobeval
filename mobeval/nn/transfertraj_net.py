@@ -15,6 +15,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .common import report_loss_parts
+
 # token vocabulary of the original data pipeline
 KNOWN_TOKEN, MASK_TOKEN, START_TOKEN, END_TOKEN, UNKNOWN_TOKEN, PAD_TOKEN = range(6)
 FEATURE_PAD = 0
@@ -292,7 +294,9 @@ class TransferTraj(nn.Module):
         token_loss = torch.stack([F.cross_entropy(pred_token_dist[:, :, i].reshape(B * L, -1),
                                                   torch.clamp(target_token[..., i], max=4).reshape(B * L),
                                                   reduction="none") for i in range(2)], -1).reshape(B, L, 2)
-        return spatial_loss + temporal_loss + masked_mean(token_loss, token_mask)
+        token_loss = masked_mean(token_loss, token_mask)
+        report_loss_parts(spatial=spatial_loss, temporal=temporal_loss, token=token_loss)
+        return spatial_loss + temporal_loss + token_loss
 
 
 def _default_context(embed, coors):

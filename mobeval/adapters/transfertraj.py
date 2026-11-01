@@ -266,7 +266,7 @@ class TransferTrajAdapter(TorchAdapter):
         every point except each `keep_every`-th and the last (TRecPadder); timestamps stay visible.
         val_feature_masking: also apply the single-modality masking to validation batches (the original
         has no validation at all; mobeval validates on span masks only by default)."""
-        from ..nn.common import TrainConfig
+        from ..nn.common import TrainConfig, evaluating
         from ..nn.common import fit as fit_loop
         cfg = TrainConfig.from_dict({"lr": 1e-3, "batch_size": 32, **(train or {})})
         kw.pop("device", None)
@@ -284,9 +284,11 @@ class TransferTrajAdapter(TorchAdapter):
 
         def loss_fn(idx, training):
             b = (tr if training else va).take(idx)
-            seed = rng if training else np.random.default_rng(int(idx[0]))
+            # monitoring passes (validation, and the training sample measured like it) use fixed masks
+            stochastic = training and not evaluating()
+            seed = rng if stochastic else np.random.default_rng(int(idx[0]))
             if objective == "pretrain":
-                fm = feature_mask_prob if (training or val_feature_masking) else 0.0
+                fm = feature_mask_prob if (stochastic or val_feature_masking) else 0.0
                 hidden2 = ad._pretrain_masks(len(idx), b.length, seed, span_div_ratio, span_mask_ratio, fm, masking)
             else:
                 hidden2 = np.zeros((len(idx), b.length, 2), bool)
@@ -300,7 +302,7 @@ class TransferTrajAdapter(TorchAdapter):
             log.warning(f"context coverage check failed: {e!r}")
         ad.provenance = ctx.provenance(init_from=init_from)
         ad.net.train()
-        history = fit_loop(ad.net, len(tr), len(va), loss_fn, cfg, on_best=ad.epoch_checkpointer(out))
+        history = fit_loop(ad.net, len(tr), len(va), loss_fn, cfg, on_best=ad.epoch_checkpointer(out), log_to=out)
         ad.invalidate_cache()
         if out:
             ad.save(out, history)

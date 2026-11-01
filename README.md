@@ -45,7 +45,8 @@ models:
 Outputs land in `<output_dir>/runs/<run_id>/` — `report.md`, `results.jsonl` (every metric with
 bootstrap CIs), `leaderboard.csv`, `family_summary.csv`, `run_info.json` — with
 `<output_dir>/latest` pointing at the newest run, and `checkpoints/<name>.pt` (+ a readable
-`.json` with config, training history and provenance) shared across runs. See
+`.json` with config, training history and provenance, and `<name>.losses.csv`, the
+[training log](#the-training-log)) shared across runs. See
 [one directory per run](#one-directory-per-run), and
 [surviving a crash](#surviving-a-crash-or-a-walltime-kill) for `--persist-dir` and `--resume`.
 
@@ -517,7 +518,45 @@ skill on train and on test and a reading:
 - **consistent**: similar on both.
 
 The section ends with the training curves read from the checkpoints: epochs run, the epoch that was
-kept, and how far the train and validation losses moved.
+kept, how far the train and validation losses moved, and the gap between the validation loss and
+the training loss measured the same way (see the training log below).
+
+## The training log
+
+Every model trained by mobeval (UniTraj, TrajGPT, TransferTraj, CLIP-Mobility, OmniTraj) writes
+`checkpoints/<name>.losses.csv` next to its checkpoint, rewritten after **every** epoch and mirrored
+to the persist directory like the checkpoint, so it can be read while the job runs
+(`column -s, -t < checkpoints/TrajGPT.losses.csv`). One row per epoch:
+
+| column | meaning |
+|---|---|
+| `train_loss` | mean loss over the epoch's training steps (train mode: dropout, random masks, weights moving) |
+| `train_eval_loss` | loss on a fixed sample of the training data measured **like the validation loss** (eval mode, fixed masks, the same batch layout) - the curve to compare `val_loss` with |
+| `val_loss`, `best_val_loss`, `improved` | validation loss, best so far, and whether this epoch was kept |
+| `lr` | learning rate used in the epoch |
+| `grad_norm`, `grad_norm_max` | gradient norm before clipping, mean and largest over the steps |
+| `seconds` | duration of the epoch (OmniTraj adds `batch_seconds`, the part spent building batches) |
+| `train_loss:<term>`, `train_eval_loss:<term>`, `val_loss:<term>` | each term of the model's loss, before its weight |
+
+The terms: TrajGPT `location`, `travel_time`, `duration`; CLIP-Mobility `prediction`, `alignment`;
+TransferTraj `spatial`, `temporal`, `token`; OmniTraj one per contrasted pair
+(`trajectory-topology`, `topology-road`, ..., `trajectory-topology_road` for the fusions); UniTraj
+has a single term. The same fields are in the checkpoint's `.json` history (which is rewritten only
+when validation improves, and at the end).
+
+How to read it: `train_loss` above `train_eval_loss` is normal (dropout and augmentation are on while
+training). `val_loss` close to `train_eval_loss` means the model does as well on unseen trips as on
+its training trips. A gap that opens and grows over the epochs is overfitting; a gap that is already
+there at epoch 1 is a difference between the splits (validation is a later period), not something
+the model learned. For contrastive losses (OmniTraj, CLIP-Mobility's `alignment`) the level also
+depends on how alike the trips in a batch are, so compare how the curves move more than where they
+sit. A loss that does not move, with a tiny `lr` or vanishing `grad_norm`, is an optimisation problem. `train.train_eval_samples` (default 2048, rounded up to whole batches) sets the
+sample; `0` turns the extra pass off. It never changes the training: it uses fixed batches and puts
+the random state back, so the weights are the same with or without it.
+
+Figures: `python plot_fit.py --checkpoints $RESULTS_DIR/checkpoints --out figures` draws the curves
+(22), each loss term (23) and the learning rate and gradient norm (24), from the training logs when
+they exist and the `.json` histories otherwise; it works on a job that is still running.
 
 ## Surviving a crash or a walltime kill
 
@@ -528,6 +567,7 @@ written to *as the work completes*:
 | what | when it is written |
 |---|---|
 | a model's checkpoint | after **every epoch that improves**, not at the end of training |
+| a model's training log (`<name>.losses.csv`) | after **every epoch** |
 | a task's metrics | after **every task**, not at the end of the evaluation |
 | report, leaderboard, `run_info.json` | when the evaluation finishes |
 
@@ -570,6 +610,7 @@ newest:
 $RESULTS_DIR/
   checkpoints/                 one per model, SHARED by every run so re-runs do not retrain
     TrajGPT.pt  TrajGPT.json   (the .json sidecar holds config, history and complete: true/false)
+    TrajGPT.losses.csv         (the training log, rewritten every epoch)
   runs/
     20260921-100122-994-run/   report.md  results.jsonl  leaderboard.csv  family_summary.csv  run_info.json
     20260921-143010-1002-run/

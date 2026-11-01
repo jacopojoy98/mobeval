@@ -225,7 +225,7 @@ class CLIPMobilityAdapter(TorchAdapter):
         import pandas as pd
         import torch
         import torch.nn.functional as F
-        from ..nn.common import TrainConfig
+        from ..nn.common import TrainConfig, report_loss_parts
         from ..nn.common import fit as fit_loop
         cfg = TrainConfig.from_dict({"lr": 1e-4, "batch_size": 64, **(train or {})})
         kw.pop("device", None)                     # the training device (train.device) is used for the adapter too
@@ -255,12 +255,13 @@ class CLIPMobilityAdapter(TorchAdapter):
             pt, vt, vp = (a[idx] for a in data[training])
             outp = ad.net(pt[:, :-1], vt, None, vp, compute_alignment=True)
             pred = F.mse_loss(outp["trajectory_predictions"], pt[:, 1:])
+            report_loss_parts(prediction=pred, alignment=outp["clip_loss"])     # before their weights
             return prediction_weight * pred + clip_weight * outp["clip_loss"]
 
         ad.provenance = ctx.provenance(init_from=init_from)
         ad.net.train()
         history = fit_loop(ad.net, len(data[True][0]), len(data[False][0]), loss_fn, cfg,
-                           on_best=ad.epoch_checkpointer(out))
+                           on_best=ad.epoch_checkpointer(out), log_to=out)
         ad.invalidate_cache()
         if out:
             ad.save(out, history)

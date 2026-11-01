@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -N mobeval_eval
 #PBS -q q07daneel
-#PBS -l select=1:ncpus=8:ngpus=1:mem=32gb
+#PBS -l select=1:ncpus=8:ngpus=1:mem=128gb
 #PBS -l walltime=12:00:00
 #PBS -j oe
 # Evaluate every model in the config using the checkpoints produced by the training jobs.
@@ -20,7 +20,10 @@ restore_checkpoints
 
 status=0
 run_mobeval evaluate --config "$SCRATCH/config.yaml" --device cuda -v \
-    ${RESUME:+--resume "$RESUME"} || status=$?
+    ${MODELS:+--models ${MODELS//:/ }} ${RESUME:+--resume "$RESUME"} || status=$?
+
+#run_mobeval evaluate --config "$SCRATCH/config.yaml" --device cuda -v \
+#    ${RESUME:+--resume "$RESUME"} || status=$?
 
 explain_exit $status
 stage_out

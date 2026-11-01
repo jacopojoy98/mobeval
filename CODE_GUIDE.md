@@ -136,7 +136,20 @@ Every training method has the same shape, so they read alike:
    (`training=True`) or validation data, run the network, return a scalar loss;
 3. hand `loss_fn` to `nn/common.py :: fit`, which shuffles indices, steps the optimiser, computes
    the validation loss each epoch, early-stops, and restores the best weights. The checkpoint is
-   saved on every improvement (`TorchAdapter.epoch_checkpointer`).
+   saved on every improvement (`TorchAdapter.epoch_checkpointer`), and with `log_to=out` every
+   epoch goes to `<checkpoint>.losses.csv` (the training log, README).
+
+Two conventions for `loss_fn`, both needed by the training log:
+
+- `report_loss_parts(name=term, ...)` names the terms the loss is made of (before their weights);
+  `fit` averages them per epoch next to the total. Outside `fit` it does nothing.
+- The log also measures the loss on a fixed training sample *like the validation loss*, by calling
+  `loss_fn(idx, True)` in eval mode. A `loss_fn` that draws masks, orders or augmentations from its
+  own generator must then draw nothing from it: use `stochastic = training and not evaluating()`
+  for the random parts, and a generator seeded by the batch (as for validation) otherwise. The
+  random state of python, numpy and torch is restored by `fit`; a private generator cannot be.
+  `tests/test_training_log.py` checks every model trains to the same weights with and without
+  that pass.
 
 So the answer to "how is the data prepared" is always: **read `loss_fn` and the helper it calls to
 build a batch.** Hyper-parameters come from `nn/common.py :: TrainConfig`.

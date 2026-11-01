@@ -338,6 +338,7 @@ class TrajGPTAdapter(TorchAdapter):
         import torch.nn.functional as F
         from ..nn.common import TrainConfig
         from ..nn.common import fit as fit_loop
+        from ..nn.common import report_loss_parts
         from ..nn.features import RegionTokenizer
         from ..nn.trajgpt_net import gmm_nll, init_gmm_head
         cfg = TrainConfig.from_dict({"lr": 1e-3, "batch_size": 64, "patience": 10, **(train or {})})
@@ -422,11 +423,12 @@ class TrajGPTAdapter(TorchAdapter):
             ms = ad.min_scale_h
             t_nll = gmm_nll(out["travel_time"], travel[idx], ok[idx].bool(), ms)
             d_nll = gmm_nll(out["duration"], dur[idx], w.bool(), ms)
+            report_loss_parts(location=ce, travel_time=t_nll, duration=d_nll)
             return ce + (t_nll.mean() if t_nll.numel() else 0.0) + d_nll.mean()
 
         ad.provenance = ctx.provenance(init_from=init_from, train_context=C)
         ad.net.train()
-        history = fit_loop(ad.net, len(tr), len(va), loss_fn, cfg, on_best=ad.epoch_checkpointer(out))
+        history = fit_loop(ad.net, len(tr), len(va), loss_fn, cfg, on_best=ad.epoch_checkpointer(out), log_to=out)
         if out:
             ad.save(out, history)
         return ad
@@ -436,6 +438,7 @@ class TrajGPTAdapter(TorchAdapter):
         import torch
         import torch.nn.functional as F
         from ..nn.common import fit as fit_loop
+        from ..nn.common import report_loss_parts
         from ..nn.trajgpt_net import PAD, gmm_nll, init_gmm_head
         S = int(seq_len)
         if ad.sequence_len < S:
@@ -494,12 +497,13 @@ class TrajGPTAdapter(TorchAdapter):
             ms = ad.min_scale_h
             t_nll = gmm_nll(o["travel_time"], travel, ok, ms)
             d_nll = gmm_nll(o["duration"], dur, tgt, ms)
+            report_loss_parts(location=ce, travel_time=t_nll, duration=d_nll)
             return ce + (t_nll.mean() if t_nll.numel() else 0.0) + (d_nll.mean() if d_nll.numel() else 0.0)
 
         ad.provenance = ctx.provenance(init_from=init_from, train_context=S - 1)
         ad.net.train()
         history = fit_loop(ad.net, len(data["train"][1]), len(data["val"][1]), loss_fn, cfg,
-                           on_best=ad.epoch_checkpointer(out))
+                           on_best=ad.epoch_checkpointer(out), log_to=out)
         if out:
             ad.save(out, history)
         return ad

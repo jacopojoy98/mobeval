@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Dict, Optional, Sequence
 
 import numpy as np
@@ -64,6 +65,17 @@ class TorchAdapter(MobilityModelAdapter):
             # job dies here, a resumed run continues from them instead of treating them as final.
             self.save(out, history, quiet=True, complete=False)
 
+        def snapshot(history, epoch):
+            # train.save_every: the weights of this epoch, kept beside (not in) checkpoints/, so jobs
+            # never copy them back to scratch and training never mistakes them for the model to resume.
+            # Evaluate one with `checkpoint: <path>` under a new model name.
+            ck = Path(out)
+            root = ck.parent.parent if ck.parent.name == "checkpoints" else ck.parent
+            path = root / "snapshots" / ck.stem / f"epoch_{epoch:04d}.pt"
+            self.save(str(path), history, quiet=True, complete=True)
+            return path
+
+        save_best.snapshot = snapshot
         return save_best
 
     # ----------------------------------------------------------------- embeddings

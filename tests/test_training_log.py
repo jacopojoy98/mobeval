@@ -309,3 +309,40 @@ def test_plot_fit_prefers_the_log_with_more_epochs_and_draws_the_figures(tmp_pat
     assert plot_fit.fig_terms(hist, figs, ["png"]) and plot_fit.fig_optimisation(hist, figs, ["png"])
     assert {p.name for p in figs.iterdir()} == {"22_training_curves.png", "23_loss_terms.png",
                                                 "24_learning_rate_and_gradients.png"}
+
+
+# ------------------------------------------------------------------ periodic snapshots (train.save_every)
+@pytest.mark.parametrize("kind", ["trajgpt", "clip"])
+def test_save_every_keeps_each_nth_epoch_beside_the_checkpoints(kind, ctx, tmp_path):
+    from mobeval.registry import load_model
+    ck = tmp_path / "checkpoints"
+    ad = _train(kind, ctx, ck / "M.pt", epochs=5, save_every=2)
+    snaps = tmp_path / "snapshots" / "M"
+    assert sorted(p.name for p in snaps.glob("*.pt")) == ["epoch_0002.pt", "epoch_0004.pt"]
+    assert not (ck / "snapshots").exists()                  # jobs never copy them back to scratch
+    side = json.loads((snaps / "epoch_0004.json").read_text())
+    assert side["history"][-1]["epoch"] == 4                 # the weights of epoch 4, whatever was best
+    spec = {"name": "M-epoch4", "type": "trajgpt" if kind == "trajgpt" else "clip_mobility",
+            "checkpoint": str(snaps / "epoch_0004.pt"), "adapter": {"device": "cpu"}}
+    snap = load_model(spec, ctx, str(tmp_path), check_provenance="error")
+    assert snap.name == "M-epoch4"                          # loads, and passes the split check
+
+
+def test_no_snapshots_by_default(ctx, tmp_path):
+    _train("trajgpt", ctx, tmp_path / "checkpoints" / "M.pt", epochs=3)
+    assert not (tmp_path / "snapshots").exists()
+
+
+def test_a_failing_snapshot_never_stops_the_training(tmp_path, caplog):
+    model, loss_fn = _problem()
+
+    def saver(h):
+        pass
+
+    def broken(h, epoch):
+        raise OSError("disk full")
+
+    saver.snapshot = broken
+    h = fit(model, 64, 32, loss_fn, _cfg(epochs=4, save_every=2), drop_last=False, on_best=saver)
+    assert len(h) == 4
+    assert sum("could not save the epoch" in r.message and "snapshot" in r.message for r in caplog.records) == 2

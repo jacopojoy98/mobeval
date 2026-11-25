@@ -50,6 +50,8 @@ class TrainConfig:
                                            # Ampere (V100), bfloat16 from Ampere on; weights stay float32
     save_train_state: bool = True          # interim checkpoints also hold optimizer, schedule and data
                                            # order, so a resumed job continues the run exactly
+    save_every: int = 0                    # also keep the weights of every N-th epoch, as they are at that
+                                           # epoch: <output>/snapshots/<model>/epoch_0010.pt (0: off)
     train_eval_samples: int = 2048         # recorded runs (see fit's log_to): every epoch, also the loss on
                                            # this many training samples (whole batches) measured like the
                                            # validation loss - eval mode, fixed batches. 0: off
@@ -340,6 +342,9 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
     at epoch 40 of 100 still leaves the best-so-far model on disk instead of nothing.
     `on_epoch(history)` is called after every epoch (before `on_best`); it may add fields to
     history[-1], which are then saved with the checkpoint.
+    With TrainConfig.save_every = N, `on_best.snapshot(history, epoch)` (when the saver has one,
+    as TorchAdapter.epoch_checkpointer's does) is also called every N epochs, with the weights of
+    that epoch, whether or not it improved.
 
     Every epoch's history entry holds the mean training loss (over the epoch's steps, in train
     mode), the validation loss, the learning rate, the gradient norm before clipping (mean and
@@ -520,6 +525,15 @@ def fit(model: nn.Module, n_train: int, n_val: int, loss_fn: Callable[[np.ndarra
                 sched.step(vl)
             elif sched is not None:
                 sched.step()
+            snapshot = getattr(on_best, "snapshot", None)
+            if cfg.save_every and snapshot is not None and epoch % cfg.save_every == 0:
+                try:                                    # the live weights: this epoch's, not the best
+                    where = snapshot(history, epoch)
+                except Exception as e:                                      # noqa: BLE001
+                    log.warning(f"could not save the epoch-{epoch} snapshot: {e!r}")
+                else:
+                    rep.event("snapshot", model=who, epoch=epoch, path=str(where),
+                              message=f"{who}: kept the epoch-{epoch} weights in {where}")
             if vl < best - 1e-6:
                 best, bad, best_state = vl, 0, copy.deepcopy(model.state_dict())
                 if on_best is not None:

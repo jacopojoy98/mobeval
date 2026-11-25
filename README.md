@@ -554,6 +554,28 @@ sit. A loss that does not move, with a tiny `lr` or vanishing `grad_norm`, is an
 sample; `0` turns the extra pass off. It never changes the training: it uses fixed batches and puts
 the random state back, so the weights are the same with or without it.
 
+### Keeping the weights of every N-th epoch
+
+The checkpoint holds the best epoch only. To also keep the model as it was at regular points of the
+training, set `save_every` in the model's `train:` section:
+
+```yaml
+    train: {epochs: 2000, patience: 5000, save_every: 50, device: cuda}
+```
+
+Every 50th epoch is then saved, with its own weights (best or not) and the history up to it, as
+`snapshots/<model>/epoch_0050.pt` (+ `.json`) next to `checkpoints/`. Snapshots never replace the
+checkpoint, are never resumed from, and are not copied back to scratch by the jobs. Each is as large
+as the checkpoint, so pick N with the disk quota in mind. To evaluate one, add it to the config under
+a new name:
+
+```yaml
+  - name: TrajGPT-epoch500
+    type: trajgpt
+    checkpoint: /home/jcolombini/results/MilanDataset_LongTrain/snapshots/TrajGPT/epoch_0500.pt
+    adapter: {device: cuda}
+```
+
 Figures: `python plot_fit.py --checkpoints $RESULTS_DIR/checkpoints --out figures` draws the curves
 (22), each loss term (23) and the learning rate and gradient norm (24), from the training logs when
 they exist and the `.json` histories otherwise; it works on a job that is still running.

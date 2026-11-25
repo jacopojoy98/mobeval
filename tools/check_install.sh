@@ -28,6 +28,7 @@ check mobeval/adapters/clip_mobility.py "report_loss_parts"    "training log: CL
 check mobeval/nn/transfertraj_net.py   "report_loss_parts"     "training log: TransferTraj loss terms"
 check mobeval/adapters/omnitraj.py     "report_loss_parts"     "training log: OmniTraj loss per contrasted pair"
 check mobeval/adapters/unitraj.py      "log_to=out"            "training log: UniTraj"
+check mobeval/nn/common.py             "save_every: int"       "snapshots every N epochs (train: save_every)"
 check plot_fit.py                      "def fig_terms"         "training figures (plot_fit.py 22-24)"
 check jobs/env.sh                      'cp -r -u'              "jobs sharing RESULTS_DIR keep each other's checkpoints"
 check jobs/env.sh                      'cp -r -p'              "restore keeps the newer of the two checkpoint copies"

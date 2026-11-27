@@ -595,7 +595,10 @@ class GenerationTask(Task):
 
     def run(self, adapter, ctx):
         cfg, recs = ctx.cfg, []
-        test = ctx.splits["test"]
+        # the split being scored: "test", or another one under EvalContext.split_view (e.g. the
+        # validation split of a snapshot sweep), whose trips are then the real reference
+        scored = getattr(ctx, "eval_split", "test")
+        test = ctx.splits[scored]
         n = min(test.points.traj_id.nunique(), cfg.generation_max_trajectories)
         if "gen_real" not in ctx.cache:
             # The real reference distribution. Capped: these are per-trajectory statistics whose
@@ -605,10 +608,10 @@ class GenerationTask(Task):
             capped = len(real_pts) < len(test.points)
             if capped:
                 log.info(f"generation: using {real_pts.traj_id.nunique():,} of "
-                         f"{test.points.traj_id.nunique():,} test trajectories for the reference "
+                         f"{test.points.traj_id.nunique():,} {scored} trajectories for the reference "
                          f"statistics (eval.generation_max_real_trajectories)")
             ctx.cache["gen_real"] = self._stats(ctx, MobilityDataset(real_pts, "real"),
-                                                split=None if capped else "test")
+                                                split=None if capped else scored)
             # real-vs-real noise floor: n REAL train trajectories, same sample size as the generator's output
             tr = ctx.splits["train"].points
             ids = np.random.default_rng(cfg.split_seed).choice(tr.traj_id.unique(), n, replace=False)

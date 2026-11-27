@@ -1,0 +1,48 @@
+#!/bin/bash
+#PBS -N mobeval_snapshots
+#PBS -q q07daneel
+#PBS -l select=1:ncpus=8:ngpus=1:mem=128gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+# Which epoch is best? Evaluate the snapshots a training kept every N epochs (train: save_every),
+# next to the checkpoint it kept, and find each model's best epoch. Same CONFIG and RESULTS_DIR as
+# the training:
+#
+#   qsub -v CONFIG=$PWD/examples/configs/MilanDataset_LongTrain.yaml,RESULTS_DIR=$HOME/results/MilanDataset_LongTrain,MODELS=TrajGPT:OmniTraj jobs/evaluate_snapshots.pbs
+#
+# Optional (add them to the -v list):
+#   MODELS=A:B          the models whose snapshots to evaluate (default: every model that has some)
+#   EVERY=100           only the epochs divisible by 100
+#   MAX=10              at most this many snapshots per model, evenly spread (default 10; MAX=0: all)
+#   SPLIT=val           score on the validation split (default), or SPLIT=test - but choosing the
+#                       epoch on test makes that epoch's test score optimistic
+#   TASKS=recovery:next_location:continuous   only these tasks (fewer tasks, shorter job)
+#   TRAIN_EVAL=1        also score every snapshot on a sample of the training data
+#   RESUME=latest       carry on an interrupted snapshot run (finished models are kept)
+#
+# Each snapshot is evaluated as a model of its own (<model>-ep0100), one at a time. The time grows
+# with the number of snapshots: MAX and TASKS keep it in hand. Results: $RESULTS_DIR/runs/<run_id>/
+# (report.md opens with the best epoch of each model). Figures, on your machine or in a short job:
+#   python plot_snapshots.py $RESULTS_DIR/runs/<run_id> --out figures_snapshots
+
+cd "$PBS_O_WORKDIR"
+source jobs/env.sh
+setup_env
+stage_in
+restore_checkpoints
+
+# The snapshots are read where the training jobs left them: $RESULTS_DIR/snapshots (copied there at
+# the end of a training job) and $MOBEVAL_PERSIST_DIR/snapshots (copied there during the training,
+# so the snapshots of a job that is still running, or that was killed, are found too).
+status=0
+run_mobeval snapshots --config "$SCRATCH/config.yaml" --device cuda -v \
+    --snapshot-dir "$RESULTS_DIR/snapshots" "$MOBEVAL_PERSIST_DIR/snapshots" \
+    ${MODELS:+--models ${MODELS//:/ }} ${EVERY:+--every "$EVERY"} ${MAX:+--max-snapshots "$MAX"} \
+    ${SPLIT:+--split "$SPLIT"} ${TASKS:+--tasks ${TASKS//:/ }} ${TRAIN_EVAL:+--train-eval} \
+    ${RESUME:+--resume "$RESUME"} || status=$?
+
+explain_exit $status
+stage_out
+echo "results: $RESULTS_DIR/runs/<run id printed above>/ (report.md opens with the best epoch of each model)"
+echo "figures: python plot_snapshots.py $RESULTS_DIR/runs/<run id> --out figures_snapshots"
+exit $status

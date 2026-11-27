@@ -40,7 +40,9 @@ class EvaluationPipeline:
         return ctx
 
     def run(self, adapters: Sequence[MobilityModelAdapter], ctx: EvalContext,
-            store: Optional[ResultStore] = None) -> ResultStore:
+            store: Optional[ResultStore] = None, count_plan: bool = True) -> ResultStore:
+        """Run every applicable task on every adapter. count_plan=False: the caller has already
+        added these steps to the progress plan (a caller running one adapter at a time)."""
         store = store or ResultStore()
         rep = progress.get()
         already = store.done_tasks()
@@ -54,7 +56,8 @@ class EvaluationPipeline:
         if already:
             log.info(f"resuming: {len(already)} (model, task) pair(s) already have results")
         plan = [(a, t) for a in adapters for t in self.tasks if t.applicable(a)]
-        rep.set_plan(rep.state.get("steps_total", 0) + len(plan) if rep.active else len(plan))
+        if count_plan:
+            rep.set_plan(rep.state.get("steps_total", 0) + len(plan) if rep.active else len(plan))
         for adapter in adapters:
             key = f"{adapter.name}@{adapter.run_tag}"
             n_tasks = sum(1 for a, t in plan if a is adapter)

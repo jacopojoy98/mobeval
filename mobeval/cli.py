@@ -2,6 +2,8 @@
 
     python -m mobeval train    --config exp.yaml [--models A B]   # train models that have a `train` section
     python -m mobeval evaluate --config exp.yaml [--models A B]   # evaluate all models, write report
+    python -m mobeval snapshots --config exp.yaml --models A [--every 100] [--max-snapshots 10]
+                                                                  # which epoch is best (train.save_every)
     python -m mobeval run      --config exp.yaml                  # train (missing checkpoints) + evaluate
     python -m mobeval run      --config exp.yaml --resume         # continue the newest run after a crash
     python -m mobeval context  --config exp.yaml --out data/context   # POI/road features from OSM
@@ -34,7 +36,7 @@ from .progress import Interrupted
 log = logging.getLogger("mobeval")
 
 
-RUN_COMMANDS = ("train", "evaluate", "run", "smoke")
+RUN_COMMANDS = ("train", "evaluate", "run", "smoke", "snapshots")
 
 
 def ensure_progress(directory, command, meta=None):
@@ -219,6 +221,112 @@ def _train_eval(cfg, names, pipe, ctx, adapters, store, out, resume, lay) -> lis
     return ["results_train.jsonl", "leaderboard_train.csv", "train_vs_test.csv"]
 
 
+def cmd_snapshots(cfg, args, resume=False):
+    """`mobeval snapshots`: evaluate the weights kept every N epochs (train.save_every), next to the
+    checkpoint each training kept, and find each model's best epoch (see mobeval/snapshots.py).
+
+    One model is loaded at a time and dropped once scored, so a sweep over many snapshots needs the
+    memory of one model. Scored on the validation split unless --split test."""
+    import dataclasses
+    import gc
+    from . import layout
+    from . import snapshots as S
+    from .registry import load_model
+    from .report import family_summary, leaderboard, markdown_report, train_vs_test
+    from .results import ResultStore
+    from .runner import EvaluationPipeline
+    from .tasks import TASK_NAMES
+    lay = layout.get()
+    out = lay.run_dir if lay else Path(cfg["output_dir"])
+    out.mkdir(parents=True, exist_ok=True)
+    dirs = [Path(d) for d in (args.snapshot_dir or [])] + [Path(cfg["output_dir"]) / "snapshots"]
+    if lay is not None and lay.persist_dir is not None:
+        dirs.append(Path(lay.persist_dir) / "snapshots")
+    specs, snaps, histories = S.plan(cfg, args.models, dirs, every=args.every, max_n=args.max_snapshots)
+    split = args.split
+    tasks = [t for t in (args.tasks or cfg["eval"].get("tasks") or TASK_NAMES) if t != "efficiency"]
+    S.check_resume(out, {"split": split, "tasks": tasks}, resuming=resume)
+    snaps.to_csv(out / "snapshots.csv", index=False)
+    S.history_frame(histories).to_csv(out / "training_history.csv", index=False)
+    for name in ("snapshots.csv", "training_history.csv", "snapshots_meta.json"):
+        layout.mirror(out / name)
+
+    # efficiency is the same for every snapshot; sample maps of every snapshot would be noise
+    ecfg = {**cfg["eval"], "tasks": tasks, "visualize_samples": 0, "train_eval": bool(args.train_eval)}
+    scfg = {**cfg, "eval": ecfg, "models": specs}
+    pipe, ctx = _context(scfg)
+    view = ctx.split_view(split) if split != "test" else ctx
+    log.info(f"scoring {len(specs)} models on the {split} split: {', '.join(s['name'] for s in specs)}")
+    store = ResultStore(out / "results.jsonl", resume=resume)
+    tview = tpipe = tstore = None
+    wanted = sorted(set(ctx.cfg.train_eval_tasks) & set(tasks)) if ctx.cfg.train_eval else []
+    if wanted:
+        tview = view.split_view("train")
+        tpipe = EvaluationPipeline(dataclasses.replace(ctx.cfg, tasks=tuple(wanted)))
+        tstore = ResultStore(out / "results_train.jsonl", resume=resume)
+    if lay is not None:
+        store.on_persist = lay.mirror
+        if tstore is not None:
+            tstore.on_persist = lay.mirror
+    rep = progress.get()
+    count = snaps.base.value_counts().to_dict()
+    planned = set()
+    for spec in specs:
+        base = snaps.loc[snaps.model.eq(spec["name"]), "base"].iloc[0]
+        ad = load_model(spec, view, cfg["output_dir"], cfg["check_provenance"])
+        if base not in planned and rep.active:          # every snapshot of a model has the same tasks
+            n = sum(t.applicable(ad) for t in pipe.tasks) + (sum(t.applicable(ad) for t in tpipe.tasks)
+                                                             if tpipe else 0)
+            rep.set_plan(rep.state.get("steps_total", 0) + n * count[base])
+            planned.add(base)
+        store = pipe.run([ad], view, store, count_plan=False)
+        if tpipe is not None:
+            tstore = tpipe.run([ad], tview, tstore, count_plan=False)
+        S.release(ad, [view, tview])
+        del ad
+        gc.collect()
+
+    progress.get().set_phase("writing report")
+    lb = leaderboard(store)
+    lb.to_csv(out / "leaderboard.csv", index=False)
+    family_summary(store.to_frame()).to_csv(out / "family_summary.csv")
+    summary, overall = S.summarize(lb, snaps)
+    summary.to_csv(out / "best_snapshots.csv", index=False)
+    overall.to_csv(out / "snapshot_ranking.csv", index=False)
+    split_name = "validation" if split == "val" else split
+    title = f"{cfg.get('title', 'Evaluation')} - snapshots on the {split_name} split"
+    bases = {m["name"]: m for m in cfg["models"]}
+    (out / "report.md").write_text(S.markdown(summary, overall, snaps, split, bases) + "\n\n"
+                                   + markdown_report(store, view, title))
+    extra = []
+    if tstore is not None:
+        for r in tstore.records:
+            r.split = "train"
+        tstore.persist()
+        leaderboard(tstore).to_csv(out / "leaderboard_train.csv", index=False)
+        train_vs_test(store.to_frame(), tstore.to_frame()).to_csv(out / "train_vs_test.csv", index=False)
+        extra = ["results_train.jsonl", "leaderboard_train.csv", "train_vs_test.csv"]
+    errors = list(ctx.errors) + (list(view.errors) if view is not ctx else []) + \
+        ([(m, f"[train] {t}", e, tb) for m, t, e, tb in tview.errors] if tview is not None else [])
+    (out / "run_info.json").write_text(json.dumps({
+        "fingerprint": ctx.fingerprint, "config": scfg, "run_id": lay.run_id if lay else None,
+        "eval_split": split, "snapshot_dirs": [str(d) for d in dirs],
+        "errors": [e[:3] for e in errors], "skipped": view.skipped}, indent=2, default=str))
+    for name in ["leaderboard.csv", "family_summary.csv", "best_snapshots.csv", "snapshot_ranking.csv",
+                 "report.md", "run_info.json"] + extra:
+        layout.mirror(out / name)
+    for m, t, e, _ in errors:
+        log.error(f"{m} · {t}: {e}")
+    for base in summary.base.unique() if len(summary) else []:
+        b = S.best_overall(overall, base)
+        if b is not None:
+            log.info(f"{base}: best overall epoch {b.epoch} ({b.model}), best or tied on "
+                     f"{int(b.best_or_tied_on)}/{int(b.tasks)} tasks")
+    durable = (lay._twin(out) if lay is not None else None) or out
+    log.info(f"wrote {out}/report.md - figures: python plot_snapshots.py {durable}")
+    return store, view
+
+
 def cmd_visualize(cfg, args):
     """Sample figures for trained models, without re-running the evaluation."""
     from .registry import load_model
@@ -377,8 +485,8 @@ def cmd_recipes(types=None):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="mobeval", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["train", "evaluate", "run", "smoke", "info", "context", "status", "recipes",
-                                        "roads", "mapmatch", "visualize"])
+    ap.add_argument("command", choices=["train", "evaluate", "snapshots", "run", "smoke", "info", "context", "status",
+                                        "recipes", "roads", "mapmatch", "visualize"])
     ap.add_argument("--config")
     ap.add_argument("--models", nargs="*")
     ap.add_argument("--out", help="override output_dir (roads / mapmatch: the output file)")
@@ -407,6 +515,18 @@ def main(argv=None):
     r.add_argument("--fmm-export", help="mapmatch: write the GPS points for FMM instead of matching")
     r.add_argument("--fmm-import", help="mapmatch: read an FMM result (opath field) instead of matching")
     r.add_argument("--fmm-network", help="mapmatch: the FMM GeoPackage written by `mobeval roads --fmm`")
+    n = ap.add_argument_group("snapshots (which epoch is best; models trained with train.save_every)")
+    n.add_argument("--every", type=int, help="snapshots: only epochs divisible by this")
+    n.add_argument("--max-snapshots", type=int, default=10,
+                   help="snapshots: at most this many per model, evenly spread (default 10; 0 = all)")
+    n.add_argument("--split", choices=["val", "test"], default="val",
+                   help="snapshots: score on the validation split (default: choosing an epoch on test "
+                        "overstates its test score) or on test")
+    n.add_argument("--snapshot-dir", nargs="*", help="snapshots: extra folders holding <model>/epoch_*.pt "
+                   "(<output_dir>/snapshots and <persist_dir>/snapshots are always searched)")
+    n.add_argument("--tasks", nargs="*", help="snapshots: only these tasks (default: eval.tasks, without efficiency)")
+    n.add_argument("--train-eval", action="store_true",
+                   help="snapshots: also score each snapshot on a sample of the training data (eval.train_eval)")
     s = ap.add_argument_group("status")
     s.add_argument("--watch", type=float, nargs="?", const=10.0, help="refresh every N seconds (default 10)")
     s.add_argument("--events", type=int, default=0, help="also show the last N events of the newest run")
@@ -474,6 +594,8 @@ def main(argv=None):
             cmd_train(cfg, args.models, only_missing=bool(args.resume))
         elif args.command == "evaluate":
             cmd_evaluate(cfg, args.models, resume=bool(args.resume))
+        elif args.command == "snapshots":
+            cmd_snapshots(cfg, args, resume=bool(args.resume))
         else:                                   # run / smoke
             pipe, ctx = _context(cfg)
             cmd_train(cfg, args.models, ctx, only_missing=args.command == "run")
@@ -531,6 +653,8 @@ def _setup_layout(cfg, args, rep):
                 raise SystemExit(f"--resume {args.resume}: no such run directory {resume_dir}")
         else:
             previous = probe.previous_runs()
+            if args.command == "snapshots":           # never continue an ordinary evaluation's run
+                previous = [d for d in previous if d.name.endswith("-snapshots")]
             resume_dir = previous[-1] if previous else None
             if resume_dir is None:
                 log.info("--resume: no previous run found, starting a fresh one")

@@ -580,6 +580,49 @@ Figures: `python plot_fit.py --checkpoints $RESULTS_DIR/checkpoints --out figure
 (22), each loss term (23) and the learning rate and gradient norm (24), from the training logs when
 they exist and the `.json` histories otherwise; it works on a job that is still running.
 
+### Which epoch is best: evaluating the snapshots
+
+`mobeval snapshots` evaluates a model's snapshots side by side, together with the weights the
+training kept. It shows whether the epoch with the lowest validation loss is also the one that does
+best on the tasks:
+
+```bash
+qsub -v CONFIG=$PWD/examples/configs/MilanDataset_LongTrain.yaml,RESULTS_DIR=$HOME/results/MilanDataset_LongTrain,MODELS=TrajGPT:OmniTraj,MAX=10,TASKS=recovery:next_location:continuous:retrieval jobs/evaluate_snapshots.pbs
+# locally:  python -m mobeval snapshots --config exp.yaml --models TrajGPT --max-snapshots 10
+```
+
+- Every snapshot is evaluated as a model of its own, named `TrajGPT-ep0100`, and loaded one at a time,
+  so the number of snapshots is not limited by GPU memory. The weights the training kept are scored
+  once: as their snapshot when that epoch has one, otherwise as `TrajGPT`.
+- `MAX` (default 10, `0` = all) keeps that many snapshots per model, evenly spread from the first to
+  the last; `EVERY=100` keeps only the epochs divisible by 100. The run takes about as long as
+  evaluating that many models, so `MAX` and `TASKS` are what keep it in hand.
+- **The snapshots are scored on the validation split** (`SPLIT=val`, the default). Choosing the epoch
+  with the best test score and then reporting that score would overstate it. Once you have chosen,
+  evaluate that snapshot on the test split as a model of its own: report.md prints the config entry.
+  `SPLIT=test` is there, and the report then warns that the scores are optimistic.
+- Efficiency (identical for every snapshot) and the sample maps are left out. `TRAIN_EVAL=1` also
+  scores each snapshot on a sample of the training data, and the figures then show it as a dotted line.
+
+The run folder (`$RESULTS_DIR/runs/<run id>-snapshots/`) holds the usual leaderboard, and also:
+`snapshots.csv` (which file each model is, its epoch, the losses at that epoch), `best_snapshots.csv`
+(per model and task: the best epoch, its value, the kept weights' value, the epochs inside the best
+one's 95% interval, the best baseline), `snapshot_ranking.csv` and `training_history.csv`.
+`report.md` opens with the best epoch of each model. "Best overall" is the lowest average position
+among the evaluated epochs, averaged within each task family first, so every family counts once. On
+noisy tasks many epochs fall inside the best one's interval: the report lists them, because those
+epochs cannot be told apart at this sample size.
+
+Figures (`python plot_snapshots.py $RESULTS_DIR/runs/<run id> --out figures_snapshots`):
+
+| figure | shows |
+|---|---|
+| `40_snapshots_<model>` | a panel per task: each snapshot's result against its epoch, with its 95% interval; star = the weights the training kept, ring = the best epoch, dashed = the best baseline; first panel: the training log's losses |
+| `41_snapshot_heatmap` | all snapshots side by side: a row per task, a column per epoch, each row coloured from its worst epoch (light) to its best (dark), borders on the best and on those inside its interval |
+| `42_snapshot_ranking` | each epoch's average position over the task families, next to the same epochs ordered by validation loss alone: where the lines part, the loss did not pick the epoch that does best |
+
+`--models` and `--families recovery location ...` restrict the figures.
+
 ## Surviving a crash or a walltime kill
 
 Nothing finished waits for the end of the job. `MOBEVAL_PERSIST_DIR` (set to `$RESULTS_DIR` by

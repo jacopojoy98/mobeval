@@ -52,6 +52,13 @@ Three ideas explain almost everything else:
    compute the metric from the answer. Metrics are never computed inside an adapter, so the formula
    is identical for every model.
 
+Tasks read the samples they score from `ctx.windows["test"]` / `ctx.visits["test"]` (and generation
+from `ctx.splits[ctx.eval_split]`). `EvalContext.split_view(name)` returns a context whose "test"
+is another split, which is how the same tasks score a sample of the training data (`train_eval`)
+and the validation split (`mobeval snapshots`, `cmd_snapshots` + `snapshots.py`, which evaluates
+the snapshots of `train.save_every` one model at a time). A new task that reads the scored split
+some other way must follow `eval_split` too.
+
 ## 2. The data views (read these two classes first)
 
 Everything a model or a task receives is one of two containers in `data.py`.
